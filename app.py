@@ -24,7 +24,6 @@ EBAY_SEARCH_URL = os.getenv("EBAY_SEARCH_URL")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "600"))
-PROXY_API_URL = os.getenv("PROXY_API_URL", "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text&anonymity=elite%2Canonymous")
 # ===============================
 
 if not EBAY_SEARCH_URL or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -35,110 +34,125 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 app = Flask(__name__)
 
-# ==================== ЗАГРУЗКА СПИСКА ПРОКСИ ====================
+# ==================== ЗАГРУЗКА ПРОКСИ (ТОЛЬКО HTTP/HTTPS) ====================
 def fetch_proxy_list():
-    """Загружает список прокси с API (без проверки)."""
+    """Загружает список HTTP/HTTPS прокси с двух источников."""
+    proxies = []
+    
+    # Источник 1: free-proxy-list.net (парсим таблицу)
     try:
         import requests
-        logging.info("Загрузка списка прокси с API...")
-        response = requests.get(PROXY_API_URL, timeout=30)
-        response.raise_for_status()
-        raw_proxies = response.text.split()
-        # Нормализуем формат (добавляем http:// если нет схемы)
-        proxies = []
-        for p in raw_proxies:
-            p = p.strip()
-            if not p:
-                continue
-            if not re.match(r'^(http|https|socks4|socks5)://', p):
-                p = f"http://{p}"
-            proxies.append(p)
-        logging.info(f"Загружено {len(proxies)} прокси (без проверки).")
-        return proxies
+        logging.info("Загрузка прокси с free-proxy-list.net...")
+        resp = requests.get("https://free-proxy-list.net/", timeout=30)
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        table = soup.find('table', id='proxylisttable')
+        if table:
+            for row in table.find_all('tr')[1:]:
+                cols = row.find_all('td')
+                if len(cols) >= 7:
+                    ip = cols[0].text.strip()
+                    port = cols[1].text.strip()
+                    https = cols[6].text.strip() == 'yes'
+                    if https:
+                        proxies.append(f"https://{ip}:{port}")
+                    else:
+                        proxies.append(f"http://{ip}:{port}")
+        logging.info(f"С free-proxy-list.net получено {len(proxies)} прокси")
     except Exception as e:
-        logging.error(f"Ошибка загрузки прокси: {e}")
-        return []
+        logging.error(f"Ошибка загрузки free-proxy-list: {e}")
+    
+    # Источник 2: proxyscrape.com (только HTTP/HTTPS, elite+anonymous)
+    try:
+        logging.info("Загрузка прокси с proxyscrape.com...")
+        url = "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000&country=all&ssl=all&anonymity=elite%2Canonymous"
+        resp = requests.get(url, timeout=30)
+        raw = resp.text.split()
+        for p in raw:
+            p = p.strip()
+            if p:
+                if ':' in p:
+                    # формат ip:port, добавляем http://
+                    proxies.append(f"http://{p}")
+                else:
+                    proxies.append(f"http://{p}")
+        logging.info(f"С proxyscrape.com получено {len(raw)} прокси")
+    except Exception as e:
+        logging.error(f"Ошибка загрузки proxyscrape: {e}")
+    
+    # Убираем дубликаты
+    proxies = list(dict.fromkeys(proxies))
+    logging.info(f"Всего уникальных прокси: {len(proxies)}")
+    return proxies
 
-# ==================== УМНЫЙ ПУЛ С ЛЕНИВОЙ ПРОВЕРКОЙ ====================
-class LazyProxyPool:
-    def __init__(self, api_url):
-        self.api_url = api_url
-        self.all_proxies = []          # весь список (непроверенные)
-        self.working_proxies = []      # проверенные рабочие
-        self.current_index = 0
+def quick_check_proxy(proxy_url):
+    """Быстрая проверка прокси (таймаут 5 секунд) на доступность."""
+    test_url = "https://www.ebay.com"
+    proxies = {"http": proxy_url, "https": proxy_url}
+    try:
+        response = cffi_requests.get(test_url, proxies=proxies, impersonate="chrome124", timeout=5)
+        return response.status_code == 200
+    except Exception:
+        return False
+
+# ==================== УМНЫЙ ПУЛ С ПРЕДВАРИТЕЛЬНОЙ ПРОВЕРКОЙ ====================
+class SmartProxyPool:
+    def __init__(self):
+        self.working_proxies = []   # список проверенных рабочих прокси
         self.lock = threading.Lock()
-        self.load_proxies()
-        # Раз в час обновляем список (добавляем свежие)
-        self.start_refresh_thread()
+        self.refresh_proxies()      # первичная загрузка и проверка
+        # Фоновое обновление каждый час
+        threading.Thread(target=self._refresh_loop, daemon=True).start()
 
-    def load_proxies(self):
-        """Загружает свежие прокси и добавляет их в конец очереди (не удаляя старые рабочие)."""
-        new_list = fetch_proxy_list()
+    def _refresh_loop(self):
+        while True:
+            time.sleep(3600)
+            self.refresh_proxies()
+
+    def refresh_proxies(self):
+        """Загружает свежие прокси, быстро проверяет и обновляет пул."""
+        logging.info("Обновление пула прокси (может занять 1-2 минуты)...")
+        all_proxies = fetch_proxy_list()
+        if not all_proxies:
+            logging.warning("Не удалось загрузить прокси, пул остаётся прежним.")
+            return
+        
+        working = []
+        total = len(all_proxies)
+        for i, proxy in enumerate(all_proxies):
+            if i % 100 == 0:
+                logging.info(f"Проверка прокси: {i}/{total}")
+            if quick_check_proxy(proxy):
+                working.append(proxy)
+        
         with self.lock:
-            if new_list:
-                # Добавляем только те, которых ещё нет в all_proxies
-                existing = set(self.all_proxies)
-                added = 0
-                for p in new_list:
-                    if p not in existing:
-                        self.all_proxies.append(p)
-                        added += 1
-                logging.info(f"Добавлено {added} новых прокси из API. Всего в очереди: {len(self.all_proxies)}")
-            else:
-                logging.warning("Не удалось обновить список прокси.")
-
-    def start_refresh_thread(self):
-        def refresh_loop():
-            while True:
-                time.sleep(3600)  # каждый час
-                self.load_proxies()
-        thread = threading.Thread(target=refresh_loop, daemon=True)
-        thread.start()
+            self.working_proxies = working
+        logging.info(f"Пул обновлён: {len(working)} рабочих прокси из {total}")
 
     def get_proxy(self):
-        """
-        Возвращает прокси для запроса.
-        Сначала пытается взять случайный из рабочих (проверенных).
-        Если рабочих нет — берёт следующий из общей очереди и помечает его как "тестируемый".
-        """
+        """Возвращает случайный рабочий прокси или None, если пул пуст."""
         with self.lock:
-            # Если есть проверенные рабочие — используем их (случайный)
-            if self.working_proxies:
-                selected = random.choice(self.working_proxies)
-                return {"http": selected, "https": selected}, selected, True
-            # Иначе берём следующий из очереди
-            if not self.all_proxies:
-                return None, None, False
-            proxy = self.all_proxies[self.current_index]
-            self.current_index = (self.current_index + 1) % len(self.all_proxies)
-            return {"http": proxy, "https": proxy}, proxy, False
+            if not self.working_proxies:
+                return None
+            proxy = random.choice(self.working_proxies)
+            return {"http": proxy, "https": proxy}, proxy
 
-    def mark_success(self, proxy_url):
-        """Прокси успешно отработал — перемещаем в рабочий пул, если его там ещё нет."""
-        with self.lock:
-            if proxy_url not in self.working_proxies:
-                self.working_proxies.append(proxy_url)
-                logging.info(f"✅ Прокси {mask_proxy(proxy_url)} добавлен в рабочий пул (всего рабочих: {len(self.working_proxies)})")
-            # Также удаляем его из all_proxies, чтобы не повторяться
-            if proxy_url in self.all_proxies:
-                self.all_proxies.remove(proxy_url)
-
-    def mark_failure(self, proxy_url):
-        """Прокси не работает — удаляем из обоих списков."""
+    def report_failure(self, proxy_url):
+        """Удаляет прокси из пула при ошибке."""
         with self.lock:
             if proxy_url in self.working_proxies:
                 self.working_proxies.remove(proxy_url)
-                logging.warning(f"❌ Прокси {mask_proxy(proxy_url)} удалён из рабочих (осталось {len(self.working_proxies)})")
-            if proxy_url in self.all_proxies:
-                self.all_proxies.remove(proxy_url)
+                logging.warning(f"Прокси {mask_proxy(proxy_url)} удалён из пула. Осталось: {len(self.working_proxies)}")
 
 def mask_proxy(proxy_url):
-    return re.sub(r':([^:]+)@', ':****@', proxy_url) if proxy_url else "None"
+    if not proxy_url:
+        return "None"
+    # маскируем пароль, если есть
+    return re.sub(r':([^:]+)@', ':****@', proxy_url)
 
 # Глобальный пул
-proxy_pool = LazyProxyPool(PROXY_API_URL)
+proxy_pool = SmartProxyPool()
 
-# ==================== ФУНКЦИИ БОТА ====================
+# ==================== ОСТАЛЬНЫЕ ФУНКЦИИ БОТА ====================
 def send_telegram_message(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -156,16 +170,14 @@ def send_telegram_message(message):
         logging.error(f"Не удалось отправить в Telegram: {e}")
 
 def fetch_ebay_html():
-    """Загружает eBay через прокси (с автоматическим переключением при ошибке)."""
-    for attempt in range(5):
-        proxy_dict, proxy_url, is_working = proxy_pool.get_proxy()
+    """Загружает eBay через случайный рабочий прокси (с повторными попытками)."""
+    for attempt in range(3):
+        proxy_dict, proxy_url = proxy_pool.get_proxy()
         if proxy_dict is None:
-            logging.warning("Нет доступных прокси, пробуем без прокси")
-            proxy_dict = None
-            proxy_url = "direct"
-        else:
-            logging.info(f"Попытка {attempt+1}/5 через {mask_proxy(proxy_url)} (рабочий: {is_working})")
+            logging.error("Нет рабочих прокси, бот не может продолжить.")
+            return None
         
+        logging.info(f"Попытка {attempt+1}/3 через {mask_proxy(proxy_url)}")
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
@@ -174,32 +186,27 @@ def fetch_ebay_html():
             'Sec-Ch-Ua': '"Google Chrome";v="124", "Chromium";v="124", "Not-A.Brand";v="99"',
             'Upgrade-Insecure-Requests': '1',
         }
-        time.sleep(random.uniform(1.0, 3.0))
+        time.sleep(random.uniform(1.0, 2.0))
         try:
             response = cffi_requests.get(
                 EBAY_SEARCH_URL,
                 headers=headers,
                 impersonate="chrome124",
                 proxies=proxy_dict,
-                timeout=45
+                timeout=30
             )
             if response.status_code == 200:
                 logging.info("Страница успешно загружена")
-                if proxy_url != "direct":
-                    proxy_pool.mark_success(proxy_url)
                 return response.text
             else:
                 logging.warning(f"Ошибка HTTP {response.status_code}")
-                if proxy_url != "direct":
-                    proxy_pool.mark_failure(proxy_url)
+                proxy_pool.report_failure(proxy_url)
         except Exception as e:
             logging.error(f"Ошибка запроса: {e}")
-            if proxy_url != "direct":
-                proxy_pool.mark_failure(proxy_url)
+            proxy_pool.report_failure(proxy_url)
     logging.error("Все попытки не удались")
     return None
 
-# --- Остальные функции (парсинг, БД) без изменений ---
 def extract_item_id(url):
     if not url or '/itm/' not in url:
         return None
@@ -292,10 +299,10 @@ def check_new_items():
 
 def bot_worker():
     logging.info("🔄 Фоновый поток запущен")
-    time.sleep(10)
+    time.sleep(5)
     try:
         init_db_and_snapshot()
-        send_telegram_message("🚀 Бот запущен на Render.com с ленивой ротацией прокси (без массовой проверки)!")
+        send_telegram_message(f"🚀 Бот запущен на Render.com. Рабочих прокси: {len(proxy_pool.working_proxies)}")
         while True:
             try:
                 new_items = check_new_items()
@@ -323,7 +330,7 @@ def bot_worker():
 
 @app.route('/')
 def index():
-    return "eBay мониторинг бот работает (ленивая ротация)"
+    return f"eBay бот работает. Рабочих прокси: {len(proxy_pool.working_proxies)}"
 
 @app.route('/health')
 def health():
@@ -331,8 +338,16 @@ def health():
 
 if __name__ == "__main__":
     logging.info("Запуск процесса...")
-    total = len(proxy_pool.all_proxies)
-    send_telegram_message(f"✅ Бот загрузил {total} прокси. Проверка будет происходить по мере использования.")
+    # Ждём, пока пул прокси инициализируется (не дольше 2 минут)
+    timeout = 120
+    start = time.time()
+    while not proxy_pool.working_proxies and (time.time() - start) < timeout:
+        logging.info("Ожидание загрузки рабочих прокси...")
+        time.sleep(5)
+    if proxy_pool.working_proxies:
+        send_telegram_message(f"✅ Бот загрузил {len(proxy_pool.working_proxies)} рабочих прокси. Начинаем мониторинг.")
+    else:
+        send_telegram_message("⚠️ Не найдено ни одного рабочего прокси. Бот не сможет проверять eBay.")
     thread = threading.Thread(target=bot_worker, daemon=False)
     thread.start()
     port = int(os.environ.get("PORT", 5000))
