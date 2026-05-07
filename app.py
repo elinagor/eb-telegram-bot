@@ -27,7 +27,7 @@ load_dotenv()
 EBAY_SEARCH_URL = os.getenv("EBAY_SEARCH_URL")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "600"))
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "180"))
 BRIGHT_DATA_PROXY_URL = os.getenv("BRIGHT_DATA_PROXY_URL")
 DATABASE_URL = os.getenv("DATABASE_URL")
 MAX_ITEMS = 20  # Ограничение: обрабатывать только первые N товаров (чем меньше, тем свежее)
@@ -226,7 +226,7 @@ def bot_worker():
     while True:
         try:
             check_and_send_new_items()
-            wait = max(300, CHECK_INTERVAL + random.uniform(-60, 120))
+            wait = max(180, CHECK_INTERVAL + random.uniform(-60, 120))
             logging.info(f"Следующая проверка через {wait:.0f} секунд.")
             time.sleep(wait)
         except Exception as e:
