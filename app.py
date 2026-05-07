@@ -5,16 +5,16 @@ import random
 import sqlite3
 import threading
 import logging
-import re
 from datetime import datetime
 from bs4 import BeautifulSoup
 from flask import Flask
 from dotenv import load_dotenv
 
+# Импорт curl_cffi
 try:
     from curl_cffi import requests as cffi_requests
 except ImportError:
-    print("curl_cffi не установлен. Добавьте в requirements.txt")
+    logging.error("curl_cffi не установлен. Добавьте его в requirements.txt")
     sys.exit(1)
 
 load_dotenv()
@@ -24,136 +24,65 @@ EBAY_SEARCH_URL = os.getenv("EBAY_SEARCH_URL")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "600"))
-# ===============================
+
+# --- Новая переменная для прокси Bright Data ---
+BRIGHT_DATA_PROXY_URL = os.getenv("BRIGHT_DATA_PROXY_URL")
+# =============================================
 
 if not EBAY_SEARCH_URL or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-    logging.error("Не хватает переменных окружения.")
+    logging.error("Не хватает основных переменных окружения (EBAY_SEARCH_URL, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID).")
+    sys.exit(1)
+
+if not BRIGHT_DATA_PROXY_URL:
+    logging.error("Не указана переменная BRIGHT_DATA_PROXY_URL. Добавьте её в Environment Variables на Render.")
     sys.exit(1)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 app = Flask(__name__)
 
-# ==================== ЗАГРУЗКА ПРОКСИ (ТОЛЬКО HTTP/HTTPS) ====================
-def fetch_proxy_list():
-    """Загружает список HTTP/HTTPS прокси с двух источников."""
-    proxies = []
-    
-    # Источник 1: free-proxy-list.net (парсим таблицу)
+# ==================== ФУНКЦИЯ ДЛЯ ЗАПРОСОВ ЧЕРЕЗ BRIGHT DATA ====================
+def fetch_ebay_html():
+    """Выполняет запрос к eBay через прокси Bright Data."""
+    # Настраиваем прокси для curl_cffi
+    proxies = {
+        "http": BRIGHT_DATA_PROXY_URL,
+        "https": BRIGHT_DATA_PROXY_URL,
+    }
+
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+        'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
+        'Referer': 'https://www.ebay.com/',
+        'Sec-Ch-Ua': '"Google Chrome";v="124", "Chromium";v="124", "Not-A.Brand";v="99"',
+        'Upgrade-Insecure-Requests': '1',
+    }
+
     try:
-        import requests
-        logging.info("Загрузка прокси с free-proxy-list.net...")
-        resp = requests.get("https://free-proxy-list.net/", timeout=30)
-        soup = BeautifulSoup(resp.text, 'html.parser')
-        table = soup.find('table', id='proxylisttable')
-        if table:
-            for row in table.find_all('tr')[1:]:
-                cols = row.find_all('td')
-                if len(cols) >= 7:
-                    ip = cols[0].text.strip()
-                    port = cols[1].text.strip()
-                    https = cols[6].text.strip() == 'yes'
-                    if https:
-                        proxies.append(f"https://{ip}:{port}")
-                    else:
-                        proxies.append(f"http://{ip}:{port}")
-        logging.info(f"С free-proxy-list.net получено {len(proxies)} прокси")
+        # Делаем запрос, используя proxies и impersonate для маскировки
+        response = cffi_requests.get(
+            EBAY_SEARCH_URL,
+            headers=headers,
+            impersonate="chrome124",
+            proxies=proxies,
+            timeout=45
+        )
+        if response.status_code == 200:
+            logging.info("Страница eBay успешно загружена через Bright Data.")
+            return response.text
+        else:
+            logging.error(f"Ошибка HTTP {response.status_code} при запросе через Bright Data.")
+            return None
     except Exception as e:
-        logging.error(f"Ошибка загрузки free-proxy-list: {e}")
-    
-    # Источник 2: proxyscrape.com (только HTTP/HTTPS, elite+anonymous)
-    try:
-        logging.info("Загрузка прокси с proxyscrape.com...")
-        url = "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000&country=all&ssl=all&anonymity=elite%2Canonymous"
-        resp = requests.get(url, timeout=30)
-        raw = resp.text.split()
-        for p in raw:
-            p = p.strip()
-            if p:
-                if ':' in p:
-                    # формат ip:port, добавляем http://
-                    proxies.append(f"http://{p}")
-                else:
-                    proxies.append(f"http://{p}")
-        logging.info(f"С proxyscrape.com получено {len(raw)} прокси")
-    except Exception as e:
-        logging.error(f"Ошибка загрузки proxyscrape: {e}")
-    
-    # Убираем дубликаты
-    proxies = list(dict.fromkeys(proxies))
-    logging.info(f"Всего уникальных прокси: {len(proxies)}")
-    return proxies
+        logging.error(f"Ошибка при запросе через Bright Data: {e}")
+        return None
 
-def quick_check_proxy(proxy_url):
-    """Быстрая проверка прокси (таймаут 5 секунд) на доступность."""
-    test_url = "https://www.ebay.com"
-    proxies = {"http": proxy_url, "https": proxy_url}
-    try:
-        response = cffi_requests.get(test_url, proxies=proxies, impersonate="chrome124", timeout=5)
-        return response.status_code == 200
-    except Exception:
-        return False
+# --- ВСЕ ОСТАЛЬНЫЕ ФУНКЦИИ (парсинг, работа с БД, отправка сообщений) ОСТАЮТСЯ БЕЗ ИЗМЕНЕНИЙ ---
+# Они такие же, как в предыдущей стабильной версии вашего бота.
 
-# ==================== УМНЫЙ ПУЛ С ПРЕДВАРИТЕЛЬНОЙ ПРОВЕРКОЙ ====================
-class SmartProxyPool:
-    def __init__(self):
-        self.working_proxies = []   # список проверенных рабочих прокси
-        self.lock = threading.Lock()
-        self.refresh_proxies()      # первичная загрузка и проверка
-        # Фоновое обновление каждый час
-        threading.Thread(target=self._refresh_loop, daemon=True).start()
-
-    def _refresh_loop(self):
-        while True:
-            time.sleep(3600)
-            self.refresh_proxies()
-
-    def refresh_proxies(self):
-        """Загружает свежие прокси, быстро проверяет и обновляет пул."""
-        logging.info("Обновление пула прокси (может занять 1-2 минуты)...")
-        all_proxies = fetch_proxy_list()
-        if not all_proxies:
-            logging.warning("Не удалось загрузить прокси, пул остаётся прежним.")
-            return
-        
-        working = []
-        total = len(all_proxies)
-        for i, proxy in enumerate(all_proxies):
-            if i % 100 == 0:
-                logging.info(f"Проверка прокси: {i}/{total}")
-            if quick_check_proxy(proxy):
-                working.append(proxy)
-        
-        with self.lock:
-            self.working_proxies = working
-        logging.info(f"Пул обновлён: {len(working)} рабочих прокси из {total}")
-
-    def get_proxy(self):
-        """Возвращает случайный рабочий прокси или None, если пул пуст."""
-        with self.lock:
-            if not self.working_proxies:
-                return None
-            proxy = random.choice(self.working_proxies)
-            return {"http": proxy, "https": proxy}, proxy
-
-    def report_failure(self, proxy_url):
-        """Удаляет прокси из пула при ошибке."""
-        with self.lock:
-            if proxy_url in self.working_proxies:
-                self.working_proxies.remove(proxy_url)
-                logging.warning(f"Прокси {mask_proxy(proxy_url)} удалён из пула. Осталось: {len(self.working_proxies)}")
-
-def mask_proxy(proxy_url):
-    if not proxy_url:
-        return "None"
-    # маскируем пароль, если есть
-    return re.sub(r':([^:]+)@', ':****@', proxy_url)
-
-# Глобальный пул
-proxy_pool = SmartProxyPool()
-
-# ==================== ОСТАЛЬНЫЕ ФУНКЦИИ БОТА ====================
 def send_telegram_message(message):
+    # ... (без изменений) ...
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         'chat_id': TELEGRAM_CHAT_ID,
@@ -169,45 +98,8 @@ def send_telegram_message(message):
     except Exception as e:
         logging.error(f"Не удалось отправить в Telegram: {e}")
 
-def fetch_ebay_html():
-    """Загружает eBay через случайный рабочий прокси (с повторными попытками)."""
-    for attempt in range(3):
-        proxy_dict, proxy_url = proxy_pool.get_proxy()
-        if proxy_dict is None:
-            logging.error("Нет рабочих прокси, бот не может продолжить.")
-            return None
-        
-        logging.info(f"Попытка {attempt+1}/3 через {mask_proxy(proxy_url)}")
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-            'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
-            'Referer': 'https://www.ebay.com/',
-            'Sec-Ch-Ua': '"Google Chrome";v="124", "Chromium";v="124", "Not-A.Brand";v="99"',
-            'Upgrade-Insecure-Requests': '1',
-        }
-        time.sleep(random.uniform(1.0, 2.0))
-        try:
-            response = cffi_requests.get(
-                EBAY_SEARCH_URL,
-                headers=headers,
-                impersonate="chrome124",
-                proxies=proxy_dict,
-                timeout=30
-            )
-            if response.status_code == 200:
-                logging.info("Страница успешно загружена")
-                return response.text
-            else:
-                logging.warning(f"Ошибка HTTP {response.status_code}")
-                proxy_pool.report_failure(proxy_url)
-        except Exception as e:
-            logging.error(f"Ошибка запроса: {e}")
-            proxy_pool.report_failure(proxy_url)
-    logging.error("Все попытки не удались")
-    return None
-
 def extract_item_id(url):
+    # ... (без изменений) ...
     if not url or '/itm/' not in url:
         return None
     try:
@@ -216,6 +108,7 @@ def extract_item_id(url):
         return None
 
 def parse_ebay_listings(html):
+    # ... (без изменений) ...
     if not html:
         return {}
     soup = BeautifulSoup(html, 'html.parser')
@@ -245,6 +138,7 @@ def parse_ebay_listings(html):
     return items
 
 def init_db_and_snapshot():
+    # ... (без изменений) ...
     conn = sqlite3.connect('ebay_tracker.db')
     cursor = conn.cursor()
     cursor.execute('CREATE TABLE IF NOT EXISTS seen_items (item_id TEXT PRIMARY KEY, first_seen TIMESTAMP)')
@@ -252,7 +146,7 @@ def init_db_and_snapshot():
     logging.info("Делаем начальный снимок...")
     html = fetch_ebay_html()
     if not html:
-        logging.error("Не удалось загрузить eBay для снимка")
+        logging.error("Не удалось загрузить eBay для снимка. Проверьте работу прокси.")
         conn.close()
         return
     items = parse_ebay_listings(html)
@@ -266,9 +160,10 @@ def init_db_and_snapshot():
             pass
     conn.commit()
     conn.close()
-    logging.info(f"Начальный снимок: добавлено {count} товаров")
+    logging.info(f"Начальный снимок: добавлено {count} товаров (не будут отправлены)")
 
 def get_seen_ids():
+    # ... (без изменений) ...
     conn = sqlite3.connect('ebay_tracker.db')
     cursor = conn.cursor()
     cursor.execute('SELECT item_id FROM seen_items')
@@ -277,6 +172,7 @@ def get_seen_ids():
     return seen
 
 def add_seen_id(item_id):
+    # ... (без изменений) ...
     conn = sqlite3.connect('ebay_tracker.db')
     cursor = conn.cursor()
     cursor.execute('INSERT OR IGNORE INTO seen_items (item_id, first_seen) VALUES (?, ?)',
@@ -285,6 +181,7 @@ def add_seen_id(item_id):
     conn.close()
 
 def check_new_items():
+    # ... (без изменений) ...
     seen = get_seen_ids()
     html = fetch_ebay_html()
     if not html:
@@ -298,11 +195,12 @@ def check_new_items():
     return new_items
 
 def bot_worker():
+    # ... (без изменений) ...
     logging.info("🔄 Фоновый поток запущен")
-    time.sleep(5)
+    time.sleep(10)
     try:
         init_db_and_snapshot()
-        send_telegram_message(f"🚀 Бот запущен на Render.com. Рабочих прокси: {len(proxy_pool.working_proxies)}")
+        send_telegram_message(f"🚀 Бот запущен на Render.com, используя Bright Data Residential Proxy!")
         while True:
             try:
                 new_items = check_new_items()
@@ -325,12 +223,12 @@ def bot_worker():
                 time.sleep(120)
     except Exception as e:
         logging.error(f"Критическая ошибка: {e}", exc_info=True)
-        send_telegram_message("❌ Критическая ошибка, бот остановлен")
+        send_telegram_message("❌ Критическая ошибка, бот остановлен. Проверьте логи на Render.")
         sys.exit(1)
 
 @app.route('/')
 def index():
-    return f"eBay бот работает. Рабочих прокси: {len(proxy_pool.working_proxies)}"
+    return "eBay бот работает через Bright Data Proxy."
 
 @app.route('/health')
 def health():
@@ -338,16 +236,7 @@ def health():
 
 if __name__ == "__main__":
     logging.info("Запуск процесса...")
-    # Ждём, пока пул прокси инициализируется (не дольше 2 минут)
-    timeout = 120
-    start = time.time()
-    while not proxy_pool.working_proxies and (time.time() - start) < timeout:
-        logging.info("Ожидание загрузки рабочих прокси...")
-        time.sleep(5)
-    if proxy_pool.working_proxies:
-        send_telegram_message(f"✅ Бот загрузил {len(proxy_pool.working_proxies)} рабочих прокси. Начинаем мониторинг.")
-    else:
-        send_telegram_message("⚠️ Не найдено ни одного рабочего прокси. Бот не сможет проверять eBay.")
+    send_telegram_message("✅ Бот запускается и настраивает соединение через Bright Data.")
     thread = threading.Thread(target=bot_worker, daemon=False)
     thread.start()
     port = int(os.environ.get("PORT", 5000))
