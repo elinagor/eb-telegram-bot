@@ -30,6 +30,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "600"))
 BRIGHT_DATA_PROXY_URL = os.getenv("BRIGHT_DATA_PROXY_URL")
 DATABASE_URL = os.getenv("DATABASE_URL")
+MAX_ITEMS = 20  # Ограничение: обрабатывать только первые N товаров (чем меньше, тем свежее)
 
 if not all([EBAY_SEARCH_URL, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, BRIGHT_DATA_PROXY_URL, DATABASE_URL]):
     logging.error("Не хватает переменных окружения. Проверьте .env или настройки Render.")
@@ -43,7 +44,6 @@ def get_db_connection():
     return psycopg2.connect(DATABASE_URL)
 
 def init_db():
-    """Создаёт таблицу, если её нет."""
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -56,7 +56,6 @@ def init_db():
     logging.info("Таблица seen_items готова (PostgreSQL)")
 
 def get_seen_ids():
-    """Возвращает множество всех item_id, которые уже были отправлены."""
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT item_id FROM seen_items")
@@ -64,7 +63,6 @@ def get_seen_ids():
             return {row[0] for row in rows}
 
 def add_seen_ids_batch(item_ids):
-    """Добавляет несколько новых ID в БД за один раз."""
     if not item_ids:
         return
     with get_db_connection() as conn:
@@ -79,13 +77,12 @@ def add_seen_ids_batch(item_ids):
     logging.info(f"Добавлено {len(item_ids)} ID в базу")
 
 def is_db_empty():
-    """Проверяет, есть ли хоть одна запись в таблице."""
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT EXISTS (SELECT 1 FROM seen_items LIMIT 1)")
             return not cur.fetchone()[0]
 
-# ============ ОСТАЛЬНЫЕ ФУНКЦИИ ============
+# ============ ФУНКЦИИ ДЛЯ EBAY (С ПОВТОРНЫМИ ПОПЫТКАМИ) ============
 def send_telegram_message(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -102,7 +99,7 @@ def send_telegram_message(message):
     except Exception as e:
         logging.error(f"Не удалось отправить в Telegram: {e}")
 
-def fetch_ebay_html():
+def fetch_ebay_html_with_retry(retries=3, delay=10):
     proxies = {"http": BRIGHT_DATA_PROXY_URL, "https": BRIGHT_DATA_PROXY_URL}
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
@@ -112,24 +109,31 @@ def fetch_ebay_html():
         'Sec-Ch-Ua': '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="99"',
         'Upgrade-Insecure-Requests': '1',
     }
-    try:
-        response = cffi_requests.get(
-            EBAY_SEARCH_URL,
-            headers=headers,
-            impersonate="chrome131",
-            proxies=proxies,
-            verify=False,
-            timeout=45
-        )
-        if response.status_code == 200:
-            logging.info("Страница eBay успешно загружена")
-            return response.text
-        else:
-            logging.error(f"Ошибка HTTP {response.status_code}")
-            return None
-    except Exception as e:
-        logging.error(f"Ошибка при запросе: {e}")
-        return None
+    for attempt in range(1, retries+1):
+        try:
+            response = cffi_requests.get(
+                EBAY_SEARCH_URL,
+                headers=headers,
+                impersonate="chrome131",
+                proxies=proxies,
+                verify=False,
+                timeout=45
+            )
+            if response.status_code == 200:
+                logging.info("Страница eBay успешно загружена")
+                return response.text
+            else:
+                logging.warning(f"Попытка {attempt}: HTTP {response.status_code}")
+                if attempt < retries:
+                    time.sleep(delay)
+                continue
+        except Exception as e:
+            logging.error(f"Попытка {attempt} ошибка: {e}")
+            if attempt < retries:
+                time.sleep(delay)
+            continue
+    logging.error("Не удалось загрузить страницу после всех попыток")
+    return None
 
 def extract_item_id(url):
     if not url or '/itm/' not in url:
@@ -139,14 +143,17 @@ def extract_item_id(url):
     except IndexError:
         return None
 
-def parse_ebay_listings(html):
+def parse_ebay_listings(html, max_items=MAX_ITEMS):
     if not html:
         return {}
     soup = BeautifulSoup(html, 'html.parser')
     items = {}
+    # Находим все ссылки с '/itm/'
     links = soup.find_all('a', href=True)
     itm_links = [link for link in links if '/itm/' in link['href']]
-    logging.info(f"Найдено ссылок с '/itm/': {len(itm_links)}")
+    logging.info(f"Найдено всего ссылок с '/itm/': {len(itm_links)}")
+    # Ограничиваем количество первыми max_items
+    itm_links = itm_links[:max_items]
     for link in itm_links:
         url = link['href']
         if url.startswith('/'):
@@ -158,34 +165,32 @@ def parse_ebay_listings(html):
         if not title or title.lower() in ('', 'new listing', 'новое объявление'):
             continue
         items[item_id] = {'url': url, 'title': title}
-    logging.info(f"Извлечено уникальных товаров: {len(items)}")
+    logging.info(f"Обработано товаров (первые {max_items}): {len(items)}")
     return items
 
 def perform_initial_snapshot():
-    """Запоминает все текущие товары, чтобы никогда их не отправлять."""
-    logging.info("Делаем начальный снимок (сохраняем все ID из текущей выдачи)...")
-    html = fetch_ebay_html()
+    logging.info("Делаем начальный снимок (сохраняем ID из текущей выдачи)...")
+    html = fetch_ebay_html_with_retry()
     if not html:
-        logging.error("Не удалось загрузить eBay для начального снимка. Бот не может работать.")
+        logging.error("Не удалось загрузить eBay для начального снимка.")
         return False
-    items = parse_ebay_listings(html)
+    items = parse_ebay_listings(html, max_items=50)  # для снимка можно больше
     if not items:
-        logging.warning("На странице не найдено товаров. Проверьте ссылку поиска.")
+        logging.warning("На странице не найдено товаров. Проверьте ссылку.")
         return False
     item_ids = list(items.keys())
     add_seen_ids_batch(item_ids)
-    logging.info(f"Начальный снимок выполнен: добавлено {len(item_ids)} товаров в БД. Они НЕ будут отправлены.")
+    logging.info(f"Начальный снимок: добавлено {len(item_ids)} товаров. Они НЕ будут отправлены.")
     return True
 
 def check_and_send_new_items():
-    """Проверяет новые товары и отправляет только те, которых ещё нет в БД."""
     seen = get_seen_ids()
-    logging.info(f"В базе данных уже {len(seen)} уникальных товаров.")
-
-    html = fetch_ebay_html()
+    logging.info(f"В базе данных {len(seen)} уникальных товаров.")
+    html = fetch_ebay_html_with_retry()
     if not html:
+        logging.error("Не удалось получить HTML, пропускаем этот цикл.")
         return
-    current_items = parse_ebay_listings(html)
+    current_items = parse_ebay_listings(html, max_items=MAX_ITEMS)
     new_items = []
     for item_id, data in current_items.items():
         if item_id not in seen:
@@ -198,7 +203,6 @@ def check_and_send_new_items():
                    f"📦 <b>{item['title']}</b>\n\n"
                    f"🔗 <a href='{item['url']}'>Ссылка на товар</a>")
             send_telegram_message(msg)
-            # Добавляем ID в БД сразу, чтобы не отправить повторно
             add_seen_ids_batch([item['id']])
             time.sleep(1)
     else:
@@ -206,12 +210,9 @@ def check_and_send_new_items():
 
 def bot_worker():
     logging.info("🔄 Фоновый поток запущен")
-    time.sleep(5)  # Даём время Flask подняться
+    time.sleep(5)
 
-    # Инициализация БД
     init_db()
-
-    # Если таблица пуста – делаем начальный снимок (старые товары не отправятся)
     if is_db_empty():
         logging.info("База данных пуста. Выполняется начальный снимок...")
         if not perform_initial_snapshot():
@@ -222,7 +223,6 @@ def bot_worker():
         logging.info("База данных уже содержит товары. Пропускаем начальный снимок.")
         send_telegram_message("✅ Бот перезапущен. Продолжаю отслеживание новых товаров (старые не будут дублироваться).")
 
-    # Основной цикл проверки
     while True:
         try:
             check_and_send_new_items()
@@ -235,7 +235,7 @@ def bot_worker():
 
 @app.route('/')
 def index():
-    return "eBay бот работает с PostgreSQL (только новые товары)"
+    return "eBay бот работает с PostgreSQL (только свежие товары, устойчив к 502)"
 
 @app.route('/health')
 def health():
@@ -243,7 +243,7 @@ def health():
 
 if __name__ == "__main__":
     logging.info("Запуск бота...")
-    send_telegram_message("🚀 Бот запускается с PostgreSQL и Bright Data.")
+    send_telegram_message("🚀 Бот запускается с PostgreSQL и Bright Data (улучшенная устойчивость, ограничение на количество товаров).")
     thread = threading.Thread(target=bot_worker, daemon=False)
     thread.start()
     port = int(os.environ.get("PORT", 5000))
