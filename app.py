@@ -25,7 +25,7 @@ EBAY_SEARCH_URL = os.getenv("EBAY_SEARCH_URL")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "600"))
-RAW_PROXY_LIST = os.getenv("PROXY_LIST", "")
+PROXY_API_URL = os.getenv("PROXY_API_URL", "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text&anonymity=elite%2Canonymous")
 # ===============================
 
 if not EBAY_SEARCH_URL or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -36,17 +36,45 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 app = Flask(__name__)
 
+# ==================== ФУНКЦИЯ ЗАГРУЗКИ ПРОКСИ ИЗ API ====================
+def fetch_proxy_list():
+    """
+    Загружает список прокси с API и возвращает список строк в формате protocol://ip:port.
+    """
+    try:
+        import requests
+        logging.info("Загрузка свежего списка прокси с API...")
+        response = requests.get(PROXY_API_URL, timeout=30)
+        response.raise_for_status()
+        # API возвращает одну строку с прокси, разделёнными пробелами
+        proxy_text = response.text
+        raw_proxies = [p.strip() for p in proxy_text.split() if p.strip()]
+        # Проверяем, что каждый прокси имеет схему. Если нет — добавляем http:// по умолчанию
+        validated = []
+        for p in raw_proxies:
+            if p.startswith(('http://', 'https://', 'socks4://', 'socks5://')):
+                validated.append(p)
+            else:
+                # Если схема отсутствует, предполагаем, что это http
+                validated.append(f"http://{p}")
+        logging.info(f"Загружено {len(validated)} прокси с API.")
+        return validated
+    except Exception as e:
+        logging.error(f"Ошибка загрузки списка прокси: {e}")
+        return []
+
 # ==================== ФУНКЦИЯ КОНВЕРТАЦИИ ПРОКСИ ====================
 def normalize_proxy_url(proxy: str) -> str:
-    """Приводит прокси к формату http://login:password@ip:port или socks5://..."""
+    """Приводит прокси к формату, ожидаемому curl_cffi."""
     if not proxy:
         return ""
-    proxy = proxy.strip()
-    # Если уже есть схема (http://, socks5:// и т.д.)
+    # Если уже есть схема и формат правильный
     if re.match(r'^(http|https|socks4|socks5|socks5h)://', proxy, re.I):
+        # Убедимся, что нет двоеточий в порту, и при необходимости добавим логин:пароль, если они есть
+        # Для простоты считаем, что пришедший прокси уже в формате protocol://ip:port
         return proxy
-    # Если начинается с http:// без логина (http://ip:port)
-    if proxy.startswith("http://") and "@" not in proxy:
+    # Если начинается с http://, но без логина
+    if proxy.startswith("http://"):
         return proxy
     # Убираем возможный http:// в начале
     if proxy.startswith("http://"):
@@ -63,37 +91,31 @@ def normalize_proxy_url(proxy: str) -> str:
         logging.warning(f"Неизвестный формат прокси: {proxy}")
         return None
 
-# ==================== УПРАВЛЕНИЕ ПРОКСИ ====================
+# ==================== УПРАВЛЕНИЕ ПРОКСИ-ПУЛОМ ====================
 class ProxyManager:
-    def __init__(self, proxy_list_string: str):
-        self.raw_proxies = [p.strip() for p in proxy_list_string.split(',') if p.strip()]
-        self.working_proxies = []  # список словарей {'url': str, 'fail_count': int}
-        self._init_pool()
+    def __init__(self, api_url):
+        self.api_url = api_url
+        self.working_proxies = []  # {'url': str, 'fail_count': int}
+        self.lock = threading.Lock()
+        self._update_pool()
 
-    def _init_pool(self):
-        if not self.raw_proxies:
-            logging.warning("Список прокси пуст. Будет работать без прокси.")
+    def _update_pool(self):
+        """Обновляет пул прокси: загружает новые и проверяет их."""
+        logging.info("Обновление пула прокси...")
+        raw_list = fetch_proxy_list()
+        if not raw_list:
+            logging.warning("Пул прокси пуст. Бот продолжит работу с существующим пулом.")
             return
-        # Конвертируем каждый прокси
-        converted = []
-        for p in self.raw_proxies:
+        # Конвертируем и проверяем новые прокси
+        new_working = []
+        for p in raw_list:
             norm = normalize_proxy_url(p)
-            if norm:
-                converted.append(norm)
-            else:
-                logging.warning(f"Прокси {p} пропущен — неверный формат")
-        if not converted:
-            logging.error("Нет валидных прокси. Работа без прокси.")
-            return
-        # Проверяем каждый прокси
-        logging.info(f"Проверка {len(converted)} прокси...")
-        for url in converted:
-            if self._check_proxy(url):
-                self.working_proxies.append({'url': url, 'fail_count': 0})
-                logging.info(f"✅ Прокси работает: {self._mask(url)}")
-            else:
-                logging.warning(f"❌ Прокси не работает: {self._mask(url)}")
-        logging.info(f"Доступно рабочих прокси: {len(self.working_proxies)}")
+            if norm and self._check_proxy(norm):
+                new_working.append({'url': norm, 'fail_count': 0})
+                logging.info(f"✅ Новый рабочий прокси: {self._mask(norm)}")
+        with self.lock:
+            self.working_proxies = new_working
+        logging.info(f"Пул обновлён. Всего рабочих прокси: {len(self.working_proxies)}")
 
     def _check_proxy(self, proxy_url: str) -> bool:
         """Проверяет прокси, делая тестовый запрос к eBay."""
@@ -104,7 +126,7 @@ class ProxyManager:
                 test_url,
                 proxies=proxies,
                 impersonate="chrome124",
-                timeout=20
+                timeout=15
             )
             return response.status_code == 200
         except Exception:
@@ -115,26 +137,35 @@ class ProxyManager:
         return re.sub(r':([^:]+)@', ':****@', url)
 
     def get_proxy(self):
-        """Возвращает словарь прокси для curl_cffi и запись из списка."""
-        if not self.working_proxies:
-            return None, None
-        selected = random.choice(self.working_proxies)
-        proxy_url = selected['url']
-        return {"http": proxy_url, "https": proxy_url}, selected
+        """Возвращает случайный рабочий прокси из пула."""
+        with self.lock:
+            if not self.working_proxies:
+                return None, None
+            selected = random.choice(self.working_proxies)
+            proxy_url = selected['url']
+            return {"http": proxy_url, "https": proxy_url}, selected
 
     def report_failure(self, proxy_entry):
         """Увеличивает счётчик ошибок, при 3 неудачах удаляет прокси."""
-        proxy_entry['fail_count'] += 1
-        if proxy_entry['fail_count'] >= 3:
-            logging.warning(f"Прокси {self._mask(proxy_entry['url'])} исключён (3 ошибки).")
-            self.working_proxies.remove(proxy_entry)
-        else:
-            logging.warning(f"Прокси {self._mask(proxy_entry['url'])} ошибка, счётчик: {proxy_entry['fail_count']}/3")
+        with self.lock:
+            if proxy_entry not in self.working_proxies:
+                return
+            proxy_entry['fail_count'] += 1
+            if proxy_entry['fail_count'] >= 3:
+                logging.warning(f"Прокси {self._mask(proxy_entry['url'])} исключён (3 ошибки).")
+                self.working_proxies.remove(proxy_entry)
+            else:
+                logging.warning(f"Прокси {self._mask(proxy_entry['url'])} ошибка, счётчик: {proxy_entry['fail_count']}/3")
 
 # Глобальный менеджер прокси
-proxy_manager = ProxyManager(RAW_PROXY_LIST)
+proxy_manager = ProxyManager(PROXY_API_URL)
 
-# ==================== ОСТАЛЬНЫЕ ФУНКЦИИ ====================
+# ==================== ОСТАЛЬНЫЕ ФУНКЦИИ БОТА ====================
+# ... (функции send_telegram_message, fetch_ebay_html, parse_ebay_listings, 
+#      init_db_and_snapshot, get_seen_ids, add_seen_id, check_new_items, bot_worker)
+# Обратите внимание, что эти функции должны использовать proxy_manager. 
+# Для экономии места я их здесь привожу полностью, но в финальном коде они будут.
+
 def send_telegram_message(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -153,14 +184,14 @@ def send_telegram_message(message):
 
 def fetch_ebay_html():
     """Загружает страницу через случайный прокси из пула (или без прокси)."""
-    # Пытаемся до 5 раз с разными прокси
-    for attempt in range(5):
+    for attempt in range(3):
         proxy_dict, proxy_entry = proxy_manager.get_proxy()
         if proxy_dict is None:
             logging.warning("Прокси нет, пробуем прямой запрос")
+            # В реальности прямой запрос с IP Render может не работать, но оставим как запасной вариант
         else:
-            logging.info(f"Попытка {attempt+1}/5 через {proxy_manager._mask(proxy_entry['url'])}")
-        # Заголовки
+            logging.info(f"Попытка {attempt+1}/3 через {proxy_manager._mask(proxy_entry['url'])}")
+        # Заголовки (можно упростить)
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
@@ -291,7 +322,7 @@ def bot_worker():
     time.sleep(10)
     try:
         init_db_and_snapshot()
-        send_telegram_message("🚀 Бот запущен на Render.com с поддержкой прокси!")
+        send_telegram_message("🚀 Бот запущен на Render.com с динамическим пулом бесплатных прокси!")
         logging.info("Переход в основной цикл")
         while True:
             try:
@@ -328,14 +359,12 @@ def health():
 
 if __name__ == "__main__":
     logging.info("Запуск процесса...")
-    # Если нет рабочих прокси, отправляем предупреждение
-    if not proxy_manager.working_proxies and RAW_PROXY_LIST:
+    # Отправим приветственное сообщение с количеством прокси в пуле
+    if proxy_manager.working_proxies:
+        send_telegram_message(f"✅ Бот использует {len(proxy_manager.working_proxies)} рабочих прокси из бесплатного API.")
+    else:
         logging.warning("Нет рабочих прокси, бот будет работать без них (риск 403)")
         send_telegram_message("⚠️ Внимание: нет рабочих прокси. Возможны блокировки eBay.")
-    elif not RAW_PROXY_LIST:
-        logging.info("Прокси не настроены. Работаем напрямую.")
-    else:
-        send_telegram_message(f"✅ Бот использует {len(proxy_manager.working_proxies)} рабочих прокси.")
     thread = threading.Thread(target=bot_worker, daemon=False)
     thread.start()
     port = int(os.environ.get("PORT", 5000))
