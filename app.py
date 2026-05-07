@@ -27,10 +27,12 @@ load_dotenv()
 EBAY_SEARCH_URL = os.getenv("EBAY_SEARCH_URL")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "180"))
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "180"))   # Изменено: 3 минуты (180 сек)
 BRIGHT_DATA_PROXY_URL = os.getenv("BRIGHT_DATA_PROXY_URL")
 DATABASE_URL = os.getenv("DATABASE_URL")
-MAX_ITEMS = 20  # Ограничение: обрабатывать только первые N товаров (чем меньше, тем свежее)
+MAX_ITEMS = 20              # Ограничение: обрабатывать только первые N товаров (первые в выдаче)
+MAX_RETRIES = 10            # Максимальное количество попыток при ошибках
+RETRY_DELAY = 5             # Задержка между попытками (секунды)
 
 if not all([EBAY_SEARCH_URL, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, BRIGHT_DATA_PROXY_URL, DATABASE_URL]):
     logging.error("Не хватает переменных окружения. Проверьте .env или настройки Render.")
@@ -99,7 +101,8 @@ def send_telegram_message(message):
     except Exception as e:
         logging.error(f"Не удалось отправить в Telegram: {e}")
 
-def fetch_ebay_html_with_retry(retries=3, delay=10):
+def fetch_ebay_html_with_retry():
+    """Выполняет запрос с повторными попытками (до MAX_RETRIES) при любых ошибках."""
     proxies = {"http": BRIGHT_DATA_PROXY_URL, "https": BRIGHT_DATA_PROXY_URL}
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
@@ -109,7 +112,7 @@ def fetch_ebay_html_with_retry(retries=3, delay=10):
         'Sec-Ch-Ua': '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="99"',
         'Upgrade-Insecure-Requests': '1',
     }
-    for attempt in range(1, retries+1):
+    for attempt in range(1, MAX_RETRIES + 1):
         try:
             response = cffi_requests.get(
                 EBAY_SEARCH_URL,
@@ -120,18 +123,16 @@ def fetch_ebay_html_with_retry(retries=3, delay=10):
                 timeout=45
             )
             if response.status_code == 200:
-                logging.info("Страница eBay успешно загружена")
+                logging.info(f"Страница eBay успешно загружена (попытка {attempt})")
                 return response.text
             else:
-                logging.warning(f"Попытка {attempt}: HTTP {response.status_code}")
-                if attempt < retries:
-                    time.sleep(delay)
-                continue
+                logging.warning(f"Попытка {attempt}/{MAX_RETRIES}: HTTP {response.status_code}")
+                if attempt < MAX_RETRIES:
+                    time.sleep(RETRY_DELAY)
         except Exception as e:
-            logging.error(f"Попытка {attempt} ошибка: {e}")
-            if attempt < retries:
-                time.sleep(delay)
-            continue
+            logging.error(f"Попытка {attempt}/{MAX_RETRIES}: ошибка запроса: {e}")
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_DELAY)
     logging.error("Не удалось загрузить страницу после всех попыток")
     return None
 
@@ -152,7 +153,7 @@ def parse_ebay_listings(html, max_items=MAX_ITEMS):
     links = soup.find_all('a', href=True)
     itm_links = [link for link in links if '/itm/' in link['href']]
     logging.info(f"Найдено всего ссылок с '/itm/': {len(itm_links)}")
-    # Ограничиваем количество первыми max_items
+    # Ограничиваем количество первыми max_items (самые свежие)
     itm_links = itm_links[:max_items]
     for link in itm_links:
         url = link['href']
@@ -226,7 +227,7 @@ def bot_worker():
     while True:
         try:
             check_and_send_new_items()
-            wait = max(180, CHECK_INTERVAL + random.uniform(-60, 120))
+            wait = max(180, CHECK_INTERVAL + random.uniform(-30, 60))  # минимум 3 минуты
             logging.info(f"Следующая проверка через {wait:.0f} секунд.")
             time.sleep(wait)
         except Exception as e:
@@ -235,7 +236,7 @@ def bot_worker():
 
 @app.route('/')
 def index():
-    return "eBay бот работает с PostgreSQL (только свежие товары, устойчив к 502)"
+    return "eBay бот работает (интервал 180 сек, 10 попыток при ошибках)"
 
 @app.route('/health')
 def health():
@@ -243,7 +244,7 @@ def health():
 
 if __name__ == "__main__":
     logging.info("Запуск бота...")
-    send_telegram_message("🚀 Бот запускается с PostgreSQL и Bright Data (улучшенная устойчивость, ограничение на количество товаров).")
+    send_telegram_message("🚀 Бот запущен: интервал проверки 3 минуты, до 10 попыток при ошибках.")
     thread = threading.Thread(target=bot_worker, daemon=False)
     thread.start()
     port = int(os.environ.get("PORT", 5000))
