@@ -30,7 +30,7 @@ load_dotenv()
 EBAY_SEARCH_URL = os.getenv("EBAY_SEARCH_URL")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))   # ИЗМЕНЕНО на 60 секунд
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))   # 60 секунд
 BRIGHT_DATA_PROXY_URL = os.getenv("BRIGHT_DATA_PROXY_URL")
 DATABASE_URL = os.getenv("DATABASE_URL")
 MAX_ITEMS = 20
@@ -349,29 +349,44 @@ def extract_shipping(card, item_price=None):
             return pc
     return None
 
-# ============ НОВАЯ ФУНКЦИЯ: ОПРЕДЕЛЕНИЕ BEST OFFER ============
+# ============ ОПРЕДЕЛЕНИЕ BEST OFFER ============
 def extract_best_offer(card):
-    """
-    Ищет индикатор «or Best Offer» в карточке товара.
-    Возвращает True, если найден, иначе False.
-    """
-    # Прямой поиск текста
     text = card.get_text()
     if re.search(r'or\s+best\s+offer', text, re.I):
         return True
-    # Специфические селекторы eBay для Best Offer
     best_offer_selectors = [
-        '.s-item__best-offer',
-        '.s-item__detail--best-offer',
-        '.s-item__bonus',
-        '[class*="bestOffer"]',
-        '[class*="best-offer"]'
+        '.s-item__best-offer', '.s-item__detail--best-offer', '.s-item__bonus',
+        '[class*="bestOffer"]', '[class*="best-offer"]'
     ]
     for sel in best_offer_selectors:
         if card.select_one(sel):
             return True
-    # Поиск по атрибутам
     if card.select_one('[data-best-offer="true"]'):
+        return True
+    return False
+
+# ============ ОПРЕДЕЛЕНИЕ АУКЦИОНА (BIDS) ============
+def extract_auction(card):
+    """
+    Возвращает True, если товар является аукционным (есть ставки "bid").
+    Ищет текст "bid" или количество ставок, а также специальные классы.
+    """
+    # Поиск по тексту
+    text = card.get_text()
+    if re.search(r'\d+\s+bids?\b', text, re.I):
+        return True
+    if re.search(r'\bplace\s+bid\b', text, re.I):
+        return True
+    # Поиск по классам и атрибутам
+    auction_selectors = [
+        '.s-item__bid-count', '.s-item__bids', '[class*="bidCount"]',
+        '[class*="bids"]', '.vi-bidrev'
+    ]
+    for sel in auction_selectors:
+        if card.select_one(sel):
+            return True
+    # Поиск ссылок с параметром "bid"
+    if card.select_one('a[href*="bid"]'):
         return True
     return False
 
@@ -414,13 +429,15 @@ def parse_ebay_listings(html, max_items=MAX_ITEMS):
         shipping = extract_shipping(card, item_price=price)
         if shipping and shipping != "Бесплатно" and not is_usd_price(shipping):
             shipping = None
-        best_offer = extract_best_offer(card)  # <-- НОВОЕ
+        best_offer = extract_best_offer(card)
+        auction = extract_auction(card)
         items[item_id] = {
             'url': url,
             'title': title,
             'price': price,
             'shipping': shipping,
-            'best_offer': best_offer   # <-- НОВОЕ
+            'best_offer': best_offer,
+            'auction': auction
         }
         processed += 1
     logging.info(f"Обработано товаров: {len(items)}")
@@ -444,6 +461,7 @@ def parse_ebay_listings_fallback(soup, max_items):
         price = None
         shipping = None
         best_offer = False
+        auction = False
         parent = link.parent
         for _ in range(5):
             if parent:
@@ -454,7 +472,8 @@ def parse_ebay_listings_fallback(soup, max_items):
                 if shipping and shipping != "Бесплатно" and not is_usd_price(shipping):
                     shipping = None
                 best_offer = extract_best_offer(parent)
-                if price or shipping or best_offer:
+                auction = extract_auction(parent)
+                if price or shipping or best_offer or auction:
                     break
                 parent = parent.parent
         items[item_id] = {
@@ -462,7 +481,8 @@ def parse_ebay_listings_fallback(soup, max_items):
             'title': title,
             'price': price,
             'shipping': shipping,
-            'best_offer': best_offer
+            'best_offer': best_offer,
+            'auction': auction
         }
     return items
 
@@ -489,7 +509,7 @@ def check_and_send_new_items():
     for item_id, data in current.items():
         if item_id not in seen:
             new.append({'id': item_id, **data})
-            logging.info(f"НОВЫЙ: {data['title'][:50]}... цена: {data['price']}, доставка: {data.get('shipping')}, best_offer: {data.get('best_offer')}")
+            logging.info(f"НОВЫЙ: {data['title'][:50]}... цена: {data['price']}, доставка: {data.get('shipping')}, best_offer: {data.get('best_offer')}, auction: {data.get('auction')}")
     if new:
         for item in new:
             msg = f"🔹 <b>НОВЫЙ ТОВАР НА EBAY</b> 🔹\n\n<b>{item['title']}</b>\n\n"
@@ -502,7 +522,9 @@ def check_and_send_new_items():
             else:
                 msg += f"🚚 Доставка: не указана\n"
             if item.get('best_offer', False):
-                msg += f"✅ Можно сделать предложение\n"
+                msg += f"✅ Сделать предложение (Best Offer)\n"
+            if item.get('auction', False):
+                msg += f"⏰ Аукцион\n"
             msg += f"\n🔗 <a href='{item['url']}'>Ссылка на товар</a>"
             send_telegram_message(msg)
             add_seen_ids_batch([item['id']])
@@ -527,7 +549,7 @@ def bot_worker():
             continue
         try:
             check_and_send_new_items()
-            wait = max(60, CHECK_INTERVAL + random.uniform(-30, 60))   # CHECK_INTERVAL = 60
+            wait = max(60, CHECK_INTERVAL + random.uniform(-30, 60))
             logging.info(f"Следующая проверка через {wait:.0f} секунд.")
             time.sleep(wait)
         except Exception as e:
@@ -536,14 +558,14 @@ def bot_worker():
 
 @app.route('/')
 def index():
-    return "eBay бот работает (интервал 60 сек, определяет Best Offer)"
+    return "eBay бот работает (интервал 60 сек, Best Offer + Auction)"
 
 @app.route('/health')
 def health():
     return "OK", 200
 
 if __name__ == "__main__":
-    send_telegram_message("🚀 Бот запущен. Интервал 60 сек, отслеживаю Best Offer")
+    send_telegram_message("🚀 Бот запущен. Интервал 60 сек, отслеживаю Best Offer и аукционы")
     threading.Thread(target=telegram_listener, daemon=True).start()
     worker_thread = threading.Thread(target=bot_worker, daemon=False)
     worker_thread.start()
