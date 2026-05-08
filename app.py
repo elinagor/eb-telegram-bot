@@ -50,10 +50,11 @@ if not all([EBAY_SEARCH_URL, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, BRIGHT_DATA_P
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 app = Flask(__name__)
 
-# ============ ГЛОБАЛЬНЫЕ ФЛАГИ ДЛЯ КОМАНД ============
-is_paused = False          # Флаг паузы
-restart_requested = False  # Флаг перезапуска (не используется, т.к. restart через execv)
-last_update_id = 0         # Для Telegram long polling
+# ============ ГЛОБАЛЬНЫЕ ФЛАГИ ============
+is_paused = False
+restart_flag = False
+bot_worker_thread = None
+worker_should_exit = False
 
 # ============ РОТАЦИЯ USER-AGENT ============
 USER_AGENTS = [
@@ -108,8 +109,9 @@ def send_telegram_message(message, parse_mode='HTML'):
 
 # ============ ОБРАБОТЧИК КОМАНД (LONG POLLING) ============
 def telegram_listener():
-    global is_paused, last_update_id
+    global is_paused, restart_flag, bot_worker_thread, worker_should_exit
     logging.info("🔁 Поток слушателя команд Telegram запущен")
+    last_update_id = 0
     while True:
         try:
             url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
@@ -131,17 +133,27 @@ def telegram_listener():
                             send_telegram_message("▶ Бот продолжает работу")
                             logging.info("Команда /start - продолжение")
                         elif text == '/restart':
-                            send_telegram_message("🔄 Перезапуск бота через 2 секунды...")
-                            logging.info("Команда /restart - перезапуск процесса")
-                            time.sleep(2)
-                            # Полный перезапуск скрипта
-                            os.execv(sys.executable, [sys.executable] + sys.argv)
+                            if bot_worker_thread and bot_worker_thread.is_alive():
+                                send_telegram_message("🔄 Перезапуск бота...")
+                                logging.info("Команда /restart - мягкий перезапуск воркера")
+                                worker_should_exit = True
+                                bot_worker_thread.join(timeout=10)
+                                # Запускаем новый воркер
+                                worker_should_exit = False
+                                bot_worker_thread = threading.Thread(target=bot_worker, daemon=False)
+                                bot_worker_thread.start()
+                                send_telegram_message("✅ Бот успешно перезапущен")
+                            else:
+                                send_telegram_message("⚠ Воркер не активен, запускаю новый")
+                                worker_should_exit = False
+                                bot_worker_thread = threading.Thread(target=bot_worker, daemon=False)
+                                bot_worker_thread.start()
             time.sleep(1)
         except Exception as e:
             logging.error(f"Ошибка в слушателе Telegram: {e}")
             time.sleep(5)
 
-# ============ ЗАПРОС К EBAY ============
+# ============ ЗАПРОС К EBAY (Аналогично предыдущему коду) ============
 def fetch_ebay_html_with_retry():
     proxies = {"http": BRIGHT_DATA_PROXY_URL, "https": BRIGHT_DATA_PROXY_URL}
     cookies = {'ebay': '%2F', 'm': 'USA', 's': 'S0'}
@@ -475,7 +487,7 @@ def check_and_send_new_items():
         logging.info("Новых нет")
 
 def bot_worker():
-    global is_paused
+    global is_paused, worker_should_exit
     logging.info("🤖 Бот-воркер запущен")
     init_db()
     if is_db_empty():
@@ -485,7 +497,7 @@ def bot_worker():
         send_telegram_message("✅ Бот запущен, начальный снимок сделан")
     else:
         send_telegram_message("✅ Бот перезапущен")
-    while True:
+    while not worker_should_exit:
         if is_paused:
             time.sleep(2)
             continue
@@ -493,10 +505,15 @@ def bot_worker():
             check_and_send_new_items()
             wait = max(60, CHECK_INTERVAL + random.uniform(-30, 60))
             logging.info(f"Следующая проверка через {wait:.0f} секунд.")
-            time.sleep(wait)
+            # Выход из цикла, если запрошен перезапуск (спим с частыми проверками)
+            for _ in range(int(wait)):
+                if worker_should_exit:
+                    break
+                time.sleep(1)
         except Exception as e:
             logging.error(f"Ошибка в основном цикле: {e}", exc_info=True)
             time.sleep(120)
+    logging.info("Бот-воркер завершает работу по запросу перезапуска")
 
 @app.route('/')
 def index():
@@ -508,11 +525,12 @@ def health():
 
 if __name__ == "__main__":
     send_telegram_message("🚀 Бот запущен. Доступны команды: /stop, /start, /restart")
-    # Запускаем слушателя команд (демонический поток)
+    # Запускаем слушателя команд (демонический)
     threading.Thread(target=telegram_listener, daemon=True).start()
-    # Запускаем основной воркер (не демонический, чтобы процесс не завершился)
-    worker_thread = threading.Thread(target=bot_worker, daemon=False)
-    worker_thread.start()
+    # Запускаем основной воркер в не-демоническом потоке
+    global bot_worker_thread
+    bot_worker_thread = threading.Thread(target=bot_worker, daemon=False)
+    bot_worker_thread.start()
     # Запускаем Flask
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
