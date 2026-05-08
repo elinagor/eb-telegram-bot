@@ -156,7 +156,6 @@ def clean_title(title):
     return title
 
 def is_valid_price(text):
-    """Проверяет, похоже ли на цену."""
     if not text or len(text) > 20:
         return False
     has_digit = re.search(r'\d', text)
@@ -166,45 +165,35 @@ def is_valid_price(text):
         return False
     if not (has_currency or has_decimal):
         return False
-    # Если содержит слова shipping, delivery, handling — не цена
     if re.search(r'(?i)(shipping|delivery|handling|postage|versand|lieferung)', text):
         return False
     return True
 
 def extract_price_jsonld(card, url=None, soup=None):
-    """Извлекает цену из JSON-LD внутри карточки или общего скрипта."""
-    # Сначала ищем script внутри карточки
     script = card.find('script', type='application/ld+json')
     if script and script.string:
         try:
             data = json.loads(script.string)
             if isinstance(data, dict):
-                # Ищем offers
                 if 'offers' in data:
                     offers = data['offers']
                     if isinstance(offers, dict):
                         price = offers.get('price')
                         currency = offers.get('priceCurrency', '')
                         if price and price != '0':
-                            if currency:
-                                return f"{currency} {price}"
-                            return str(price)
+                            return f"{currency} {price}" if currency else str(price)
                     elif isinstance(offers, list) and len(offers) > 0:
                         first = offers[0]
                         price = first.get('price')
                         currency = first.get('priceCurrency', '')
                         if price and price != '0':
-                            if currency:
-                                return f"{currency} {price}"
-                            return str(price)
+                            return f"{currency} {price}" if currency else str(price)
                 elif 'price' in data:
                     price = data['price']
                     if price and price != '0':
                         return str(price)
         except:
             pass
-    
-    # Если внутри карточки нет, ищем общий JSON-LD по всему soup и сопоставляем по URL
     if soup and url:
         for script in soup.find_all('script', type='application/ld+json'):
             if not script.string:
@@ -218,16 +207,12 @@ def extract_price_jsonld(card, url=None, soup=None):
                             price = offers.get('price')
                             currency = offers.get('priceCurrency', '')
                             if price and price != '0':
-                                if currency:
-                                    return f"{currency} {price}"
-                                return str(price)
+                                return f"{currency} {price}" if currency else str(price)
             except:
                 continue
     return None
 
 def extract_price_css(card):
-    """Запасной метод: поиск цены через CSS-селекторы с фильтрацией."""
-    # Приоритетные селекторы
     selectors = [
         'span.s-item__price',
         '[data-testid="item-price"]',
@@ -239,13 +224,10 @@ def extract_price_css(card):
         elem = card.select_one(sel)
         if elem:
             text = elem.get_text(strip=True)
-            # Убираем перечеркнутые (старые цены)
             if elem.find('span', class_='s-item__price--strikethrough'):
                 continue
             if is_valid_price(text):
                 return text
-    
-    # Если не нашли, пробуем любой элемент с классом содержащим 'price'
     for elem in card.select('[class*="price"]'):
         text = elem.get_text(strip=True)
         if is_valid_price(text):
@@ -279,7 +261,6 @@ def parse_ebay_listings(html, max_items=MAX_ITEMS):
             if not item_id:
                 continue
             
-            # Название
             title_elem = (card.select_one('div.s-item__title span[role="heading"]') or
                           card.select_one('span[role="heading"]') or
                           card.select_one('div.s-item__title') or
@@ -291,7 +272,6 @@ def parse_ebay_listings(html, max_items=MAX_ITEMS):
                 if not title:
                     continue
             
-            # Цена: сначала JSON-LD, потом CSS
             price = extract_price_jsonld(card, url, soup)
             if not price:
                 price = extract_price_css(card)
@@ -306,7 +286,7 @@ def parse_ebay_listings(html, max_items=MAX_ITEMS):
         logging.info(f"Обработано {len(items_data)} товаров")
         return items_data
     
-    # Резерв
+    # Резервный поиск по ссылкам
     logging.warning("Карточки не найдены, поиск по ссылкам")
     links = soup.find_all('a', href=True)
     itm_links = [link for link in links if '/itm/' in link['href']]
@@ -359,7 +339,13 @@ def check_and_send_new_items():
     new_items = []
     for item_id, data in current_items.items():
         if item_id not in seen:
-            new_items.append(data)
+            # Добавляем id в словарь
+            new_items.append({
+                'id': item_id,
+                'url': data['url'],
+                'title': data['title'],
+                'price': data['price']
+            })
             logging.info(f"НОВЫЙ: {data['title'][:50]}... цена: {data['price']}")
     if new_items:
         for item in new_items:
