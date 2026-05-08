@@ -31,20 +31,18 @@ EBAY_SEARCH_URL = os.getenv("EBAY_SEARCH_URL")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))   # 60 секунд
-BRIGHT_DATA_PROXY_URL = os.getenv("BRIGHT_DATA_PROXY_URL")
 DATABASE_URL = os.getenv("DATABASE_URL")
 MAX_ITEMS = 20
 MAX_RETRIES = 20
 RETRY_DELAY = 5
 
 # Принудительная локализация Великобритании и фунты стерлингов
-# Добавляем параметры: товары из UK, сортировка по новизне, 240 товаров на страницу
 if '?' in EBAY_SEARCH_URL:
     EBAY_SEARCH_URL += '&LH_PrefLoc=3&_ipg=240&_sop=10'
 else:
     EBAY_SEARCH_URL += '?LH_PrefLoc=3&_ipg=240&_sop=10'
 
-if not all([EBAY_SEARCH_URL, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, BRIGHT_DATA_PROXY_URL, DATABASE_URL]):
+if not all([EBAY_SEARCH_URL, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DATABASE_URL]):
     logging.error("Не хватает переменных окружения.")
     sys.exit(1)
 
@@ -135,9 +133,8 @@ def telegram_listener():
             logging.error(f"Ошибка в слушателе Telegram: {e}")
             time.sleep(5)
 
-# ============ ЗАПРОС К EBAY ============
+# ============ ЗАПРОС К EBAY (БЕЗ ПРОКСИ) ============
 def fetch_ebay_html_with_retry():
-    proxies = {"http": BRIGHT_DATA_PROXY_URL, "https": BRIGHT_DATA_PROXY_URL}
     # Куки для Великобритании
     cookies = {'ebay': '%2F', 'm': 'GB', 's': 'UK', 'siteid': '3'}
     for attempt in range(1, MAX_RETRIES + 1):
@@ -159,7 +156,7 @@ def fetch_ebay_html_with_retry():
                 headers=headers,
                 cookies=cookies,
                 impersonate="chrome142",
-                proxies=proxies,
+                # proxies полностью убраны
                 verify=False,
                 timeout=35
             )
@@ -193,20 +190,16 @@ def clean_title(title):
     title = re.sub(r'(?i)new\s*listing', '', title)
     title = re.sub(r'(?i)\blisting\b', '', title)
     title = re.sub(r'(?i)\bnew\b', '', title)
-    title = re.sub(r'[^\w\s£€$]', ' ', title)   # оставляем £, €, $
+    title = re.sub(r'[^\w\s£€$]', ' ', title)
     title = re.sub(r'\s+', ' ', title).strip()
     return title
 
 def is_gbp_price(text):
-    """Проверяет, является ли текст ценой в фунтах стерлингов (£)"""
     if not text: return False
-    # Явный символ £ или GBP
     if re.search(r'£|\bGBP\b', text, re.I):
         return True
-    # Если есть другие валюты ($, €) — не GBP
     if re.search(r'[$€]|USD|EUR', text, re.I):
         return False
-    # Если есть цифры и возможно десятичный разделитель, но нет других валют — считаем потенциально GBP
     return re.search(r'\d', text) is not None
 
 def extract_price_jsonld(card, url=None, soup=None):
@@ -245,7 +238,6 @@ def extract_price_jsonld(card, url=None, soup=None):
                             candidates.append((price, currency))
             except:
                 continue
-    # Приоритет GBP
     for price, curr in candidates:
         if curr == 'GBP' or (curr == '' and str(price).startswith('£')):
             return f"£{price}"
@@ -356,7 +348,6 @@ def extract_shipping(card, item_price=None):
             return pc
     return None
 
-# ============ ОПРЕДЕЛЕНИЕ BEST OFFER ============
 def extract_best_offer(card):
     text = card.get_text()
     if re.search(r'or\s+best\s+offer', text, re.I):
@@ -372,7 +363,6 @@ def extract_best_offer(card):
         return True
     return False
 
-# ============ ОПРЕДЕЛЕНИЕ АУКЦИОНА (BIDS) ============
 def extract_auction(card):
     text = card.get_text()
     if re.search(r'\d+\s+bids?\b', text, re.I):
@@ -512,7 +502,6 @@ def check_and_send_new_items():
             logging.info(f"НОВЫЙ: {data['title'][:50]}... цена: {data['price']}, доставка: {data.get('shipping')}, best_offer: {data.get('best_offer')}, auction: {data.get('auction')}")
     if new:
         for item in new:
-            # Изменён заголовок: флаг Англии
             msg = f"🇬🇧 <b>НОВЫЙ ТОВАР Англия</b> 🇬🇧\n\n<b>{item['title']}</b>\n\n"
             if item['price']:
                 msg += f"💰 Цена: {item['price']}\n"
@@ -559,14 +548,14 @@ def bot_worker():
 
 @app.route('/')
 def index():
-    return "eBay бот работает (UK, интервал 60 сек, Best Offer + Auction)"
+    return "eBay бот работает (UK, без прокси, интервал 60 сек, Best Offer + Auction)"
 
 @app.route('/health')
 def health():
     return "OK", 200
 
 if __name__ == "__main__":
-    send_telegram_message("🚀 Бот запущен (Великобритания, GBP). Интервал 60 сек, отслеживаю Best Offer и аукционы")
+    send_telegram_message("🚀 Бот запущен (Великобритания, без прокси, GBP). Интервал 60 сек, команды /stop /start")
     threading.Thread(target=telegram_listener, daemon=True).start()
     worker_thread = threading.Thread(target=bot_worker, daemon=False)
     worker_thread.start()
