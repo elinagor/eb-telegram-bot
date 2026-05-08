@@ -3,6 +3,7 @@ import sys
 import ssl
 import time
 import random
+import re
 import threading
 import logging
 from datetime import datetime
@@ -27,11 +28,11 @@ load_dotenv()
 EBAY_SEARCH_URL = os.getenv("EBAY_SEARCH_URL")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "180"))   # Изменено: 3 минуты (180 сек)
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "120"))   # ИЗМЕНЕНО: 120 секунд (было 180)
 BRIGHT_DATA_PROXY_URL = os.getenv("BRIGHT_DATA_PROXY_URL")
 DATABASE_URL = os.getenv("DATABASE_URL")
-MAX_ITEMS = 20              # Ограничение: обрабатывать только первые N товаров (первые в выдаче)
-MAX_RETRIES = 10            # Максимальное количество попыток при ошибках
+MAX_ITEMS = 20              # Ограничение: обрабатывать только первые N товаров
+MAX_RETRIES = 20            # ИЗМЕНЕНО: увеличено с 10 до 20
 RETRY_DELAY = 5             # Задержка между попытками (секунды)
 
 if not all([EBAY_SEARCH_URL, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, BRIGHT_DATA_PROXY_URL, DATABASE_URL]):
@@ -144,30 +145,109 @@ def extract_item_id(url):
     except IndexError:
         return None
 
+def clean_title(title):
+    """Удаляет фразу 'New listing' (регистронезависимо) и лишние пробелы."""
+    if not title:
+        return ""
+    # Убираем "new listing" с возможными запятыми, точками и лишними пробелами
+    cleaned = re.sub(r'(?i)\bnew listing\b', '', title)
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    return cleaned
+
 def parse_ebay_listings(html, max_items=MAX_ITEMS):
+    """
+    Парсит страницу поиска eBay, извлекая ID, URL, очищенное название и цену.
+    Возвращает словарь {item_id: {'url': url, 'title': clean_title, 'price': price}}
+    """
     if not html:
         return {}
     soup = BeautifulSoup(html, 'html.parser')
-    items = {}
-    # Находим все ссылки с '/itm/'
-    links = soup.find_all('a', href=True)
-    itm_links = [link for link in links if '/itm/' in link['href']]
-    logging.info(f"Найдено всего ссылок с '/itm/': {len(itm_links)}")
-    # Ограничиваем количество первыми max_items (самые свежие)
-    itm_links = itm_links[:max_items]
-    for link in itm_links:
-        url = link['href']
+
+    # Ищем карточки товаров — стандартный селектор для eBay
+    # Приоритет: li.s-item (основные результаты)
+    items_data = {}
+    items_found = 0
+
+    # Способ 1: блоки с классом s-item
+    search_result_items = soup.select('li.s-item')
+    if not search_result_items:
+        # Запасной вариант: искать все ссылки с '/itm/' (как было раньше, но без цены)
+        logging.warning("Не найдены карточки li.s-item, пробуем устаревший метод поиска по ссылкам")
+        links = soup.find_all('a', href=True)
+        itm_links = [link for link in links if '/itm/' in link['href']]
+        itm_links = itm_links[:max_items]
+        for link in itm_links:
+            url = link['href']
+            if url.startswith('/'):
+                url = 'https://www.ebay.com' + url
+            item_id = extract_item_id(url)
+            if not item_id:
+                continue
+            raw_title = link.get_text(strip=True)
+            title = clean_title(raw_title)
+            if not title:
+                continue
+            items_data[item_id] = {
+                'url': url,
+                'title': title,
+                'price': None
+            }
+        logging.info(f"Устаревшим методом обработано товаров: {len(items_data)}")
+        return items_data
+
+    for item in search_result_items:
+        if items_found >= max_items:
+            break
+
+        # Ссылка на товар
+        link_elem = item.select_one('a.s-item__link')
+        if not link_elem:
+            continue
+        url = link_elem.get('href')
+        if not url or '/itm/' not in url:
+            continue
         if url.startswith('/'):
             url = 'https://www.ebay.com' + url
+
         item_id = extract_item_id(url)
         if not item_id:
             continue
-        title = link.get_text(strip=True)
-        if not title or title.lower() in ('', 'new listing', 'новое объявление'):
+
+        # Название товара
+        title_elem = item.select_one('div.s-item__title span[role="heading"]') or \
+                     item.select_one('span[role="heading"]') or \
+                     item.select_one('div.s-item__title')
+        if title_elem:
+            raw_title = title_elem.get_text(strip=True)
+        else:
+            raw_title = link_elem.get_text(strip=True)
+        title = clean_title(raw_title)
+        if not title:
             continue
-        items[item_id] = {'url': url, 'title': title}
-    logging.info(f"Обработано товаров (первые {max_items}): {len(items)}")
-    return items
+
+        # Цена товара
+        price_elem = item.select_one('span.s-item__price')
+        price = None
+        if price_elem:
+            price_text = price_elem.get_text(strip=True)
+            # Убираем лишние символы, оставляем цену как есть (например, "$12.99")
+            if price_text:
+                price = price_text
+        else:
+            # Попробуем альтернативный селектор (например, для рекламных объявлений)
+            price_elem = item.select_one('.s-item__detail .s-item__price')
+            if price_elem:
+                price = price_elem.get_text(strip=True)
+
+        items_data[item_id] = {
+            'url': url,
+            'title': title,
+            'price': price
+        }
+        items_found += 1
+
+    logging.info(f"Обработано карточек товаров (первые {items_found}): {len(items_data)}")
+    return items_data
 
 def perform_initial_snapshot():
     logging.info("Делаем начальный снимок (сохраняем ID из текущей выдачи)...")
@@ -195,14 +275,23 @@ def check_and_send_new_items():
     new_items = []
     for item_id, data in current_items.items():
         if item_id not in seen:
-            new_items.append({'id': item_id, 'url': data['url'], 'title': data['title']})
+            new_items.append({
+                'id': item_id,
+                'url': data['url'],
+                'title': data['title'],
+                'price': data['price']
+            })
             logging.info(f"НОВЫЙ товар: {item_id} -> {data['title'][:60]}...")
     if new_items:
         logging.info(f"Найдено новых товаров: {len(new_items)}. Отправляем в Telegram...")
         for item in new_items:
-            msg = (f"🔹 <b>НОВЫЙ ТОВАР НА EBAY</b> 🔹\n\n"
-                   f"📦 <b>{item['title']}</b>\n\n"
-                   f"🔗 <a href='{item['url']}'>Ссылка на товар</a>")
+            # Формируем сообщение без эмодзи коробки и без "New listing"
+            msg = f"🔹 <b>НОВЫЙ ТОВАР НА EBAY</b> 🔹\n\n<b>{item['title']}</b>\n\n"
+            if item['price']:
+                msg += f"💰 Цена: {item['price']}\n\n"
+            else:
+                msg += f"💰 Цена не указана\n\n"
+            msg += f"🔗 <a href='{item['url']}'>Ссылка на товар</a>"
             send_telegram_message(msg)
             add_seen_ids_batch([item['id']])
             time.sleep(1)
@@ -227,7 +316,8 @@ def bot_worker():
     while True:
         try:
             check_and_send_new_items()
-            wait = max(180, CHECK_INTERVAL + random.uniform(-30, 60))  # минимум 3 минуты
+            # ИЗМЕНЕНО: убран жёсткий минимум 180 секунд, используется CHECK_INTERVAL (120 сек) + случайная вариация
+            wait = max(60, CHECK_INTERVAL + random.uniform(-30, 60))
             logging.info(f"Следующая проверка через {wait:.0f} секунд.")
             time.sleep(wait)
         except Exception as e:
@@ -236,7 +326,7 @@ def bot_worker():
 
 @app.route('/')
 def index():
-    return "eBay бот работает (интервал 180 сек, 10 попыток при ошибках)"
+    return "eBay бот работает (интервал 120 сек, 20 попыток при ошибках)"
 
 @app.route('/health')
 def health():
@@ -244,7 +334,7 @@ def health():
 
 if __name__ == "__main__":
     logging.info("Запуск бота...")
-    send_telegram_message("🚀 Бот запущен: интервал проверки 3 минуты, до 10 попыток при ошибках.")
+    send_telegram_message("🚀 Бот запущен: интервал проверки 120 секунд, до 20 попыток при ошибках.")
     thread = threading.Thread(target=bot_worker, daemon=False)
     thread.start()
     port = int(os.environ.get("PORT", 5000))
