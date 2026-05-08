@@ -146,31 +146,19 @@ def extract_item_id(url):
         return None
 
 def clean_title(title):
-    """
-    Удаляет 'new listing' и 'listing' из любого места названия (даже слитно)
-    """
     if not title:
         return ""
-    # 1) Удаляем 'new listing' с пробелом или без в любом регистре
     title = re.sub(r'(?i)new\s*listing', '', title)
-    # 2) Удаляем 'listing' как отдельную подстроку (учитывая границы слов, но также и слитно)
     title = re.sub(r'(?i)\blisting\b', '', title)
-    # 3) Удаляем 'new' (отдельное слово)
     title = re.sub(r'(?i)\bnew\b', '', title)
-    # 4) Убираем повторяющиеся или конечные символы-разделители
     title = re.sub(r'[^\w\s\$€£¥]', ' ', title)
     title = re.sub(r'\s+', ' ', title).strip()
-    # 5) Если после чистки строка пустая, вернуть исходную (но без 'listing'?)
-    if not title:
-        # Пробуем вырезать только если слово было в начале
-        title = re.sub(r'(?i)^listing', '', title)
     return title
 
 def is_valid_price(text):
-    """Проверяет, может ли текст быть ценой."""
-    if not text or len(text) > 15:
+    """Проверяет, похоже ли на цену."""
+    if not text or len(text) > 20:
         return False
-    # Должен содержать хотя бы одну цифру и символ валюты или десятичную точку/запятую
     has_digit = re.search(r'\d', text)
     has_currency = re.search(r'[$€£¥]', text)
     has_decimal = re.search(r'[,.]', text)
@@ -178,93 +166,91 @@ def is_valid_price(text):
         return False
     if not (has_currency or has_decimal):
         return False
-    # Если содержит буквы (кроме валюты), то скорее всего не цена
-    # Но оставляем символы валюты, цифры, пробелы, точки, запятые
-    valid_chars = r'[$€£¥\d\s\.,]'
-    cleaned = re.sub(valid_chars, '', text)
-    if cleaned:  # остались буквы (не валюта)
+    # Если содержит слова shipping, delivery, handling — не цена
+    if re.search(r'(?i)(shipping|delivery|handling|postage|versand|lieferung)', text):
         return False
     return True
 
-def extract_price_from_element(card):
-    """
-    Ищет цену внутри карточки. Возвращает строку с ценой или None.
-    """
-    # 1) Специфичные селекторы eBay
-    specific_selectors = [
-        'span.s-item__price',
-        '.s-item__detail .s-item__price',
-        'span.s-item__price--buynow',
-        '[data-testid="item-price"]',
-    ]
-    for sel in specific_selectors:
-        elem = card.select_one(sel)
-        if elem:
-            text = elem.get_text(strip=True)
-            if is_valid_price(text):
-                return clean_price_text(text)
-    
-    # 2) Любые элементы с классом, содержащим "price"
-    for elem in card.select('[class*="price"]'):
-        text = elem.get_text(strip=True)
-        if is_valid_price(text):
-            return clean_price_text(text)
-    
-    # 3) Поиск в атрибутах aria-label
-    for elem in card.select('[aria-label]'):
-        label = elem.get('aria-label', '')
-        match = re.search(r'(?:price|Price):?\s*([\d\.,]+)', label)
-        if match:
-            candidate = match.group(1)
-            if is_valid_price(candidate):
-                return candidate
-    
-    # 4) JSON-LD
+def extract_price_jsonld(card, url=None, soup=None):
+    """Извлекает цену из JSON-LD внутри карточки или общего скрипта."""
+    # Сначала ищем script внутри карточки
     script = card.find('script', type='application/ld+json')
-    if script:
+    if script and script.string:
         try:
             data = json.loads(script.string)
             if isinstance(data, dict):
-                if 'offers' in data and isinstance(data['offers'], dict):
-                    price = data['offers'].get('price')
-                    if price and is_valid_price(str(price)):
-                        currency = data['offers'].get('priceCurrency', '')
-                        if currency:
-                            return f"{currency} {price}"
-                        return str(price)
+                # Ищем offers
+                if 'offers' in data:
+                    offers = data['offers']
+                    if isinstance(offers, dict):
+                        price = offers.get('price')
+                        currency = offers.get('priceCurrency', '')
+                        if price and price != '0':
+                            if currency:
+                                return f"{currency} {price}"
+                            return str(price)
+                    elif isinstance(offers, list) and len(offers) > 0:
+                        first = offers[0]
+                        price = first.get('price')
+                        currency = first.get('priceCurrency', '')
+                        if price and price != '0':
+                            if currency:
+                                return f"{currency} {price}"
+                            return str(price)
                 elif 'price' in data:
                     price = data['price']
-                    if price and is_valid_price(str(price)):
+                    if price and price != '0':
                         return str(price)
         except:
             pass
     
-    # 5) Регулярные выражения на всей HTML карточки
-    html = str(card)
-    # Приоритет шаблонов: с валютой, с цифрами и точкой/запятой
-    patterns = [
-        r'([$€£¥]\s*[\d,]+\.?\d*)',               # $12.99
-        r'([\d,]+\.?\d*\s*[$€£¥])',               # 12.99 $
-        r'([A-Z]{3}\s*[\d,]+\.?\d*)',            # USD 12.99
-        r'([\d,]+\.?\d*\s*[A-Z]{3})',            # 12.99 USD
-        r'([\d,]+\.\d{2})',                      # 12.99 (без валюты, но с двумя десятичными)
-    ]
-    for pattern in patterns:
-        matches = re.findall(pattern, html)
-        for match in matches:
-            if is_valid_price(match):
-                return clean_price_text(match)
+    # Если внутри карточки нет, ищем общий JSON-LD по всему soup и сопоставляем по URL
+    if soup and url:
+        for script in soup.find_all('script', type='application/ld+json'):
+            if not script.string:
+                continue
+            try:
+                data = json.loads(script.string)
+                if isinstance(data, dict) and 'url' in data and data['url'] == url:
+                    if 'offers' in data:
+                        offers = data['offers']
+                        if isinstance(offers, dict):
+                            price = offers.get('price')
+                            currency = offers.get('priceCurrency', '')
+                            if price and price != '0':
+                                if currency:
+                                    return f"{currency} {price}"
+                                return str(price)
+            except:
+                continue
     return None
 
-def clean_price_text(price_text):
-    """Оставляет только первую часть похожую на цену."""
-    # Убираем лишние слова типа "to", "–"
-    price_text = re.sub(r'(?i)\s*(to|–|-|—)\s*', ' ', price_text)
-    parts = re.split(r'\s+', price_text)
-    for part in parts:
-        if is_valid_price(part):
-            return part
-    return price_text
+def extract_price_css(card):
+    """Запасной метод: поиск цены через CSS-селекторы с фильтрацией."""
+    # Приоритетные селекторы
+    selectors = [
+        'span.s-item__price',
+        '[data-testid="item-price"]',
+        '.s-item__detail .s-item__price',
+        'span.POSITIVE',
+        'span.vi-price',
+    ]
+    for sel in selectors:
+        elem = card.select_one(sel)
+        if elem:
+            text = elem.get_text(strip=True)
+            # Убираем перечеркнутые (старые цены)
+            if elem.find('span', class_='s-item__price--strikethrough'):
+                continue
+            if is_valid_price(text):
+                return text
+    
+    # Если не нашли, пробуем любой элемент с классом содержащим 'price'
+    for elem in card.select('[class*="price"]'):
+        text = elem.get_text(strip=True)
+        if is_valid_price(text):
+            return text
+    return None
 
 def parse_ebay_listings(html, max_items=MAX_ITEMS):
     if not html:
@@ -272,17 +258,15 @@ def parse_ebay_listings(html, max_items=MAX_ITEMS):
     soup = BeautifulSoup(html, 'html.parser')
     items_data = {}
 
-    # Основные карточки
     cards = soup.select('li.s-item')
     if not cards:
         cards = soup.select('.s-item')
     
     if cards:
         processed = 0
-        for idx, card in enumerate(cards):
+        for card in cards:
             if processed >= max_items:
                 break
-            # Ссылка
             link = card.select_one('a.s-item__link')
             if not link:
                 continue
@@ -307,12 +291,10 @@ def parse_ebay_listings(html, max_items=MAX_ITEMS):
                 if not title:
                     continue
             
-            # Цена
-            price = extract_price_from_element(card)
-            
-            # Отладочный вывод для первых 3 карточек
-            if idx < 3:
-                logging.debug(f"DEBUG: Карточка {idx+1} -> Цена: {price}, Название: {title[:40]}")
+            # Цена: сначала JSON-LD, потом CSS
+            price = extract_price_jsonld(card, url, soup)
+            if not price:
+                price = extract_price_css(card)
             
             items_data[item_id] = {
                 'url': url,
@@ -321,19 +303,15 @@ def parse_ebay_listings(html, max_items=MAX_ITEMS):
             }
             processed += 1
         
-        if items_data:
-            logging.info(f"Основной парсинг: найдено {len(items_data)} товаров")
-            return items_data
+        logging.info(f"Обработано {len(items_data)} товаров")
+        return items_data
     
-    # Резервный метод (поиск ссылок)
-    logging.warning("Карточки не найдены, ищу по ссылкам /itm/")
+    # Резерв
+    logging.warning("Карточки не найдены, поиск по ссылкам")
     links = soup.find_all('a', href=True)
     itm_links = [link for link in links if '/itm/' in link['href']]
     itm_links = itm_links[:max_items]
-    processed = 0
     for link in itm_links:
-        if processed >= max_items:
-            break
         url = link.get('href')
         if url.startswith('/'):
             url = 'https://www.ebay.com' + url
@@ -346,58 +324,44 @@ def parse_ebay_listings(html, max_items=MAX_ITEMS):
             continue
         price = None
         parent = link.parent
-        for _ in range(3):
+        for _ in range(4):
             if parent:
-                price = extract_price_from_element(parent)
+                price = extract_price_jsonld(parent, url, soup)
+                if price:
+                    break
+                price = extract_price_css(parent)
                 if price:
                     break
                 parent = parent.parent
-        items_data[item_id] = {
-            'url': url,
-            'title': title,
-            'price': price
-        }
-        processed += 1
-    
-    logging.info(f"Резервный метод: найдено {len(items_data)} товаров")
+        items_data[item_id] = {'url': url, 'title': title, 'price': price}
+    logging.info(f"Резерв: {len(items_data)} товаров")
     return items_data
 
 def perform_initial_snapshot():
-    logging.info("Делаем начальный снимок (сохраняем ID из текущей выдачи)...")
+    logging.info("Начальный снимок...")
     html = fetch_ebay_html_with_retry()
     if not html:
-        logging.error("Не удалось загрузить eBay для начального снимка.")
         return False
     items = parse_ebay_listings(html, max_items=50)
     if not items:
-        logging.warning("На странице не найдено товаров. Проверьте ссылку.")
         return False
-    item_ids = list(items.keys())
-    add_seen_ids_batch(item_ids)
-    logging.info(f"Начальный снимок: добавлено {len(item_ids)} товаров.")
+    add_seen_ids_batch(list(items.keys()))
+    logging.info(f"Снимок: {len(items)} товаров")
     return True
 
 def check_and_send_new_items():
     seen = get_seen_ids()
-    logging.info(f"В базе данных {len(seen)} уникальных товаров.")
+    logging.info(f"В базе {len(seen)} товаров")
     html = fetch_ebay_html_with_retry()
     if not html:
-        logging.error("Не удалось получить HTML, пропускаем этот цикл.")
         return
-    current_items = parse_ebay_listings(html, max_items=MAX_ITEMS)
+    current_items = parse_ebay_listings(html)
     new_items = []
     for item_id, data in current_items.items():
         if item_id not in seen:
-            new_items.append({
-                'id': item_id,
-                'url': data['url'],
-                'title': data['title'],
-                'price': data['price']
-            })
-            logging.info(f"НОВЫЙ товар: {item_id} -> '{data['title'][:60]}...' (цена: {data['price']})")
-    
+            new_items.append(data)
+            logging.info(f"НОВЫЙ: {data['title'][:50]}... цена: {data['price']}")
     if new_items:
-        logging.info(f"Найдено новых товаров: {len(new_items)}. Отправляем в Telegram...")
         for item in new_items:
             msg = f"🔹 <b>НОВЫЙ ТОВАР НА EBAY</b> 🔹\n\n<b>{item['title']}</b>\n\n"
             if item['price']:
@@ -409,44 +373,37 @@ def check_and_send_new_items():
             add_seen_ids_batch([item['id']])
             time.sleep(1)
     else:
-        logging.info("Новых товаров не найдено.")
+        logging.info("Новых нет")
 
 def bot_worker():
-    logging.info("🔄 Фоновый поток запущен")
     time.sleep(5)
-    
     init_db()
     if is_db_empty():
-        logging.info("База данных пуста. Выполняется начальный снимок...")
         if not perform_initial_snapshot():
-            send_telegram_message("❌ Ошибка инициализации: не удалось загрузить eBay. Бот остановлен.")
+            send_telegram_message("❌ Ошибка инициализации")
             return
-        send_telegram_message("✅ Бот запущен: начальный снимок сделан. Отслеживаю только новые товары.")
+        send_telegram_message("✅ Бот запущен, начальный снимок сделан")
     else:
-        logging.info("База данных уже содержит товары. Пропускаем начальный снимок.")
-        send_telegram_message("✅ Бот перезапущен. Продолжаю отслеживание новых товаров.")
-    
+        send_telegram_message("✅ Бот перезапущен")
     while True:
         try:
             check_and_send_new_items()
             wait = max(60, CHECK_INTERVAL + random.uniform(-30, 60))
-            logging.info(f"Следующая проверка через {wait:.0f} секунд.")
             time.sleep(wait)
         except Exception as e:
-            logging.error(f"Ошибка в основном цикле: {e}", exc_info=True)
+            logging.error(f"Ошибка: {e}", exc_info=True)
             time.sleep(120)
 
 @app.route('/')
 def index():
-    return "eBay бот работает (интервал 120 сек, 20 попыток, усиленная очистка названий и поиск цен)"
+    return "eBay бот работает (цена через JSON-LD)"
 
 @app.route('/health')
 def health():
     return "OK", 200
 
 if __name__ == "__main__":
-    logging.info("Запуск бота...")
-    send_telegram_message("🚀 Бот запущен: интервал 120 сек, 20 попыток, улучшен поиск цены и удаление 'Listing'")
+    send_telegram_message("🚀 Бот запущен, цена из JSON-LD")
     thread = threading.Thread(target=bot_worker, daemon=False)
     thread.start()
     port = int(os.environ.get("PORT", 5000))
