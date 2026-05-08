@@ -28,12 +28,12 @@ load_dotenv()
 EBAY_SEARCH_URL = os.getenv("EBAY_SEARCH_URL")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "120"))   # ИЗМЕНЕНО: 120 секунд (было 180)
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "120"))
 BRIGHT_DATA_PROXY_URL = os.getenv("BRIGHT_DATA_PROXY_URL")
 DATABASE_URL = os.getenv("DATABASE_URL")
-MAX_ITEMS = 20              # Ограничение: обрабатывать только первые N товаров
-MAX_RETRIES = 20            # ИЗМЕНЕНО: увеличено с 10 до 20
-RETRY_DELAY = 5             # Задержка между попытками (секунды)
+MAX_ITEMS = 20
+MAX_RETRIES = 20
+RETRY_DELAY = 5
 
 if not all([EBAY_SEARCH_URL, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, BRIGHT_DATA_PROXY_URL, DATABASE_URL]):
     logging.error("Не хватает переменных окружения. Проверьте .env или настройки Render.")
@@ -121,7 +121,7 @@ def fetch_ebay_html_with_retry():
                 impersonate="chrome131",
                 proxies=proxies,
                 verify=False,
-                timeout=45
+                timeout=30  # уменьшено с 45 до 30 секунд
             )
             if response.status_code == 200:
                 logging.info(f"Страница eBay успешно загружена (попытка {attempt})")
@@ -146,37 +146,92 @@ def extract_item_id(url):
         return None
 
 def clean_title(title):
-    """Удаляет фразу 'New listing' (регистронезависимо) и лишние пробелы."""
+    """
+    Удаляет фразы 'New Listing', 'New', 'Listing' из начала/середины названия.
+    Также удаляет лишние пробелы и знаки препинания вокруг.
+    """
     if not title:
         return ""
-    # Убираем "new listing" с возможными запятыми, точками и лишними пробелами
-    cleaned = re.sub(r'(?i)\bnew listing\b', '', title)
+    # Удаляем "new listing" (с пробелом и без) в любом регистре
+    # А также варианты с точкой, запятой, скобками
+    patterns = [
+        r'(?i)\bnew listing\b',          # New listing
+        r'(?i)\bnewlisting\b',           # Newlisting
+        r'(?i)\bnew\s+listing\b',        # New   listing
+        r'(?i)^listing\s*',              # Listing в начале
+        r'(?i)^new\s+',                  # New в начале (с пробелом)
+        r'(?i)\bnew\b\s*',               # New как отдельное слово
+    ]
+    cleaned = title
+    for pat in patterns:
+        cleaned = re.sub(pat, '', cleaned)
+    # Убираем лишние символы пунктуации и пробелы
+    cleaned = re.sub(r'[^\w\s\$€£¥]', ' ', cleaned)  # заменяем знаки на пробелы
     cleaned = re.sub(r'\s+', ' ', cleaned).strip()
     return cleaned
 
+def extract_price_from_element(item):
+    """
+    Пытается извлечь цену из элемента карточки товара.
+    Возвращает строку с ценой или None.
+    """
+    # Список селекторов для поиска цены (от наиболее специфичных к общим)
+    price_selectors = [
+        'span.s-item__price',                           # стандартный класс
+        '.s-item__detail .s-item__price',               # альтернативная структура
+        '.s-item__price[aria-label]',                   # ценник с aria-label
+        'span.POSITIVE',                                # положительная цена (акции)
+        'span.NEGATIVE',                                # отрицательная (со скидкой)
+        '.s-item__detail .vi-price',                    # старый вариант
+        '.s-item__price span',                          # вложенный span
+        'div.s-item__price',                            # div вместо span
+        '.s-item__price--strikethrough',                # зачёркнутая (можно пропустить)
+        '.s-item__discount-price',                      # цена со скидкой
+        '[class*="price"]',                             # любой класс содержащий price
+        '.bold',                                        # иногда цена выделена жирным
+    ]
+    
+    for selector in price_selectors:
+        price_elem = item.select_one(selector)
+        if price_elem:
+            price_text = price_elem.get_text(strip=True)
+            if price_text:
+                # Убираем лишние символы, оставляем только цену
+                # Пример: "$12.99", "EUR 10.50", "C $15.00"
+                # Удаляем ненужные надписи типа "to" или "–"
+                price_text = re.sub(r'(?i)\s*(to|To|–|-)\s*', ' ', price_text)
+                # Если в тексте несколько цен (диапазон), берём первую
+                first_price = re.split(r'\s+', price_text)[0]
+                # Проверяем, что первый фрагмент похож на цену (цифры или валюта)
+                if re.search(r'[\d.,]', first_price):
+                    return first_price
+    return None
+
 def parse_ebay_listings(html, max_items=MAX_ITEMS):
     """
-    Парсит страницу поиска eBay, извлекая ID, URL, очищенное название и цену.
+    Парсит страницу поиска eBay с использованием нескольких стратегий.
     Возвращает словарь {item_id: {'url': url, 'title': clean_title, 'price': price}}
     """
     if not html:
         return {}
     soup = BeautifulSoup(html, 'html.parser')
-
-    # Ищем карточки товаров — стандартный селектор для eBay
-    # Приоритет: li.s-item (основные результаты)
     items_data = {}
-    items_found = 0
 
-    # Способ 1: блоки с классом s-item
-    search_result_items = soup.select('li.s-item')
-    if not search_result_items:
-        # Запасной вариант: искать все ссылки с '/itm/' (как было раньше, но без цены)
-        logging.warning("Не найдены карточки li.s-item, пробуем устаревший метод поиска по ссылкам")
+    # СТРАТЕГИЯ 1: Ищем стандартные карточки li.s-item
+    items_cards = soup.select('li.s-item')
+    if not items_cards:
+        # Альтернативные контейнеры (div вместо li)
+        items_cards = soup.select('.s-item')
+    if not items_cards:
+        # Если вообще нет карточек, используем универсальный метод по ссылкам /itm/
+        logging.warning("Не найдены стандартные карточки товаров, используем универсальный поиск по ссылкам (без цены)")
         links = soup.find_all('a', href=True)
         itm_links = [link for link in links if '/itm/' in link['href']]
         itm_links = itm_links[:max_items]
+        processed = 0
         for link in itm_links:
+            if processed >= max_items:
+                break
             url = link['href']
             if url.startswith('/'):
                 url = 'https://www.ebay.com' + url
@@ -192,15 +247,18 @@ def parse_ebay_listings(html, max_items=MAX_ITEMS):
                 'title': title,
                 'price': None
             }
-        logging.info(f"Устаревшим методом обработано товаров: {len(items_data)}")
+            processed += 1
+        logging.info(f"Универсальный метод: найдено {len(items_data)} товаров (без цены)")
         return items_data
 
-    for item in search_result_items:
-        if items_found >= max_items:
+    # Если карточки найдены, парсим их с ценой
+    processed = 0
+    for card in items_cards:
+        if processed >= max_items:
             break
-
+        
         # Ссылка на товар
-        link_elem = item.select_one('a.s-item__link')
+        link_elem = card.select_one('a.s-item__link')
         if not link_elem:
             continue
         url = link_elem.get('href')
@@ -208,45 +266,41 @@ def parse_ebay_listings(html, max_items=MAX_ITEMS):
             continue
         if url.startswith('/'):
             url = 'https://www.ebay.com' + url
-
+        
         item_id = extract_item_id(url)
         if not item_id:
             continue
-
-        # Название товара
-        title_elem = item.select_one('div.s-item__title span[role="heading"]') or \
-                     item.select_one('span[role="heading"]') or \
-                     item.select_one('div.s-item__title')
-        if title_elem:
-            raw_title = title_elem.get_text(strip=True)
-        else:
-            raw_title = link_elem.get_text(strip=True)
+        
+        # Название
+        title_elem = (card.select_one('div.s-item__title span[role="heading"]') or
+                      card.select_one('span[role="heading"]') or
+                      card.select_one('div.s-item__title') or
+                      link_elem)
+        raw_title = title_elem.get_text(strip=True) if title_elem else ''
         title = clean_title(raw_title)
         if not title:
             continue
-
-        # Цена товара
-        price_elem = item.select_one('span.s-item__price')
-        price = None
-        if price_elem:
-            price_text = price_elem.get_text(strip=True)
-            # Убираем лишние символы, оставляем цену как есть (например, "$12.99")
-            if price_text:
-                price = price_text
-        else:
-            # Попробуем альтернативный селектор (например, для рекламных объявлений)
-            price_elem = item.select_one('.s-item__detail .s-item__price')
-            if price_elem:
-                price = price_elem.get_text(strip=True)
-
+        
+        # Цена
+        price = extract_price_from_element(card)
+        if not price:
+            # Иногда цена может быть внутри ссылки
+            price = extract_price_from_element(link_elem)
+        
         items_data[item_id] = {
             'url': url,
             'title': title,
             'price': price
         }
-        items_found += 1
-
-    logging.info(f"Обработано карточек товаров (первые {items_found}): {len(items_data)}")
+        processed += 1
+    
+    logging.info(f"Основной парсинг: обработано {len(items_data)} товаров (с ценами где возможно)")
+    # Для отладки: вывести в лог образец цен
+    sample_count = min(3, len(items_data))
+    if sample_count:
+        sample_items = list(items_data.items())[:sample_count]
+        for item_id, data in sample_items:
+            logging.info(f"Пример: {data['title'][:40]}... Цена: {data['price']}")
     return items_data
 
 def perform_initial_snapshot():
@@ -255,13 +309,13 @@ def perform_initial_snapshot():
     if not html:
         logging.error("Не удалось загрузить eBay для начального снимка.")
         return False
-    items = parse_ebay_listings(html, max_items=50)  # для снимка можно больше
+    items = parse_ebay_listings(html, max_items=50)
     if not items:
         logging.warning("На странице не найдено товаров. Проверьте ссылку.")
         return False
     item_ids = list(items.keys())
     add_seen_ids_batch(item_ids)
-    logging.info(f"Начальный снимок: добавлено {len(item_ids)} товаров. Они НЕ будут отправлены.")
+    logging.info(f"Начальный снимок: добавлено {len(item_ids)} товаров.")
     return True
 
 def check_and_send_new_items():
@@ -281,11 +335,12 @@ def check_and_send_new_items():
                 'title': data['title'],
                 'price': data['price']
             })
-            logging.info(f"НОВЫЙ товар: {item_id} -> {data['title'][:60]}...")
+            logging.info(f"НОВЫЙ товар: {item_id} -> {data['title'][:60]}... (цена: {data['price']})")
+    
     if new_items:
         logging.info(f"Найдено новых товаров: {len(new_items)}. Отправляем в Telegram...")
         for item in new_items:
-            # Формируем сообщение без эмодзи коробки и без "New listing"
+            # Формируем чистое сообщение без "New listing" и с ценой
             msg = f"🔹 <b>НОВЫЙ ТОВАР НА EBAY</b> 🔹\n\n<b>{item['title']}</b>\n\n"
             if item['price']:
                 msg += f"💰 Цена: {item['price']}\n\n"
@@ -301,7 +356,7 @@ def check_and_send_new_items():
 def bot_worker():
     logging.info("🔄 Фоновый поток запущен")
     time.sleep(5)
-
+    
     init_db()
     if is_db_empty():
         logging.info("База данных пуста. Выполняется начальный снимок...")
@@ -311,12 +366,11 @@ def bot_worker():
         send_telegram_message("✅ Бот запущен: начальный снимок сделан. Отслеживаю только новые товары.")
     else:
         logging.info("База данных уже содержит товары. Пропускаем начальный снимок.")
-        send_telegram_message("✅ Бот перезапущен. Продолжаю отслеживание новых товаров (старые не будут дублироваться).")
-
+        send_telegram_message("✅ Бот перезапущен. Продолжаю отслеживание новых товаров.")
+    
     while True:
         try:
             check_and_send_new_items()
-            # ИЗМЕНЕНО: убран жёсткий минимум 180 секунд, используется CHECK_INTERVAL (120 сек) + случайная вариация
             wait = max(60, CHECK_INTERVAL + random.uniform(-30, 60))
             logging.info(f"Следующая проверка через {wait:.0f} секунд.")
             time.sleep(wait)
@@ -326,7 +380,7 @@ def bot_worker():
 
 @app.route('/')
 def index():
-    return "eBay бот работает (интервал 120 сек, 20 попыток при ошибках)"
+    return "eBay бот работает (интервал 120 сек, 20 попыток при ошибках, есть цена и чистые названия)"
 
 @app.route('/health')
 def health():
@@ -334,7 +388,7 @@ def health():
 
 if __name__ == "__main__":
     logging.info("Запуск бота...")
-    send_telegram_message("🚀 Бот запущен: интервал проверки 120 секунд, до 20 попыток при ошибках.")
+    send_telegram_message("🚀 Бот запущен: интервал 120 сек, 20 попыток при ошибках, улучшен парсинг цен.")
     thread = threading.Thread(target=bot_worker, daemon=False)
     thread.start()
     port = int(os.environ.get("PORT", 5000))
