@@ -36,11 +36,12 @@ MAX_ITEMS = 20
 MAX_RETRIES = 20
 RETRY_DELAY = 5
 
-# Если в URL нет параметров локации, добавим для США
-if EBAY_SEARCH_URL and '?' in EBAY_SEARCH_URL:
-    EBAY_SEARCH_URL += '&LH_PrefLoc=1'  # только товары из США
-else:
-    EBAY_SEARCH_URL += '?LH_PrefLoc=1'
+# Форсируем показ товаров из США и в долларах
+if EBAY_SEARCH_URL:
+    if '?' in EBAY_SEARCH_URL:
+        EBAY_SEARCH_URL += '&LH_PrefLoc=1&_ipg=240'
+    else:
+        EBAY_SEARCH_URL += '?LH_PrefLoc=1&_ipg=240'
 
 if not all([EBAY_SEARCH_URL, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, BRIGHT_DATA_PROXY_URL, DATABASE_URL]):
     logging.error("Не хватает переменных окружения.")
@@ -104,7 +105,7 @@ def fetch_ebay_html_with_retry():
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.9',
         'Referer': 'https://www.ebay.com/',
-        'X-EBay-Site-Id': '0',  # США
+        'X-EBay-Site-Id': '0',
         'Sec-Ch-Ua': '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="99"',
         'Upgrade-Insecure-Requests': '1',
     }
@@ -140,20 +141,14 @@ def clean_title(title):
     return title
 
 def is_usd_price(text):
-    """Проверяет, является ли текст ценой в долларах (начинается с $ или содержит USD $)."""
-    if not text:
-        return False
-    # Если строка явно начинается с $ или содержит "$"
+    if not text: return False
     if re.search(r'^\$|\s\$|USD\s*\$\d+', text):
         return True
-    # Если в тексте нет знака доллара, но есть другая валюта - не USD
-    if re.search(r'[€£¥]|ZAR|EUR|GBP|JPY|RUB|CNY', text, re.I):
+    if re.search(r'[€£¥]|ZAR|EUR|GBP|JPY', text, re.I):
         return False
-    # Если есть цифры и возможно точка/запятая, но нет явного USD - всё равно пытаемся взять, но с меньшим приоритетом
     return re.search(r'\d', text) is not None
 
 def extract_price_jsonld(card, url=None, soup=None):
-    # Сначала ищем внутри карточки
     script = card.find('script', type='application/ld+json')
     candidates = []
     if script and script.string:
@@ -174,7 +169,6 @@ def extract_price_jsonld(card, url=None, soup=None):
                             candidates.append((price, currency))
         except:
             pass
-    # Поиск по всему soup (запасной) – но нужно сопоставить с url
     if soup and url:
         for script in soup.find_all('script', type='application/ld+json'):
             if not script.string: continue
@@ -189,7 +183,7 @@ def extract_price_jsonld(card, url=None, soup=None):
                             candidates.append((price, currency))
             except:
                 continue
-    # Выбираем цену: сначала USD, затем любую
+    # Выбираем USD
     for price, curr in candidates:
         if curr == 'USD' or (curr == '' and str(price).startswith('$')):
             return f"${price}"
@@ -201,7 +195,6 @@ def extract_price_jsonld(card, url=None, soup=None):
     return None
 
 def extract_price_css(card):
-    # Ищем все элементы с ценой
     candidates = []
     selectors = ['span.s-item__price', '[data-testid="item-price"]', '.s-item__detail .s-item__price']
     for sel in selectors:
@@ -209,15 +202,12 @@ def extract_price_css(card):
             text = elem.get_text(strip=True)
             if text:
                 candidates.append(text)
-    # Дополнительный поиск по классам содержащим price
     for elem in card.select('[class*="price"]'):
         text = elem.get_text(strip=True)
         if text:
             candidates.append(text)
-    # Фильтруем: сначала USD, потом другие
     for cand in candidates:
         if is_usd_price(cand):
-            # Очищаем: оставляем только первую часть до пробела, если есть
             parts = cand.split()
             for p in parts:
                 if is_usd_price(p):
@@ -254,40 +244,51 @@ def extract_shipping(card, url=None, soup=None):
                             return f"{currency} {shipping}" if currency else str(shipping)
         except:
             pass
-    # 2) Селекторы для доставки, включая su-styled-text
-    shipping_selectors = [
-        'span.s-item__shipping', '.s-item__shipping', 'div.s-item__shipping',
-        'span.s-item__logisticsCost', '.s-item__logisticsCost',
-        'span.s-item__delivery', '.s-item__delivery',
-        'span.su-styled-text', 'span.su-styled-text.secondary.large',
-        '[class*="shipping"]', '[class*="logistics"]', '[class*="delivery"]',
+
+    # 2) Специальные классы доставки (исключая кнопки)
+    shipping_classes = [
+        'span.s-item__shipping', 'div.s-item__shipping',
+        'span.s-item__logisticsCost', 'span.s-item__delivery',
+        'span.su-styled-text', '.su-styled-text.secondary.large',
+        '[class*="shippingCost"]'
     ]
-    for sel in shipping_selectors:
-        elem = card.select_one(sel)
-        if elem:
+    for sel in shipping_classes:
+        for elem in card.select(sel):
             text = elem.get_text(strip=True)
             text = re.sub(r'\s+', ' ', text)
-            if text:
+            if not text:
+                continue
+            # Пропускаем фразы, не относящиеся к доставке
+            if re.search(r'(?i)(buy it now|best offer|make offer|watch|add to cart)', text):
+                continue
+            # Если есть слова доставки или символ валюты
+            if re.search(r'(?i)(free|shipping|delivery|postage)', text) or re.search(r'[$€£¥]', text):
                 if 'free' in text.lower():
                     return "Бесплатно"
-                if re.search(r'\d', text) and re.search(r'[$€£¥]', text):
+                # Извлекаем цену вида "$5.98"
+                match = re.search(r'([$€£¥]\s*[\d,]+\.?\d*)', text)
+                if match:
+                    return match.group(1)
+                # Если цена не извлеклась, но текст короткий и похож на "Free shipping"
+                if 'free' in text.lower():
+                    return "Бесплатно"
+                if len(text) < 30:
                     return text
-                if len(text) < 30 and not text.lower() in ('shipping', 'delivery', 'logistics'):
-                    return text
-    # 3) Регулярные выражения
+
+    # 3) Регулярные выражения по всему HTML карточки
     html = str(card)
     if re.search(r'(?i)free\s+shipping', html):
         return "Бесплатно"
-    # Ищем "+$5.98 delivery"
+    # паттерн "+$5.98 delivery" или "$5.99 shipping"
     match = re.search(r'(?i)\+?\s*([$€£¥]\s*[\d,]+\.?\d*)\s*(delivery|shipping)', html)
     if match:
-        return match.group(1).strip()
-    # Старые шаблоны
-    patterns = [r'(?i)shipping:\s*([$€£¥]\s*[\d,]+\.?\d*)', r'(?i)delivery:\s*([$€£¥]\s*[\d,]+\.?\d*)']
-    for pat in patterns:
-        m = re.search(pat, html)
-        if m:
-            return m.group(1)
+        return match.group(1)
+    match = re.search(r'(?i)shipping:\s*([$€£¥]\s*[\d,]+\.?\d*)', html)
+    if match:
+        return match.group(1)
+    match = re.search(r'(?i)([$€£¥]\s*[\d,]+\.?\d*)\s+shipping', html)
+    if match:
+        return match.group(1)
     return None
 
 def parse_ebay_listings(html, max_items=MAX_ITEMS):
@@ -298,9 +299,9 @@ def parse_ebay_listings(html, max_items=MAX_ITEMS):
     if not cards:
         cards = soup.select('.s-item')
     if not cards:
-        # Резерв по ссылкам
+        # fallback по ссылкам
         return parse_ebay_listings_fallback(soup, max_items)
-    items_data = {}
+    items = {}
     processed = 0
     for card in cards:
         if processed >= max_items:
@@ -316,7 +317,7 @@ def parse_ebay_listings(html, max_items=MAX_ITEMS):
         item_id = extract_item_id(url)
         if not item_id:
             continue
-        # Название
+        # Заголовок
         title_elem = (card.select_one('div.s-item__title span[role="heading"]') or
                       card.select_one('span[role="heading"]') or
                       card.select_one('div.s-item__title') or link)
@@ -331,13 +332,13 @@ def parse_ebay_listings(html, max_items=MAX_ITEMS):
             price = extract_price_css(card)
         # Доставка
         shipping = extract_shipping(card, url, soup)
-        items_data[item_id] = {'url': url, 'title': title, 'price': price, 'shipping': shipping}
+        items[item_id] = {'url': url, 'title': title, 'price': price, 'shipping': shipping}
         processed += 1
-    logging.info(f"Обработано {len(items_data)} товаров")
-    return items_data
+    logging.info(f"Обработано товаров: {len(items)}")
+    return items
 
 def parse_ebay_listings_fallback(soup, max_items):
-    items_data = {}
+    items = {}
     links = soup.find_all('a', href=True)
     itm_links = [link for link in links if '/itm/' in link['href']]
     itm_links = itm_links[:max_items]
@@ -361,8 +362,8 @@ def parse_ebay_listings_fallback(soup, max_items):
                 if price or shipping:
                     break
                 parent = parent.parent
-        items_data[item_id] = {'url': url, 'title': title, 'price': price, 'shipping': shipping}
-    return items_data
+        items[item_id] = {'url': url, 'title': title, 'price': price, 'shipping': shipping}
+    return items
 
 def perform_initial_snapshot():
     html = fetch_ebay_html_with_retry()
@@ -411,7 +412,7 @@ def bot_worker():
         if not perform_initial_snapshot():
             send_telegram_message("❌ Ошибка инициализации")
             return
-        send_telegram_message("✅ Бот запущен")
+        send_telegram_message("✅ Бот запущен, начальный снимок сделан")
     else:
         send_telegram_message("✅ Бот перезапущен")
     while True:
@@ -425,13 +426,13 @@ def bot_worker():
 
 @app.route('/')
 def index():
-    return "eBay бот (USD + доставка)"
+    return "eBay бот (цена USD + доставка)"
 
 @app.route('/health')
 def health():
     return "OK", 200
 
 if __name__ == "__main__":
-    send_telegram_message("🚀 Бот запущен, приоритет USD, улучшена доставка")
+    send_telegram_message("🚀 Бот запущен, исправлен парсинг доставки")
     threading.Thread(target=bot_worker, daemon=False).start()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
