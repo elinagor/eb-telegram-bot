@@ -237,10 +237,9 @@ def extract_price_css(card):
 def extract_shipping(card, url=None, soup=None):
     """
     Извлекает стоимость доставки из карточки товара.
-    Приоритет: JSON-LD (shippingCost), затем CSS-селекторы (s-item__shipping и т.д.)
     Возвращает строку с ценой доставки или "Бесплатно", или None.
     """
-    # 1) Пробуем JSON-LD
+    # 1) JSON-LD: ищем shippingCost
     script = card.find('script', type='application/ld+json')
     if script and script.string:
         try:
@@ -248,64 +247,77 @@ def extract_shipping(card, url=None, soup=None):
             if isinstance(data, dict):
                 offers = data.get('offers')
                 if isinstance(offers, dict):
-                    shipping = offers.get('shippingCost')
-                    if shipping is not None:
-                        if shipping == 0 or str(shipping) == '0':
+                    shipping_cost = offers.get('shippingCost')
+                    if shipping_cost is not None:
+                        if shipping_cost == 0 or str(shipping_cost) == '0':
                             return "Бесплатно"
-                        if isinstance(shipping, (int, float)):
+                        if isinstance(shipping_cost, (int, float)):
                             currency = offers.get('priceCurrency', '')
-                            if currency:
-                                return f"{currency} {shipping}"
-                            return str(shipping)
+                            return f"{currency} {shipping_cost}" if currency else str(shipping_cost)
                 elif isinstance(offers, list) and len(offers) > 0:
                     first = offers[0]
-                    shipping = first.get('shippingCost')
-                    if shipping is not None:
-                        if shipping == 0 or str(shipping) == '0':
+                    shipping_cost = first.get('shippingCost')
+                    if shipping_cost is not None:
+                        if shipping_cost == 0 or str(shipping_cost) == '0':
                             return "Бесплатно"
-                        if isinstance(shipping, (int, float)):
+                        if isinstance(shipping_cost, (int, float)):
                             currency = first.get('priceCurrency', '')
-                            if currency:
-                                return f"{currency} {shipping}"
-                            return str(shipping)
+                            return f"{currency} {shipping_cost}" if currency else str(shipping_cost)
         except:
             pass
 
-    # 2) CSS-селекторы на странице поиска
-    # Стандартный класс для доставки
-    shipping_elem = card.select_one('span.s-item__shipping, .s-item__shipping, div.s-item__shipping')
-    if shipping_elem:
-        text = shipping_elem.get_text(strip=True)
-        # Очистка: убираем лишние пробелы, переводим в читаемый вид
-        text = re.sub(r'\s+', ' ', text).strip()
-        if text:
-            # Часто встречается "Free shipping" или "Shipping: $5.00"
-            if 'free' in text.lower():
-                return "Бесплатно"
-            # Если есть цифры и валюта
-            if re.search(r'\d', text) and re.search(r'[$€£¥]', text):
-                return text
-            # Если просто текст типа "Shipping not specified"
-            if text and len(text) < 30:
-                return text
+    # 2) CSS-селекторы для доставки на странице поиска
+    shipping_selectors = [
+        'span.s-item__shipping',
+        '.s-item__shipping',
+        'div.s-item__shipping',
+        'span.s-item__logisticsCost',
+        '.s-item__logisticsCost',
+        'span.s-item__delivery',
+        '.s-item__delivery',
+        '[class*="shipping"]',
+        '[class*="logistics"]',
+        '[class*="delivery"]',
+    ]
+    for sel in shipping_selectors:
+        elem = card.select_one(sel)
+        if elem:
+            text = elem.get_text(strip=True)
+            text = re.sub(r'\s+', ' ', text).strip()
+            if text:
+                if 'free' in text.lower():
+                    return "Бесплатно"
+                # Если есть цифры и символ валюты
+                if re.search(r'\d', text) and re.search(r'[$€£¥]', text):
+                    return text
+                # Если текст короткий и не является просто "Shipping"
+                if len(text) < 30 and not text.lower() in ('shipping', 'delivery', 'logistics'):
+                    return text
 
-    # 3) Резерв: поиск по тексту внутри родителя
-    parent = card
-    for _ in range(3):
-        if parent:
-            for elem in parent.select('[class*="shipping"], [class*="delivery"]'):
-                text = elem.get_text(strip=True)
-                if text:
-                    text = re.sub(r'\s+', ' ', text).strip()
-                    if 'free' in text.lower():
-                        return "Бесплатно"
-                    if re.search(r'\d', text) and re.search(r'[$€£¥]', text):
-                        return text
-                    if text and len(text) < 40:
-                        return text
-            parent = parent.parent
-        else:
-            break
+    # 3) Поиск по регулярным выражениям в HTML карточки
+    html = str(card)
+    # Ищем "Free shipping" или "Shipping: $X.XX"
+    free_match = re.search(r'(?i)free\s+shipping', html)
+    if free_match:
+        return "Бесплатно"
+    # Ищем шаблоны типа "Shipping: $5.00", "$5.00 shipping", "Delivery $3.99"
+    patterns = [
+        r'(?i)shipping:\s*([$€£¥]\s*[\d,]+\.?\d*)',
+        r'(?i)shipping\s*([$€£¥]\s*[\d,]+\.?\d*)',
+        r'(?i)([$€£¥]\s*[\d,]+\.?\d*)\s+shipping',
+        r'(?i)delivery:\s*([$€£¥]\s*[\d,]+\.?\d*)',
+        r'(?i)delivery\s*([$€£¥]\s*[\d,]+\.?\d*)',
+        r'(?i)([$€£¥]\s*[\d,]+\.?\d*)\s+delivery',
+        r'(?i)([\d,]+\.?\d*)\s*shipping',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, html)
+        if match:
+            # Если есть группа, берём её
+            price_part = match.group(1) if match.lastindex else match.group(0)
+            # Проверяем, что это похоже на цену
+            if re.search(r'\d', price_part):
+                return price_part.strip()
     return None
 
 def parse_ebay_listings(html, max_items=MAX_ITEMS):
@@ -320,7 +332,7 @@ def parse_ebay_listings(html, max_items=MAX_ITEMS):
     
     if cards:
         processed = 0
-        for card in cards:
+        for idx, card in enumerate(cards):
             if processed >= max_items:
                 break
             link = card.select_one('a.s-item__link')
@@ -352,6 +364,14 @@ def parse_ebay_listings(html, max_items=MAX_ITEMS):
             
             shipping = extract_shipping(card, url, soup)
             
+            # Отладка для первых трёх карточек
+            if idx < 3:
+                logging.info(f"DEBUG карточка {idx+1}: цена={price}, доставка={shipping}")
+                # Доп. отладка: найти все элементы с классами shipping/logistics
+                debug_elems = card.select('[class*="shipping"], [class*="logistics"], [class*="delivery"]')
+                for de in debug_elems[:3]:
+                    logging.debug(f"  найден элемент: {de.get('class')} -> текст: {de.get_text(strip=True)[:50]}")
+            
             items_data[item_id] = {
                 'url': url,
                 'title': title,
@@ -363,7 +383,7 @@ def parse_ebay_listings(html, max_items=MAX_ITEMS):
         logging.info(f"Обработано {len(items_data)} товаров")
         return items_data
     
-    # Резервный поиск по ссылкам (без доставки)
+    # Резервный поиск по ссылкам
     logging.warning("Карточки не найдены, поиск по ссылкам")
     links = soup.find_all('a', href=True)
     itm_links = [link for link in links if '/itm/' in link['href']]
@@ -470,14 +490,14 @@ def bot_worker():
 
 @app.route('/')
 def index():
-    return "eBay бот работает (цена + доставка из JSON-LD)"
+    return "eBay бот работает (цена + доставка усиленный парсинг)"
 
 @app.route('/health')
 def health():
     return "OK", 200
 
 if __name__ == "__main__":
-    send_telegram_message("🚀 Бот запущен, отслеживает цену и доставку")
+    send_telegram_message("🚀 Бот запущен, улучшен парсинг доставки")
     thread = threading.Thread(target=bot_worker, daemon=False)
     thread.start()
     port = int(os.environ.get("PORT", 5000))
