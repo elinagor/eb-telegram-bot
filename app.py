@@ -7,6 +7,7 @@ import re
 import json
 import threading
 import logging
+import requests
 from datetime import datetime
 from bs4 import BeautifulSoup
 from flask import Flask
@@ -46,11 +47,15 @@ if not all([EBAY_SEARCH_URL, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, BRIGHT_DATA_P
     logging.error("Не хватает переменных окружения.")
     sys.exit(1)
 
-# Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 app = Flask(__name__)
 
-# ============ РОТАЦИЯ USER-AGENT (актуальные на 2026 год) ============
+# ============ ГЛОБАЛЬНЫЕ ФЛАГИ ДЛЯ КОМАНД ============
+is_paused = False          # Флаг паузы
+restart_requested = False  # Флаг перезапуска (не используется, т.к. restart через execv)
+last_update_id = 0         # Для Telegram long polling
+
+# ============ РОТАЦИЯ USER-AGENT ============
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
@@ -90,26 +95,57 @@ def is_db_empty():
             cur.execute("SELECT NOT EXISTS (SELECT 1 FROM seen_items)")
             return cur.fetchone()[0]
 
-# ============ ТЕЛЕГРАМ ============
-def send_telegram_message(message):
+# ============ ОТПРАВКА СООБЩЕНИЙ В TELEGRAM ============
+def send_telegram_message(message, parse_mode='HTML'):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': message, 'parse_mode': 'HTML', 'disable_web_page_preview': False}
+    payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': message, 'parse_mode': parse_mode, 'disable_web_page_preview': False}
     try:
-        import requests
         r = requests.post(url, json=payload, timeout=10)
         if r.status_code != 200:
             logging.error(f"Ошибка Telegram: {r.text}")
     except Exception as e:
         logging.error(f"Не удалось отправить в Telegram: {e}")
 
-# ============ ЗАПРОС К EBAY (С РОТАЦИЕЙ USER-AGENT И ЗАДЕРЖКАМИ) ============
+# ============ ОБРАБОТЧИК КОМАНД (LONG POLLING) ============
+def telegram_listener():
+    global is_paused, last_update_id
+    logging.info("🔁 Поток слушателя команд Telegram запущен")
+    while True:
+        try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+            params = {'offset': last_update_id + 1, 'timeout': 30}
+            r = requests.get(url, params=params, timeout=35)
+            if r.status_code == 200:
+                updates = r.json().get('result', [])
+                for update in updates:
+                    last_update_id = update['update_id']
+                    message = update.get('message')
+                    if message and str(message.get('chat', {}).get('id')) == TELEGRAM_CHAT_ID:
+                        text = message.get('text', '').strip()
+                        if text == '/stop':
+                            is_paused = True
+                            send_telegram_message("⏸ Бот приостановлен. Для возобновления отправьте /start")
+                            logging.info("Команда /stop - пауза")
+                        elif text == '/start':
+                            is_paused = False
+                            send_telegram_message("▶ Бот продолжает работу")
+                            logging.info("Команда /start - продолжение")
+                        elif text == '/restart':
+                            send_telegram_message("🔄 Перезапуск бота через 2 секунды...")
+                            logging.info("Команда /restart - перезапуск процесса")
+                            time.sleep(2)
+                            # Полный перезапуск скрипта
+                            os.execv(sys.executable, [sys.executable] + sys.argv)
+            time.sleep(1)
+        except Exception as e:
+            logging.error(f"Ошибка в слушателе Telegram: {e}")
+            time.sleep(5)
+
+# ============ ЗАПРОС К EBAY ============
 def fetch_ebay_html_with_retry():
-    """Выполняет запрос с повторными попытками, ротацией User-Agent и задержками."""
     proxies = {"http": BRIGHT_DATA_PROXY_URL, "https": BRIGHT_DATA_PROXY_URL}
     cookies = {'ebay': '%2F', 'm': 'USA', 's': 'S0'}
-    
     for attempt in range(1, MAX_RETRIES + 1):
-        # Случайный User-Agent из списка
         current_ua = random.choice(USER_AGENTS)
         headers = {
             'User-Agent': current_ua,
@@ -120,16 +156,14 @@ def fetch_ebay_html_with_retry():
             'Sec-Ch-Ua': '"Google Chrome";v="142", "Chromium";v="142", "Not_A Brand";v="99"',
             'Upgrade-Insecure-Requests': '1',
         }
-        # Небольшая случайная задержка перед запросом (только при повторных попытках)
         if attempt > 1:
             time.sleep(random.uniform(1.5, 3.5))
-        
         try:
             response = cffi_requests.get(
                 EBAY_SEARCH_URL,
                 headers=headers,
                 cookies=cookies,
-                impersonate="chrome142",  # эмулируем последний Chrome
+                impersonate="chrome142",
                 proxies=proxies,
                 verify=False,
                 timeout=35
@@ -138,7 +172,7 @@ def fetch_ebay_html_with_retry():
                 logging.info(f"✅ Загружено (попытка {attempt}, UA={current_ua[:40]}...)")
                 return response.text
             elif response.status_code == 403:
-                logging.warning(f"⚠️ 403 Forbidden (попытка {attempt}) — возможно, блокировка. Пробуем дальше.")
+                logging.warning(f"⚠️ 403 Forbidden (попытка {attempt})")
                 if attempt < MAX_RETRIES:
                     time.sleep(RETRY_DELAY + random.uniform(2, 5))
             else:
@@ -146,11 +180,9 @@ def fetch_ebay_html_with_retry():
                 if attempt < MAX_RETRIES:
                     time.sleep(RETRY_DELAY)
         except Exception as e:
-            logging.error(f"Попытка {attempt}/{MAX_RETRIES}: ошибка запроса: {e}")
+            logging.error(f"Попытка {attempt}/{MAX_RETRIES}: {e}")
             if attempt < MAX_RETRIES:
                 time.sleep(RETRY_DELAY + random.uniform(1, 3))
-    
-    logging.error("❌ Не удалось загрузить страницу после всех попыток")
     return None
 
 def extract_item_id(url):
@@ -162,8 +194,7 @@ def extract_item_id(url):
         return None
 
 def clean_title(title):
-    if not title:
-        return ""
+    if not title: return ""
     title = re.sub(r'(?i)new\s*listing', '', title)
     title = re.sub(r'(?i)\blisting\b', '', title)
     title = re.sub(r'(?i)\bnew\b', '', title)
@@ -172,12 +203,9 @@ def clean_title(title):
     return title
 
 def is_usd_price(text):
-    if not text:
-        return False
-    # Доллары: начинается с $, или содержит USD, или просто цифры с точкой/запятой без других валют
+    if not text: return False
     if re.search(r'^\$|\s\$|USD\s*\$\d+', text):
         return True
-    # Если есть другие валюты — не USD
     if re.search(r'[€£¥]|ZAR|EUR|GBP|JPY|DKK|NOK|SEK|CHF', text, re.I):
         return False
     return re.search(r'\d', text) is not None
@@ -218,7 +246,6 @@ def extract_price_jsonld(card, url=None, soup=None):
                             candidates.append((price, currency))
             except:
                 continue
-    # Приоритет USD
     for price, curr in candidates:
         if curr == 'USD' or (curr == '' and str(price).startswith('$')):
             return f"${price}"
@@ -253,7 +280,6 @@ def extract_price_css(card):
     return None
 
 def extract_shipping(card, item_price=None):
-    # 1) JSON-LD
     script = card.find('script', type='application/ld+json')
     if script and script.string:
         try:
@@ -286,7 +312,6 @@ def extract_shipping(card, item_price=None):
         except:
             pass
 
-    # 2) CSS-селекторы для доставки
     shipping_selectors = [
         'span.s-item__shipping', 'div.s-item__shipping',
         'span.s-item__logisticsCost', 'span.s-item__delivery',
@@ -316,7 +341,6 @@ def extract_shipping(card, item_price=None):
                     return "Бесплатно"
                 return text
 
-    # 3) Регулярные выражения по HTML
     html = str(card)
     if re.search(r'(?i)free\s+shipping', html):
         return "Бесплатно"
@@ -357,7 +381,6 @@ def parse_ebay_listings(html, max_items=MAX_ITEMS):
         item_id = extract_item_id(url)
         if not item_id:
             continue
-        # Название
         title_elem = (card.select_one('div.s-item__title span[role="heading"]') or
                       card.select_one('span[role="heading"]') or
                       card.select_one('div.s-item__title') or link)
@@ -366,14 +389,9 @@ def parse_ebay_listings(html, max_items=MAX_ITEMS):
             title = clean_title(link.get_text(strip=True))
             if not title:
                 continue
-        # Цена
-        price = extract_price_jsonld(card, url, soup)
-        if not price:
-            price = extract_price_css(card)
-        # Отфильтровываем не-USD
+        price = extract_price_jsonld(card, url, soup) or extract_price_css(card)
         if price and not is_usd_price(price):
             price = None
-        # Доставка
         shipping = extract_shipping(card, item_price=price)
         if shipping and shipping != "Бесплатно" and not is_usd_price(shipping):
             shipping = None
@@ -457,7 +475,8 @@ def check_and_send_new_items():
         logging.info("Новых нет")
 
 def bot_worker():
-    time.sleep(5)
+    global is_paused
+    logging.info("🤖 Бот-воркер запущен")
     init_db()
     if is_db_empty():
         if not perform_initial_snapshot():
@@ -467,25 +486,33 @@ def bot_worker():
     else:
         send_telegram_message("✅ Бот перезапущен")
     while True:
+        if is_paused:
+            time.sleep(2)
+            continue
         try:
             check_and_send_new_items()
             wait = max(60, CHECK_INTERVAL + random.uniform(-30, 60))
             logging.info(f"Следующая проверка через {wait:.0f} секунд.")
             time.sleep(wait)
         except Exception as e:
-            logging.error(f"Ошибка: {e}", exc_info=True)
+            logging.error(f"Ошибка в основном цикле: {e}", exc_info=True)
             time.sleep(120)
 
 @app.route('/')
 def index():
-    return "eBay бот (ротация User-Agent, USD, доставка)"
+    return "eBay бот работает (команды /stop /start /restart)"
 
 @app.route('/health')
 def health():
     return "OK", 200
 
 if __name__ == "__main__":
-    send_telegram_message("🚀 Бот запущен, улучшенная защита от 403")
-    threading.Thread(target=bot_worker, daemon=False).start()
+    send_telegram_message("🚀 Бот запущен. Доступны команды: /stop, /start, /restart")
+    # Запускаем слушателя команд (демонический поток)
+    threading.Thread(target=telegram_listener, daemon=True).start()
+    # Запускаем основной воркер (не демонический, чтобы процесс не завершился)
+    worker_thread = threading.Thread(target=bot_worker, daemon=False)
+    worker_thread.start()
+    # Запускаем Flask
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
