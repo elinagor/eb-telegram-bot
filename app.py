@@ -234,6 +234,80 @@ def extract_price_css(card):
             return text
     return None
 
+def extract_shipping(card, url=None, soup=None):
+    """
+    Извлекает стоимость доставки из карточки товара.
+    Приоритет: JSON-LD (shippingCost), затем CSS-селекторы (s-item__shipping и т.д.)
+    Возвращает строку с ценой доставки или "Бесплатно", или None.
+    """
+    # 1) Пробуем JSON-LD
+    script = card.find('script', type='application/ld+json')
+    if script and script.string:
+        try:
+            data = json.loads(script.string)
+            if isinstance(data, dict):
+                offers = data.get('offers')
+                if isinstance(offers, dict):
+                    shipping = offers.get('shippingCost')
+                    if shipping is not None:
+                        if shipping == 0 or str(shipping) == '0':
+                            return "Бесплатно"
+                        if isinstance(shipping, (int, float)):
+                            currency = offers.get('priceCurrency', '')
+                            if currency:
+                                return f"{currency} {shipping}"
+                            return str(shipping)
+                elif isinstance(offers, list) and len(offers) > 0:
+                    first = offers[0]
+                    shipping = first.get('shippingCost')
+                    if shipping is not None:
+                        if shipping == 0 or str(shipping) == '0':
+                            return "Бесплатно"
+                        if isinstance(shipping, (int, float)):
+                            currency = first.get('priceCurrency', '')
+                            if currency:
+                                return f"{currency} {shipping}"
+                            return str(shipping)
+        except:
+            pass
+
+    # 2) CSS-селекторы на странице поиска
+    # Стандартный класс для доставки
+    shipping_elem = card.select_one('span.s-item__shipping, .s-item__shipping, div.s-item__shipping')
+    if shipping_elem:
+        text = shipping_elem.get_text(strip=True)
+        # Очистка: убираем лишние пробелы, переводим в читаемый вид
+        text = re.sub(r'\s+', ' ', text).strip()
+        if text:
+            # Часто встречается "Free shipping" или "Shipping: $5.00"
+            if 'free' in text.lower():
+                return "Бесплатно"
+            # Если есть цифры и валюта
+            if re.search(r'\d', text) and re.search(r'[$€£¥]', text):
+                return text
+            # Если просто текст типа "Shipping not specified"
+            if text and len(text) < 30:
+                return text
+
+    # 3) Резерв: поиск по тексту внутри родителя
+    parent = card
+    for _ in range(3):
+        if parent:
+            for elem in parent.select('[class*="shipping"], [class*="delivery"]'):
+                text = elem.get_text(strip=True)
+                if text:
+                    text = re.sub(r'\s+', ' ', text).strip()
+                    if 'free' in text.lower():
+                        return "Бесплатно"
+                    if re.search(r'\d', text) and re.search(r'[$€£¥]', text):
+                        return text
+                    if text and len(text) < 40:
+                        return text
+            parent = parent.parent
+        else:
+            break
+    return None
+
 def parse_ebay_listings(html, max_items=MAX_ITEMS):
     if not html:
         return {}
@@ -276,17 +350,20 @@ def parse_ebay_listings(html, max_items=MAX_ITEMS):
             if not price:
                 price = extract_price_css(card)
             
+            shipping = extract_shipping(card, url, soup)
+            
             items_data[item_id] = {
                 'url': url,
                 'title': title,
-                'price': price
+                'price': price,
+                'shipping': shipping
             }
             processed += 1
         
         logging.info(f"Обработано {len(items_data)} товаров")
         return items_data
     
-    # Резервный поиск по ссылкам
+    # Резервный поиск по ссылкам (без доставки)
     logging.warning("Карточки не найдены, поиск по ссылкам")
     links = soup.find_all('a', href=True)
     itm_links = [link for link in links if '/itm/' in link['href']]
@@ -303,17 +380,23 @@ def parse_ebay_listings(html, max_items=MAX_ITEMS):
         if not title:
             continue
         price = None
+        shipping = None
         parent = link.parent
         for _ in range(4):
             if parent:
                 price = extract_price_jsonld(parent, url, soup)
-                if price:
-                    break
-                price = extract_price_css(parent)
-                if price:
+                if not price:
+                    price = extract_price_css(parent)
+                shipping = extract_shipping(parent, url, soup)
+                if price or shipping:
                     break
                 parent = parent.parent
-        items_data[item_id] = {'url': url, 'title': title, 'price': price}
+        items_data[item_id] = {
+            'url': url,
+            'title': title,
+            'price': price,
+            'shipping': shipping
+        }
     logging.info(f"Резерв: {len(items_data)} товаров")
     return items_data
 
@@ -339,22 +422,26 @@ def check_and_send_new_items():
     new_items = []
     for item_id, data in current_items.items():
         if item_id not in seen:
-            # Добавляем id в словарь
             new_items.append({
                 'id': item_id,
                 'url': data['url'],
                 'title': data['title'],
-                'price': data['price']
+                'price': data['price'],
+                'shipping': data.get('shipping')
             })
-            logging.info(f"НОВЫЙ: {data['title'][:50]}... цена: {data['price']}")
+            logging.info(f"НОВЫЙ: {data['title'][:50]}... цена: {data['price']}, доставка: {data.get('shipping')}")
     if new_items:
         for item in new_items:
             msg = f"🔹 <b>НОВЫЙ ТОВАР НА EBAY</b> 🔹\n\n<b>{item['title']}</b>\n\n"
             if item['price']:
-                msg += f"💰 Цена: {item['price']}\n\n"
+                msg += f"💰 Цена: {item['price']}\n"
             else:
-                msg += f"💰 Цена не указана\n\n"
-            msg += f"🔗 <a href='{item['url']}'>Ссылка на товар</a>"
+                msg += f"💰 Цена не указана\n"
+            if item['shipping']:
+                msg += f"🚚 Доставка: {item['shipping']}\n"
+            else:
+                msg += f"🚚 Доставка: не указана\n"
+            msg += f"\n🔗 <a href='{item['url']}'>Ссылка на товар</a>"
             send_telegram_message(msg)
             add_seen_ids_batch([item['id']])
             time.sleep(1)
@@ -375,6 +462,7 @@ def bot_worker():
         try:
             check_and_send_new_items()
             wait = max(60, CHECK_INTERVAL + random.uniform(-30, 60))
+            logging.info(f"Следующая проверка через {wait:.0f} секунд.")
             time.sleep(wait)
         except Exception as e:
             logging.error(f"Ошибка: {e}", exc_info=True)
@@ -382,14 +470,14 @@ def bot_worker():
 
 @app.route('/')
 def index():
-    return "eBay бот работает (цена через JSON-LD)"
+    return "eBay бот работает (цена + доставка из JSON-LD)"
 
 @app.route('/health')
 def health():
     return "OK", 200
 
 if __name__ == "__main__":
-    send_telegram_message("🚀 Бот запущен, цена из JSON-LD")
+    send_telegram_message("🚀 Бот запущен, отслеживает цену и доставку")
     thread = threading.Thread(target=bot_worker, daemon=False)
     thread.start()
     port = int(os.environ.get("PORT", 5000))
