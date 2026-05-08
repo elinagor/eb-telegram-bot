@@ -30,7 +30,7 @@ load_dotenv()
 EBAY_SEARCH_URL = os.getenv("EBAY_SEARCH_URL")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))   # ИЗМЕНЕНО на 60 секунд
 BRIGHT_DATA_PROXY_URL = os.getenv("BRIGHT_DATA_PROXY_URL")
 DATABASE_URL = os.getenv("DATABASE_URL")
 MAX_ITEMS = 20
@@ -349,6 +349,32 @@ def extract_shipping(card, item_price=None):
             return pc
     return None
 
+# ============ НОВАЯ ФУНКЦИЯ: ОПРЕДЕЛЕНИЕ BEST OFFER ============
+def extract_best_offer(card):
+    """
+    Ищет индикатор «or Best Offer» в карточке товара.
+    Возвращает True, если найден, иначе False.
+    """
+    # Прямой поиск текста
+    text = card.get_text()
+    if re.search(r'or\s+best\s+offer', text, re.I):
+        return True
+    # Специфические селекторы eBay для Best Offer
+    best_offer_selectors = [
+        '.s-item__best-offer',
+        '.s-item__detail--best-offer',
+        '.s-item__bonus',
+        '[class*="bestOffer"]',
+        '[class*="best-offer"]'
+    ]
+    for sel in best_offer_selectors:
+        if card.select_one(sel):
+            return True
+    # Поиск по атрибутам
+    if card.select_one('[data-best-offer="true"]'):
+        return True
+    return False
+
 def parse_ebay_listings(html, max_items=MAX_ITEMS):
     if not html:
         return {}
@@ -388,7 +414,14 @@ def parse_ebay_listings(html, max_items=MAX_ITEMS):
         shipping = extract_shipping(card, item_price=price)
         if shipping and shipping != "Бесплатно" and not is_usd_price(shipping):
             shipping = None
-        items[item_id] = {'url': url, 'title': title, 'price': price, 'shipping': shipping}
+        best_offer = extract_best_offer(card)  # <-- НОВОЕ
+        items[item_id] = {
+            'url': url,
+            'title': title,
+            'price': price,
+            'shipping': shipping,
+            'best_offer': best_offer   # <-- НОВОЕ
+        }
         processed += 1
     logging.info(f"Обработано товаров: {len(items)}")
     return items
@@ -410,6 +443,7 @@ def parse_ebay_listings_fallback(soup, max_items):
             continue
         price = None
         shipping = None
+        best_offer = False
         parent = link.parent
         for _ in range(5):
             if parent:
@@ -419,10 +453,17 @@ def parse_ebay_listings_fallback(soup, max_items):
                 shipping = extract_shipping(parent, item_price=price)
                 if shipping and shipping != "Бесплатно" and not is_usd_price(shipping):
                     shipping = None
-                if price or shipping:
+                best_offer = extract_best_offer(parent)
+                if price or shipping or best_offer:
                     break
                 parent = parent.parent
-        items[item_id] = {'url': url, 'title': title, 'price': price, 'shipping': shipping}
+        items[item_id] = {
+            'url': url,
+            'title': title,
+            'price': price,
+            'shipping': shipping,
+            'best_offer': best_offer
+        }
     return items
 
 def perform_initial_snapshot():
@@ -448,7 +489,7 @@ def check_and_send_new_items():
     for item_id, data in current.items():
         if item_id not in seen:
             new.append({'id': item_id, **data})
-            logging.info(f"НОВЫЙ: {data['title'][:50]}... цена: {data['price']}, доставка: {data.get('shipping')}")
+            logging.info(f"НОВЫЙ: {data['title'][:50]}... цена: {data['price']}, доставка: {data.get('shipping')}, best_offer: {data.get('best_offer')}")
     if new:
         for item in new:
             msg = f"🔹 <b>НОВЫЙ ТОВАР НА EBAY</b> 🔹\n\n<b>{item['title']}</b>\n\n"
@@ -460,6 +501,8 @@ def check_and_send_new_items():
                 msg += f"🚚 Доставка: {item['shipping']}\n"
             else:
                 msg += f"🚚 Доставка: не указана\n"
+            if item.get('best_offer', False):
+                msg += f"✅ Можно сделать предложение\n"
             msg += f"\n🔗 <a href='{item['url']}'>Ссылка на товар</a>"
             send_telegram_message(msg)
             add_seen_ids_batch([item['id']])
@@ -484,7 +527,7 @@ def bot_worker():
             continue
         try:
             check_and_send_new_items()
-            wait = max(30, CHECK_INTERVAL + random.uniform(-30, 60))
+            wait = max(60, CHECK_INTERVAL + random.uniform(-30, 60))   # CHECK_INTERVAL = 60
             logging.info(f"Следующая проверка через {wait:.0f} секунд.")
             time.sleep(wait)
         except Exception as e:
@@ -493,19 +536,16 @@ def bot_worker():
 
 @app.route('/')
 def index():
-    return "eBay бот работает (команды /stop /start)"
+    return "eBay бот работает (интервал 60 сек, определяет Best Offer)"
 
 @app.route('/health')
 def health():
     return "OK", 200
 
 if __name__ == "__main__":
-    send_telegram_message("🚀 Бот запущен. Доступны команды: /stop, /start")
-    # Запускаем слушателя команд (демонический)
+    send_telegram_message("🚀 Бот запущен. Интервал 60 сек, отслеживаю Best Offer")
     threading.Thread(target=telegram_listener, daemon=True).start()
-    # Запускаем основной воркер в не-демоническом потоке
     worker_thread = threading.Thread(target=bot_worker, daemon=False)
     worker_thread.start()
-    # Запускаем Flask
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
