@@ -197,97 +197,113 @@ def is_gbp_price(text):
         return False
     return re.search(r'\d', text) is not None
 
-# ============ УЛУЧШЕННОЕ ИЗВЛЕЧЕНИЕ ЦЕНЫ С ЛОГИРОВАНИЕМ ============
-def extract_price_robust(card, url=None, soup=None):
+# ============ ИЗВЛЕЧЕНИЕ ЦЕНЫ ТОВАРА (ТОЛЬКО ТОВАР, НЕ ДОСТАВКА) ============
+def extract_price_item(card, url=None, soup=None):
     """
-    Универсальный парсер цены с подробным логированием.
+    Ищет цену товара, исключая элементы доставки.
     Возвращает строку с ценой в формате £X.XX или None.
     """
-    all_price_texts = []
-    numeric_prices = []
+    price_candidates = []
 
-    # 1. Ищем все элементы с классом, содержащим "price" или "cost"
-    price_elements = card.find_all(attrs={'class': re.compile(r'price|cost', re.I)})
-    for elem in price_elements:
-        text = elem.get_text(strip=True)
-        if text and '£' in text:
-            all_price_texts.append(text)
-
-    # 2. Ищем элементы с символом £ в любом теге, ограничивая длину текста 100 символами
-    all_tags = card.find_all(['span', 'div', 'p', 'h3', 'h4', 'li', 'a'])
-    for elem in all_tags:
-        text = elem.get_text(strip=True)
-        if text and '£' in text and re.search(r'\d', text) and len(text) < 100:
-            all_price_texts.append(text)
-
-    # 3. Специфические селекторы eBay
-    specific_selectors = [
-        'span.s-item__price', '[data-testid="item-price"]', '.s-item__detail .s-item__price',
-        '.s-item__price', '.su-styled-text.primary.bold.large-1.s-card__price',
-        '.s-item__price-msrp', '.s-item__price--strikethrough'
+    # 1. Специфические селекторы для цены товара (из вашего HTML)
+    item_price_selectors = [
+        'span.s-item__price',                # основной селектор eBay
+        '[data-testid="item-price"]',
+        '.s-item__detail .s-item__price',
+        '.s-card__price',                     # новый селектор из вашего примера
+        '.su-styled-text.primary.bold.large-1.s-card__price',  # точный класс из вашего HTML
+        'span.su-styled-text.primary.bold.large-1'
     ]
-    for sel in specific_selectors:
+    for sel in item_price_selectors:
         elem = card.select_one(sel)
         if elem:
             text = elem.get_text(strip=True)
             if text and '£' in text:
-                all_price_texts.append(text)
+                # Дополнительно проверяем, что этот элемент не содержит слова shipping/delivery
+                if not re.search(r'(?i)(shipping|delivery|postage)', text):
+                    price_candidates.append(text)
+                    break  # берём первый подходящий
 
-    # Если нет текстов с £, пробуем JSON-LD
-    if not all_price_texts:
-        scripts = card.find_all('script', type='application/ld+json')
-        for script in scripts:
-            if not script.string:
+    # 2. Если не нашли, ищем любые элементы с классом, содержащим "price", но не "shipping"
+    if not price_candidates:
+        all_price_elements = card.find_all(attrs={'class': re.compile(r'price', re.I)})
+        for elem in all_price_elements:
+            # Проверяем, что класс не содержит shipping/delivery/logistics
+            classes = ' '.join(elem.get('class', []))
+            if re.search(r'(?i)(shipping|delivery|logistics)', classes):
                 continue
-            try:
-                data = json.loads(script.string)
-                if isinstance(data, dict):
-                    offers = data.get('offers')
-                    if isinstance(offers, dict):
-                        price = offers.get('price')
-                        currency = offers.get('priceCurrency', '')
-                        if price and price != '0' and currency == 'GBP':
-                            numeric_prices.append(float(price))
-                    elif isinstance(offers, list):
-                        for off in offers:
-                            price = off.get('price')
-                            currency = off.get('priceCurrency', '')
-                            if price and price != '0' and currency == 'GBP':
-                                numeric_prices.append(float(price))
-            except:
-                continue
-        if numeric_prices:
-            best = min(numeric_prices)
-            logging.info(f"Цена из JSON-LD: {numeric_prices} -> выбрана {best}")
-            return f"£{int(best)}" if best.is_integer() else f"£{best:.2f}"
-        return None
+            text = elem.get_text(strip=True)
+            if text and '£' in text:
+                # Также проверяем текст элемента
+                if not re.search(r'(?i)(shipping|delivery|postage)', text):
+                    price_candidates.append(text)
 
-    # Из всех собранных текстов извлекаем числа с символом £
-    for text in all_price_texts:
-        # Ищем числа вида £12.34 или £12,34 или £1234.56
+    # 3. Если всё ещё нет, ищем любой элемент с символом £, но не в контексте доставки
+    if not price_candidates:
+        all_elements = card.find_all(['span', 'div', 'p'])
+        for elem in all_elements:
+            text = elem.get_text(strip=True)
+            if text and '£' in text and re.search(r'\d', text) and len(text) < 100:
+                # Исключаем явные указания на доставку
+                if re.search(r'(?i)(shipping|delivery|postage|logistics)', text):
+                    continue
+                price_candidates.append(text)
+
+    # Из кандидатов извлекаем числовые значения
+    numeric_prices = []
+    for text in price_candidates:
         matches = re.findall(r'£\s*([\d,]+(?:\.\d{1,2})?)', text)
         for m in matches:
             try:
-                clean = m.replace(',', '')  # удаляем запятые тысяч
+                clean = m.replace(',', '')
                 price_val = float(clean)
                 numeric_prices.append(price_val)
             except ValueError:
                 continue
 
     if numeric_prices:
-        best = min(numeric_prices)
-        # Логируем все найденные цены для отладки
-        logging.info(f"Найдены цены в HTML: {numeric_prices} -> выбрана минимальная {best}")
+        best = min(numeric_prices)  # если несколько цен (скидка), берём минимальную
+        logging.debug(f"Цена товара найдена: {numeric_prices} -> {best}")
         if best.is_integer():
             return f"£{int(best)}"
         else:
-            # Форматируем с двумя знаками после точки, без округления вверх
             return f"£{best:.2f}"
-    else:
-        logging.warning("Не удалось найти цену в HTML и JSON-LD")
-        return None
 
+    # 4. Резерв: JSON-LD (только с валютой GBP)
+    scripts = card.find_all('script', type='application/ld+json')
+    json_prices = []
+    for script in scripts:
+        if not script.string:
+            continue
+        try:
+            data = json.loads(script.string)
+            if isinstance(data, dict):
+                offers = data.get('offers')
+                if isinstance(offers, dict):
+                    price = offers.get('price')
+                    currency = offers.get('priceCurrency', '')
+                    if price and price != '0' and currency == 'GBP':
+                        json_prices.append(float(price))
+                elif isinstance(offers, list):
+                    for off in offers:
+                        price = off.get('price')
+                        currency = off.get('priceCurrency', '')
+                        if price and price != '0' and currency == 'GBP':
+                            json_prices.append(float(price))
+        except:
+            continue
+    if json_prices:
+        best = min(json_prices)
+        if best.is_integer():
+            return f"£{int(best)}"
+        else:
+            return f"£{best:.2f}"
+
+    return None
+
+# ============ ИЗВЛЕЧЕНИЕ СТОИМОСТИ ДОСТАВКИ (полностью отдельно) ============
 def extract_shipping(card, item_price=None):
+    # Сначала пробуем JSON-LD
     script = card.find('script', type='application/ld+json')
     if script and script.string:
         try:
@@ -302,6 +318,7 @@ def extract_shipping(card, item_price=None):
                         if isinstance(shipping, (int, float)):
                             currency = offers.get('priceCurrency', '')
                             amount = f"{currency} {shipping}" if currency else str(shipping)
+                            # Не путаем с ценой товара
                             if item_price and str(shipping) == str(item_price) and currency == 'GBP':
                                 return None
                             return amount
@@ -320,10 +337,12 @@ def extract_shipping(card, item_price=None):
         except:
             pass
 
+    # Затем ищем по селекторам доставки
     shipping_selectors = [
         'span.s-item__shipping', 'div.s-item__shipping',
         'span.s-item__logisticsCost', 'span.s-item__delivery',
-        'span.su-styled-text', '.su-styled-text.secondary.large',
+        'span.su-styled-text.secondary.large',  // часто используется для доставки
+        '.s-item__shippingCost',
         '[class*="shippingCost"]'
     ]
     for sel in shipping_selectors:
@@ -332,23 +351,30 @@ def extract_shipping(card, item_price=None):
             text = re.sub(r'\s+', ' ', text)
             if not text:
                 continue
+            # Пропускаем текст, который явно не о доставке
             if re.search(r'(?i)(buy it now|best offer|make offer|watch|add to cart)', text):
                 continue
-            if not re.search(r'(?i)(free|shipping|delivery|postage|shipping cost)', text):
+            if not re.search(r'(?i)(free|shipping|delivery|postage|shipping cost|postage cost)', text):
                 continue
             if 'free' in text.lower():
                 return "Бесплатно"
             match = re.search(r'([£€$]\s*[\d,]+\.?\d*)', text)
             if match:
                 price_candidate = match.group(1)
+                # Не путаем с ценой товара
                 if item_price and price_candidate == item_price:
                     continue
                 return price_candidate
+            # Если нет цифр, но есть слово "free" или "бесплатно"
+            if 'free' in text.lower():
+                return "Бесплатно"
+            # Если короткий текст без цифр, возможно просто "Free shipping"
             if len(text) < 30 and not re.search(r'\d', text):
                 if 'free' in text.lower():
                     return "Бесплатно"
                 return text
 
+    # Ручной поиск в HTML
     html = str(card)
     if re.search(r'(?i)free\s+shipping', html):
         return "Бесплатно"
@@ -430,13 +456,10 @@ def parse_ebay_listings(html, max_items=MAX_ITEMS):
             if not title:
                 continue
 
-        price = extract_price_robust(card, url, soup)
-        if price and not is_gbp_price(price):
-            price = None
-
+        # Извлекаем цену товара
+        price = extract_price_item(card, url, soup)
+        # Извлекаем доставку (передаём цену товара, чтобы не перепутать)
         shipping = extract_shipping(card, item_price=price)
-        if shipping and shipping != "Бесплатно" and not is_gbp_price(shipping):
-            shipping = None
 
         best_offer = extract_best_offer(card)
         auction = extract_auction(card)
@@ -475,12 +498,8 @@ def parse_ebay_listings_fallback(soup, max_items):
         parent = link.parent
         for _ in range(5):
             if parent:
-                price = extract_price_robust(parent, url, soup)
-                if price and not is_gbp_price(price):
-                    price = None
+                price = extract_price_item(parent, url, soup)
                 shipping = extract_shipping(parent, item_price=price)
-                if shipping and shipping != "Бесплатно" and not is_gbp_price(shipping):
-                    shipping = None
                 best_offer = extract_best_offer(parent)
                 auction = extract_auction(parent)
                 if price or shipping or best_offer or auction:
