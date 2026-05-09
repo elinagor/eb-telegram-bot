@@ -37,21 +37,53 @@ MAX_ITEMS = 20                     # сколько товаров из загр
 MAX_RETRIES = 5                    # сокращено для экономии трафика
 RETRY_DELAY = 5
 
-# Принудительно переводим URL в мобильную версию (легче в 5-10 раз)
-if EBAY_SEARCH_URL:
-    # Заменяем домен www.ebay.co.uk на m.ebay.co.uk
-    EBAY_SEARCH_URL = EBAY_SEARCH_URL.replace("www.ebay.co.uk", "m.ebay.co.uk")
-    # Удаляем /sch/i.html если есть, мобильная версия использует корневой путь "/"
-    EBAY_SEARCH_URL = EBAY_SEARCH_URL.replace("/sch/i.html", "")
-    # Добавляем параметры: только товары из UK (LH_PrefLoc=3), 20 товаров на страницу, сортировка по новизне
-    if '?' in EBAY_SEARCH_URL:
-        EBAY_SEARCH_URL += '&LH_PrefLoc=3&_ipg=20&_sop=10'
-    else:
-        EBAY_SEARCH_URL += '?LH_PrefLoc=3&_ipg=20&_sop=10'
-else:
+# ============ ФОРМИРОВАНИЕ ПРАВИЛЬНОГО URL (МОБИЛЬНАЯ ВЕРСИЯ) ============
+if not EBAY_SEARCH_URL:
     logging.error("EBAY_SEARCH_URL не задан в .env")
     sys.exit(1)
 
+# Заменяем домен на мобильный и удаляем /sch/i.html
+EBAY_SEARCH_URL = EBAY_SEARCH_URL.replace("www.ebay.co.uk", "m.ebay.co.uk")
+EBAY_SEARCH_URL = EBAY_SEARCH_URL.replace("/sch/i.html", "")
+
+# Разбираем параметры
+if '?' in EBAY_SEARCH_URL:
+    base, query = EBAY_SEARCH_URL.split('?', 1)
+    params = {}
+    for pair in query.split('&'):
+        if '=' in pair:
+            key, val = pair.split('=', 1)
+            params[key] = val
+else:
+    base = EBAY_SEARCH_URL
+    params = {}
+
+# Корректируем параметры для мобильной версии, сохраняя поисковый запрос
+# Заменяем _dcat на _sacat (категория)
+if '_dcat' in params:
+    params['_sacat'] = params.pop('_dcat')
+
+# Принудительно устанавливаем нужные параметры
+params['_sop'] = '10'           # сортировка по новизне
+params['_ipg'] = '20'           # 20 товаров на страницу
+params['LH_PrefLoc'] = '3'      # товары из UK
+# Оставляем _fcid=3 и _stpos если были, но не перезаписываем
+if '_fcid' not in params:
+    params['_fcid'] = '3'
+if '_stpos' not in params:
+    params['_stpos'] = 'E107QF'  # почтовый код Лондона (пример)
+
+# Удаляем мусорные параметры, которые могут ломать мобильную выдачу
+for bad in ['_from', '_sacat', 'rt', 'LH_TitleDesc', 'LH_Specifics', 'df']:
+    params.pop(bad, None)
+
+# Собираем URL заново
+new_query = '&'.join(f"{k}={v}" for k, v in params.items())
+EBAY_SEARCH_URL = f"{base}?{new_query}"
+
+logging.info(f"Финальный URL для запросов: {EBAY_SEARCH_URL}")
+
+# Проверка остальных переменных
 if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, BRIGHT_DATA_PROXY_URL, DATABASE_URL]):
     logging.error("Не хватает переменных окружения.")
     sys.exit(1)
@@ -64,16 +96,11 @@ is_paused = False
 
 # ============ РОТАЦИЯ USER-AGENT (МОБИЛЬНЫЕ) ============
 USER_AGENTS = [
-    # iPhone
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
     "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
-    # iPad
     "Mozilla/5.0 (iPad; CPU OS 17_5_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
-    # Android
     "Mozilla/5.0 (Linux; Android 14; SM-S921B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.6998.71 Mobile Safari/537.36",
     "Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.6943.121 Mobile Safari/537.36",
-    # Резервный десктопный (на случай блокировки)
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
 ]
 
 # ============ РАБОТА С БАЗОЙ ДАННЫХ ============
@@ -148,19 +175,17 @@ def telegram_listener():
             logging.error(f"Ошибка в слушателе Telegram: {e}")
             time.sleep(5)
 
-# ============ ЗАПРОС К EBAY (МОБИЛЬНАЯ ВЕРСИЯ) ============
+# ============ ЗАПРОС К EBAY ============
 def fetch_ebay_html_with_retry():
     proxies = {"http": BRIGHT_DATA_PROXY_URL, "https": BRIGHT_DATA_PROXY_URL}
-    # Куки для Великобритании (могут помочь)
     cookies = {'ebay': '%2F', 'm': 'GB', 's': 'UK', 'siteid': '3'}
     for attempt in range(1, MAX_RETRIES + 1):
         current_ua = random.choice(USER_AGENTS)
-        # Упрощённые заголовки для мобильной версии
         headers = {
             'User-Agent': current_ua,
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
             'Accept-Language': 'en-GB,en;q=0.9',
-            'Accept-Encoding': 'gzip, deflate, br',   # сжатие
+            'Accept-Encoding': 'gzip, deflate, br',
             'Referer': 'https://m.ebay.co.uk/',
         }
         if attempt > 1:
@@ -170,7 +195,7 @@ def fetch_ebay_html_with_retry():
                 EBAY_SEARCH_URL,
                 headers=headers,
                 cookies=cookies,
-                impersonate="chrome124",   # мобильный impersonate
+                impersonate="chrome124",
                 proxies=proxies,
                 verify=False,
                 timeout=35
@@ -401,7 +426,6 @@ def parse_ebay_listings(html, max_items=MAX_ITEMS):
     if not html:
         return {}
     soup = BeautifulSoup(html, 'html.parser')
-    # Мобильная версия использует те же классы, но иногда вложенность другая
     cards = soup.select('li.s-item')
     if not cards:
         cards = soup.select('.s-item')
@@ -557,7 +581,6 @@ def bot_worker():
             continue
         try:
             check_and_send_new_items()
-            # Фиксированный интервал 60 сек (без рандомизации, можно при необходимости вернуть)
             wait = CHECK_INTERVAL
             logging.info(f"Следующая проверка через {wait:.0f} секунд.")
             time.sleep(wait)
@@ -567,14 +590,14 @@ def bot_worker():
 
 @app.route('/')
 def index():
-    return "eBay бот работает (UK, мобильная версия, интервал 60 сек, Best Offer + Auction, экономия трафика: _ipg=20, сжатие gzip)"
+    return "eBay бот работает (UK, мобильная версия, правильная категория, интервал 60 сек)"
 
 @app.route('/health')
 def health():
     return "OK", 200
 
 if __name__ == "__main__":
-    send_telegram_message("🚀 Бот запущен (Великобритания, GBP, мобильная версия). Интервал 60 сек, оптимизирован трафик.")
+    send_telegram_message("🚀 Бот запущен (Великобритания, GBP, мобильная версия, категория Cross Stitch).")
     threading.Thread(target=telegram_listener, daemon=True).start()
     worker_thread = threading.Thread(target=bot_worker, daemon=False)
     worker_thread.start()
