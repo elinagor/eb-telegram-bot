@@ -30,13 +30,12 @@ load_dotenv()
 EBAY_SEARCH_URL = os.getenv("EBAY_SEARCH_URL")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))   # 60 секунд
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
 DATABASE_URL = os.getenv("DATABASE_URL")
 MAX_ITEMS = 20
 MAX_RETRIES = 20
 RETRY_DELAY = 5
 
-# Принудительная локализация Великобритании и фунты стерлингов
 if '?' in EBAY_SEARCH_URL:
     EBAY_SEARCH_URL += '&LH_PrefLoc=3&_ipg=240&_sop=10'
 else:
@@ -49,53 +48,58 @@ if not all([EBAY_SEARCH_URL, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DATABASE_URL]
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 app = Flask(__name__)
 
-# ============ ГЛОБАЛЬНЫЕ ФЛАГИ ============
 is_paused = False
 
-# ============ РОТАЦИЯ USER-AGENT, SEC-CH-UA И IMPERSONATE ============
-# *** ИСПРАВЛЕНО: значения impersonate заменены на поддерживаемые ***
+# ============ РОТАЦИЯ ПРОФИЛЕЙ (ТОЛЬКО ПОДДЕРЖИВАЕМЫЕ) ============
 BROWSER_PROFILES = [
-    {   # Chrome 146 (вместо 148, если версия curl_cffi старая)
+    # Chrome 146 (стабильный)
+    {
         'ua': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
         'sec_ch_ua': '"Google Chrome";v="146", "Chromium";v="146", "Not_A Brand";v="99"',
         'impersonate': "chrome146"
     },
-    {   # Edge 146 (вместо 148)
-        'ua': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0",
-        'sec_ch_ua': '"Microsoft Edge";v="146", "Chromium";v="146", "Not_A Brand";v="99"',
-        'impersonate': "edge146"   # Используем edge146, так как edge148 может не поддерживаться
-    },
-    {   # Firefox 147 (поддерживается в curl_cffi 0.15.0+)
+    # Firefox 147 (стабильный)
+    {
         'ua': "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0",
         'sec_ch_ua': '"Firefox";v="147", "Not_A Brand";v="99"',
         'impersonate': "firefox147"
     },
-    {   # Safari 26.4 (поддерживается)
+    # Safari 26.4 (стабильный)
+    {
         'ua': "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.4 Safari/605.1.15",
         'sec_ch_ua': '"Safari";v="26", "Not_A Brand";v="99"',
         'impersonate': "safari260"
     },
-    {   # Добавляем вариант с chrome (универсальный)
+    # Универсальный Chrome (работает всегда)
+    {
         'ua': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
         'sec_ch_ua': '"Google Chrome";v="146", "Chromium";v="146", "Not_A Brand";v="99"',
         'impersonate': "chrome"
     },
-    {   # Добавляем вариант с firefox (универсальный)
+    # Универсальный Firefox
+    {
         'ua': "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0",
         'sec_ch_ua': '"Firefox";v="147", "Not_A Brand";v="99"',
         'impersonate': "firefox"
     },
-    {   # Добавляем вариант с safari (универсальный)
+    # Универсальный Safari
+    {
         'ua': "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.4 Safari/605.1.15",
         'sec_ch_ua': '"Safari";v="26", "Not_A Brand";v="99"',
         'impersonate': "safari"
+    },
+    # === НОВЫЙ ПРОФИЛЬ (ПО ВАШЕМУ ЗАПРОСУ) ===
+    {
+        'ua': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+        'sec_ch_ua': '"Google Chrome";v="148", "Chromium";v="148", "Not_A Brand";v="99"',
+        'impersonate': "chrome"         # используем универсальную имитацию, т.к. chrome148 может не поддерживаться
     },
 ]
 
 def get_random_browser_profile():
     return random.choice(BROWSER_PROFILES)
 
-# ============ РАБОТА С БАЗОЙ ДАННЫХ ============
+# ============ БАЗА ДАННЫХ ============
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL)
 
@@ -126,7 +130,7 @@ def is_db_empty():
             cur.execute("SELECT NOT EXISTS (SELECT 1 FROM seen_items)")
             return cur.fetchone()[0]
 
-# ============ ОТПРАВКА СООБЩЕНИЙ В TELEGRAM ============
+# ============ TELEGRAM ============
 def send_telegram_message(message, parse_mode='HTML'):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': message, 'parse_mode': parse_mode, 'disable_web_page_preview': False}
@@ -137,7 +141,6 @@ def send_telegram_message(message, parse_mode='HTML'):
     except Exception as e:
         logging.error(f"Не удалось отправить в Telegram: {e}")
 
-# ============ ОБРАБОТЧИК КОМАНД (LONG POLLING) ============
 def telegram_listener():
     global is_paused
     logging.info("🔁 Поток слушателя команд Telegram запущен")
@@ -167,9 +170,8 @@ def telegram_listener():
             logging.error(f"Ошибка в слушателе Telegram: {e}")
             time.sleep(5)
 
-# ============ ЗАПРОС К EBAY (С ИСПОЛЬЗОВАНИЕМ ПРОФИЛЕЙ) ============
+# ============ ЗАПРОС К EBAY ============
 def fetch_ebay_html_with_retry():
-    # Куки для Великобритании
     cookies = {'ebay': '%2F', 'm': 'GB', 's': 'UK', 'siteid': '3'}
     for attempt in range(1, MAX_RETRIES + 1):
         profile = get_random_browser_profile()
@@ -190,12 +192,12 @@ def fetch_ebay_html_with_retry():
             'Sec-Ch-Ua-Mobile': '?0',
             'Sec-Ch-Ua-Platform': '"Windows"' if 'Windows' in profile['ua'] else '"macOS"',
         }
-        
+
         if attempt > 1:
             sleep_time = random.uniform(2.0, 5.0)
             logging.info(f"Пауза перед повторной попыткой {attempt}: {sleep_time:.1f} сек")
             time.sleep(sleep_time)
-        
+
         try:
             response = cffi_requests.get(
                 EBAY_SEARCH_URL,
@@ -206,8 +208,7 @@ def fetch_ebay_html_with_retry():
                 timeout=35,
                 allow_redirects=True
             )
-            
-            # Проверяем, не пришла ли капча или страница блокировки
+
             if response.status_code == 200:
                 if 'pardon our interruption' in response.text.lower() or 'access denied' in response.text.lower():
                     logging.warning(f"Обнаружена страница блокировки (попытка {attempt})")
@@ -215,15 +216,12 @@ def fetch_ebay_html_with_retry():
                         continue
                     else:
                         return None
-            
-            if response.status_code == 200:
                 logging.info(f"✅ Загружено (попытка {attempt}, профиль: {profile['impersonate']})")
                 return response.text
             elif response.status_code == 403:
                 logging.warning(f"⚠️ 403 Forbidden (попытка {attempt}, профиль: {profile['impersonate']})")
                 if attempt < MAX_RETRIES:
-                    sleep_time = RETRY_DELAY * 2 + random.uniform(5, 15)  # Увеличиваем паузу при 403
-                    time.sleep(sleep_time)
+                    time.sleep(RETRY_DELAY * 2 + random.uniform(5, 15))
             else:
                 logging.warning(f"Попытка {attempt}/{MAX_RETRIES}: HTTP {response.status_code}")
                 if attempt < MAX_RETRIES:
@@ -231,11 +229,10 @@ def fetch_ebay_html_with_retry():
         except Exception as e:
             logging.error(f"Попытка {attempt}/{MAX_RETRIES}: {e}")
             if attempt < MAX_RETRIES:
-                sleep_time = RETRY_DELAY * 2 + random.uniform(1, 3)
-                time.sleep(sleep_time)
+                time.sleep(RETRY_DELAY * 2 + random.uniform(1, 3))
     return None
 
-# ============ ФУНКЦИИ ПАРСИНГА ============
+# ============ ПАРСИНГ ============
 def extract_item_id(url):
     if not url or '/itm/' not in url:
         return None
@@ -607,14 +604,14 @@ def bot_worker():
 
 @app.route('/')
 def index():
-    return "eBay бот работает (UK, улучшенная имитация браузера)"
+    return "eBay бот работает (UK, исправлен список профилей, добавлен Chrome/148)"
 
 @app.route('/health')
 def health():
     return "OK", 200
 
 if __name__ == "__main__":
-    send_telegram_message("🚀 Бот запущен (Великобритания, улучшенная имитация браузера). Интервал 60 сек, команды /stop /start")
+    send_telegram_message("🚀 Бот запущен (Великобритания, обновлённые профили). Интервал 60 сек, команды /stop /start")
     threading.Thread(target=telegram_listener, daemon=True).start()
     worker_thread = threading.Thread(target=bot_worker, daemon=False)
     worker_thread.start()
