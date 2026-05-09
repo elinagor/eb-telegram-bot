@@ -4,6 +4,7 @@ import ssl
 import time
 import random
 import re
+import json
 import threading
 import logging
 import requests
@@ -14,13 +15,13 @@ from dotenv import load_dotenv
 import psycopg2
 from psycopg2.extras import execute_values
 
-# Отключаем проверку SSL
+# Отключаем проверку SSL для Bright Data
 ssl._create_default_https_context = ssl._create_unverified_context
 
 try:
     from curl_cffi import requests as cffi_requests
 except ImportError:
-    print("curl_cffi не установлен. Установите: pip install curl_cffi")
+    print("curl_cffi не установлен. Добавьте в requirements.txt")
     sys.exit(1)
 
 load_dotenv()
@@ -29,36 +30,40 @@ load_dotenv()
 EBAY_SEARCH_URL = os.getenv("EBAY_SEARCH_URL")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))   # 60 секунд
+BRIGHT_DATA_PROXY_URL = os.getenv("BRIGHT_DATA_PROXY_URL")
 DATABASE_URL = os.getenv("DATABASE_URL")
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
 MAX_ITEMS = 20
 MAX_RETRIES = 20
 RETRY_DELAY = 5
 
-# Проверяем только необходимые переменные
-if not all([EBAY_SEARCH_URL, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DATABASE_URL]):
-    logging.error("Не хватает переменных окружения. Нужны: EBAY_SEARCH_URL, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DATABASE_URL")
-    sys.exit(1)
-
-# Принудительная локализация Великобритании и сортировка по новизне
+# Принудительная локализация Великобритании и фунты стерлингов
+# Добавляем параметры: товары из UK, сортировка по новизне, 240 товаров на страницу
 if '?' in EBAY_SEARCH_URL:
     EBAY_SEARCH_URL += '&LH_PrefLoc=3&_ipg=240&_sop=10'
 else:
     EBAY_SEARCH_URL += '?LH_PrefLoc=3&_ipg=240&_sop=10'
 
+if not all([EBAY_SEARCH_URL, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, BRIGHT_DATA_PROXY_URL, DATABASE_URL]):
+    logging.error("Не хватает переменных окружения.")
+    sys.exit(1)
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 app = Flask(__name__)
 
+# ============ ГЛОБАЛЬНЫЕ ФЛАГИ ============
 is_paused = False
 
-# ============ USER-AGENTЫ ============
+# ============ РОТАЦИЯ USER-AGENT ============
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) Gecko/20100101 Firefox/144.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
 ]
 
-# ============ БАЗА ДАННЫХ ============
+# ============ РАБОТА С БАЗОЙ ДАННЫХ ============
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL)
 
@@ -67,7 +72,6 @@ def init_db():
         with conn.cursor() as cur:
             cur.execute("CREATE TABLE IF NOT EXISTS seen_items (item_id TEXT PRIMARY KEY, first_seen TIMESTAMP)")
         conn.commit()
-    logging.info("Таблица seen_items готова")
 
 def get_seen_ids():
     with get_db_connection() as conn:
@@ -90,14 +94,7 @@ def is_db_empty():
             cur.execute("SELECT NOT EXISTS (SELECT 1 FROM seen_items)")
             return cur.fetchone()[0]
 
-def reset_database():
-    with get_db_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM seen_items")
-        conn.commit()
-    logging.info("База данных очищена")
-
-# ============ TELEGRAM ============
+# ============ ОТПРАВКА СООБЩЕНИЙ В TELEGRAM ============
 def send_telegram_message(message, parse_mode='HTML'):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': message, 'parse_mode': parse_mode, 'disable_web_page_preview': False}
@@ -108,8 +105,40 @@ def send_telegram_message(message, parse_mode='HTML'):
     except Exception as e:
         logging.error(f"Не удалось отправить в Telegram: {e}")
 
-# ============ ЗАПРОС К EBAY (С ОТЛАДКОЙ) ============
+# ============ ОБРАБОТЧИК КОМАНД (LONG POLLING) ============
+def telegram_listener():
+    global is_paused
+    logging.info("🔁 Поток слушателя команд Telegram запущен")
+    last_update_id = 0
+    while True:
+        try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+            params = {'offset': last_update_id + 1, 'timeout': 30}
+            r = requests.get(url, params=params, timeout=35)
+            if r.status_code == 200:
+                updates = r.json().get('result', [])
+                for update in updates:
+                    last_update_id = update['update_id']
+                    message = update.get('message')
+                    if message and str(message.get('chat', {}).get('id')) == TELEGRAM_CHAT_ID:
+                        text = message.get('text', '').strip()
+                        if text == '/stop':
+                            is_paused = True
+                            send_telegram_message("⏸ Бот приостановлен. Для возобновления отправьте /start")
+                            logging.info("Команда /stop - пауза")
+                        elif text == '/start':
+                            is_paused = False
+                            send_telegram_message("▶ Бот продолжает работу")
+                            logging.info("Команда /start - продолжение")
+            time.sleep(1)
+        except Exception as e:
+            logging.error(f"Ошибка в слушателе Telegram: {e}")
+            time.sleep(5)
+
+# ============ ЗАПРОС К EBAY ============
 def fetch_ebay_html_with_retry():
+    proxies = {"http": BRIGHT_DATA_PROXY_URL, "https": BRIGHT_DATA_PROXY_URL}
+    # Куки для Великобритании
     cookies = {'ebay': '%2F', 'm': 'GB', 's': 'UK', 'siteid': '3'}
     for attempt in range(1, MAX_RETRIES + 1):
         current_ua = random.choice(USER_AGENTS)
@@ -118,7 +147,7 @@ def fetch_ebay_html_with_retry():
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
             'Accept-Language': 'en-GB,en;q=0.9',
             'Referer': 'https://www.ebay.co.uk/',
-            'X-EBay-Site-Id': '3',
+            'X-EBay-Site-Id': '3',          # 3 = Великобритания
             'Sec-Ch-Ua': '"Google Chrome";v="142", "Chromium";v="142", "Not_A Brand";v="99"',
             'Upgrade-Insecure-Requests': '1',
         }
@@ -130,103 +159,278 @@ def fetch_ebay_html_with_retry():
                 headers=headers,
                 cookies=cookies,
                 impersonate="chrome142",
+                proxies=proxies,
                 verify=False,
                 timeout=35
             )
             if response.status_code == 200:
-                logging.info(f"✅ Загружено (попытка {attempt})")
-                # Отладка: сохраняем первые 500 символов в лог
-                html_preview = response.text[:500]
-                logging.info(f"HTML preview: {html_preview}")
-                # Если нет карточек, сохраняем полный HTML в файл
-                if 's-card' not in html_preview and 's-item' not in html_preview and '/itm/' not in html_preview:
-                    with open('ebay_debug.html', 'w', encoding='utf-8') as f:
-                        f.write(response.text)
-                    logging.error("Страница не содержит карточек товаров. Полный HTML сохранён в ebay_debug.html")
+                logging.info(f"✅ Загружено (попытка {attempt}, UA={current_ua[:40]}...)")
                 return response.text
+            elif response.status_code == 403:
+                logging.warning(f"⚠️ 403 Forbidden (попытка {attempt})")
+                if attempt < MAX_RETRIES:
+                    time.sleep(RETRY_DELAY + random.uniform(2, 5))
             else:
-                logging.warning(f"HTTP {response.status_code} (попытка {attempt})")
+                logging.warning(f"Попытка {attempt}/{MAX_RETRIES}: HTTP {response.status_code}")
                 if attempt < MAX_RETRIES:
                     time.sleep(RETRY_DELAY)
         except Exception as e:
-            logging.error(f"Ошибка запроса: {e} (попытка {attempt})")
+            logging.error(f"Попытка {attempt}/{MAX_RETRIES}: {e}")
             if attempt < MAX_RETRIES:
-                time.sleep(RETRY_DELAY)
+                time.sleep(RETRY_DELAY + random.uniform(1, 3))
     return None
 
-# ============ ПАРСИНГ (НОВЫЕ СЕЛЕКТОРЫ) ============
+def extract_item_id(url):
+    if not url or '/itm/' not in url:
+        return None
+    try:
+        return url.split('/itm/')[1].split('?')[0]
+    except IndexError:
+        return None
+
+def clean_title(title):
+    if not title: return ""
+    title = re.sub(r'(?i)new\s*listing', '', title)
+    title = re.sub(r'(?i)\blisting\b', '', title)
+    title = re.sub(r'(?i)\bnew\b', '', title)
+    title = re.sub(r'[^\w\s£€$]', ' ', title)   # оставляем £, €, $
+    title = re.sub(r'\s+', ' ', title).strip()
+    return title
+
+def is_gbp_price(text):
+    """Проверяет, является ли текст ценой в фунтах стерлингов (£)"""
+    if not text: return False
+    # Явный символ £ или GBP
+    if re.search(r'£|\bGBP\b', text, re.I):
+        return True
+    # Если есть другие валюты ($, €) — не GBP
+    if re.search(r'[$€]|USD|EUR', text, re.I):
+        return False
+    # Если есть цифры и возможно десятичный разделитель, но нет других валют — считаем потенциально GBP
+    return re.search(r'\d', text) is not None
+
+def extract_price_jsonld(card, url=None, soup=None):
+    script = card.find('script', type='application/ld+json')
+    candidates = []
+    if script and script.string:
+        try:
+            data = json.loads(script.string)
+            if isinstance(data, dict):
+                offers = data.get('offers')
+                if isinstance(offers, dict):
+                    price = offers.get('price')
+                    currency = offers.get('priceCurrency', '')
+                    if price and price != '0':
+                        candidates.append((price, currency))
+                elif isinstance(offers, list):
+                    for off in offers:
+                        price = off.get('price')
+                        currency = off.get('priceCurrency', '')
+                        if price and price != '0':
+                            candidates.append((price, currency))
+        except:
+            pass
+    if soup and url:
+        for script in soup.find_all('script', type='application/ld+json'):
+            if not script.string:
+                continue
+            try:
+                data = json.loads(script.string)
+                if isinstance(data, dict) and data.get('url') == url:
+                    offers = data.get('offers')
+                    if isinstance(offers, dict):
+                        price = offers.get('price')
+                        currency = offers.get('priceCurrency', '')
+                        if price and price != '0':
+                            candidates.append((price, currency))
+            except:
+                continue
+    # Приоритет GBP
+    for price, curr in candidates:
+        if curr == 'GBP' or (curr == '' and str(price).startswith('£')):
+            return f"£{price}"
+    for price, curr in candidates:
+        if curr:
+            return f"{curr} {price}"
+        else:
+            return str(price)
+    return None
+
+def extract_price_css(card):
+    candidates = []
+    selectors = ['span.s-item__price', '[data-testid="item-price"]', '.s-item__detail .s-item__price']
+    for sel in selectors:
+        for elem in card.select(sel):
+            text = elem.get_text(strip=True)
+            if text:
+                candidates.append(text)
+    for elem in card.select('[class*="price"]'):
+        text = elem.get_text(strip=True)
+        if text:
+            candidates.append(text)
+    for cand in candidates:
+        if is_gbp_price(cand):
+            parts = cand.split()
+            for p in parts:
+                if is_gbp_price(p):
+                    return p
+            return cand
+    if candidates:
+        return candidates[0]
+    return None
+
+def extract_shipping(card, item_price=None):
+    script = card.find('script', type='application/ld+json')
+    if script and script.string:
+        try:
+            data = json.loads(script.string)
+            if isinstance(data, dict):
+                offers = data.get('offers')
+                if isinstance(offers, dict):
+                    shipping = offers.get('shippingCost')
+                    if shipping is not None:
+                        if shipping == 0 or str(shipping) == '0':
+                            return "Бесплатно"
+                        if isinstance(shipping, (int, float)):
+                            currency = offers.get('priceCurrency', '')
+                            amount = f"{currency} {shipping}" if currency else str(shipping)
+                            if item_price and str(shipping) == str(item_price) and currency == 'GBP':
+                                return None
+                            return amount
+                elif isinstance(offers, list) and len(offers) > 0:
+                    first = offers[0]
+                    shipping = first.get('shippingCost')
+                    if shipping is not None:
+                        if shipping == 0 or str(shipping) == '0':
+                            return "Бесплатно"
+                        if isinstance(shipping, (int, float)):
+                            currency = first.get('priceCurrency', '')
+                            amount = f"{currency} {shipping}" if currency else str(shipping)
+                            if item_price and str(shipping) == str(item_price) and currency == 'GBP':
+                                return None
+                            return amount
+        except:
+            pass
+
+    shipping_selectors = [
+        'span.s-item__shipping', 'div.s-item__shipping',
+        'span.s-item__logisticsCost', 'span.s-item__delivery',
+        'span.su-styled-text', '.su-styled-text.secondary.large',
+        '[class*="shippingCost"]'
+    ]
+    for sel in shipping_selectors:
+        for elem in card.select(sel):
+            text = elem.get_text(strip=True)
+            text = re.sub(r'\s+', ' ', text)
+            if not text:
+                continue
+            if re.search(r'(?i)(buy it now|best offer|make offer|watch|add to cart)', text):
+                continue
+            if not re.search(r'(?i)(free|shipping|delivery|postage|shipping cost)', text):
+                continue
+            if 'free' in text.lower():
+                return "Бесплатно"
+            match = re.search(r'([£€$]\s*[\d,]+\.?\d*)', text)
+            if match:
+                price_candidate = match.group(1)
+                if item_price and price_candidate == item_price:
+                    continue
+                return price_candidate
+            if len(text) < 30 and not re.search(r'\d', text):
+                if 'free' in text.lower():
+                    return "Бесплатно"
+                return text
+
+    html = str(card)
+    if re.search(r'(?i)free\s+shipping', html):
+        return "Бесплатно"
+    match = re.search(r'(?i)\+?\s*([£€$]\s*[\d,]+\.?\d*)\s*(delivery|shipping)', html)
+    if match:
+        pc = match.group(1)
+        if not (item_price and pc == item_price):
+            return pc
+    match = re.search(r'(?i)shipping:\s*([£€$]\s*[\d,]+\.?\d*)', html)
+    if match:
+        pc = match.group(1)
+        if not (item_price and pc == item_price):
+            return pc
+    return None
+
+# ============ ОПРЕДЕЛЕНИЕ BEST OFFER ============
+def extract_best_offer(card):
+    text = card.get_text()
+    if re.search(r'or\s+best\s+offer', text, re.I):
+        return True
+    best_offer_selectors = [
+        '.s-item__best-offer', '.s-item__detail--best-offer', '.s-item__bonus',
+        '[class*="bestOffer"]', '[class*="best-offer"]'
+    ]
+    for sel in best_offer_selectors:
+        if card.select_one(sel):
+            return True
+    if card.select_one('[data-best-offer="true"]'):
+        return True
+    return False
+
+# ============ ОПРЕДЕЛЕНИЕ АУКЦИОНА (BIDS) ============
+def extract_auction(card):
+    text = card.get_text()
+    if re.search(r'\d+\s+bids?\b', text, re.I):
+        return True
+    if re.search(r'\bplace\s+bid\b', text, re.I):
+        return True
+    auction_selectors = [
+        '.s-item__bid-count', '.s-item__bids', '[class*="bidCount"]',
+        '[class*="bids"]', '.vi-bidrev'
+    ]
+    for sel in auction_selectors:
+        if card.select_one(sel):
+            return True
+    if card.select_one('a[href*="bid"]'):
+        return True
+    return False
+
 def parse_ebay_listings(html, max_items=MAX_ITEMS):
     if not html:
         return {}
     soup = BeautifulSoup(html, 'html.parser')
-    # Ищем карточки – приоритет на новые классы
-    cards = soup.select('div.s-card, li.s-card')
+    cards = soup.select('li.s-item')
     if not cards:
-        cards = soup.select('li.s-item')
+        cards = soup.select('.s-item')
     if not cards:
-        logging.warning("Карточки не найдены. На странице нет s-card или s-item")
-        return {}
-    
-    logging.info(f"Найдено карточек: {len(cards)}")
+        return parse_ebay_listings_fallback(soup, max_items)
     items = {}
     processed = 0
     for card in cards:
         if processed >= max_items:
             break
-        # Ссылка
-        link = card.select_one('a[href*="/itm/"]')
+        link = card.select_one('a.s-item__link')
         if not link:
             continue
         url = link.get('href')
+        if not url or '/itm/' not in url:
+            continue
         if url.startswith('/'):
             url = 'https://www.ebay.co.uk' + url
-        item_id_match = re.search(r'/itm/(\d+)', url)
-        if not item_id_match:
+        item_id = extract_item_id(url)
+        if not item_id:
             continue
-        item_id = item_id_match.group(1)
-        
-        # Название
-        title_elem = card.select_one('span.s-card__title')
-        if not title_elem:
-            title_elem = card.select_one('div[role="heading"]')
-        if not title_elem:
-            title_elem = link
-        title = title_elem.get_text(strip=True)
-        title = re.sub(r'(?i)new listing', '', title).strip()
+        title_elem = (card.select_one('div.s-item__title span[role="heading"]') or
+                      card.select_one('span[role="heading"]') or
+                      card.select_one('div.s-item__title') or link)
+        title = clean_title(title_elem.get_text(strip=True) if title_elem else '')
         if not title:
-            continue
-        
-        # Цена
-        price_elem = card.select_one('span.s-card__price')
-        if not price_elem:
-            price_elem = card.select_one('span.su-styled-text.primary.bold.large-1')
-        price = price_elem.get_text(strip=True) if price_elem else None
-        if price and not re.search(r'£', price):
-            price = None  # не GBP
-        
-        # Доставка
-        shipping = None
-        for elem in card.select('span.su-styled-text.secondary.large'):
-            text = elem.get_text(strip=True)
-            if 'delivery' in text.lower() or 'shipping' in text.lower():
-                match = re.search(r'([£€$]\s*[\d,]+\.?\d*)', text)
-                if match:
-                    shipping = match.group(1)
-                    break
-                elif 'free' in text.lower():
-                    shipping = "Бесплатно"
-                    break
-        
-        # Best Offer
-        best_offer = False
-        for elem in card.select('span.su-styled-text.secondary.large'):
-            if 'or Best Offer' in elem.get_text():
-                best_offer = True
-                break
-        
-        # Аукцион
-        auction = bool(re.search(r'\d+\s+bids?\b', card.get_text(), re.I))
-        
+            title = clean_title(link.get_text(strip=True))
+            if not title:
+                continue
+        price = extract_price_jsonld(card, url, soup) or extract_price_css(card)
+        if price and not is_gbp_price(price):
+            price = None
+        shipping = extract_shipping(card, item_price=price)
+        if shipping and shipping != "Бесплатно" and not is_gbp_price(shipping):
+            shipping = None
+        best_offer = extract_best_offer(card)
+        auction = extract_auction(card)
         items[item_id] = {
             'url': url,
             'title': title,
@@ -239,6 +443,49 @@ def parse_ebay_listings(html, max_items=MAX_ITEMS):
     logging.info(f"Обработано товаров: {len(items)}")
     return items
 
+def parse_ebay_listings_fallback(soup, max_items):
+    items = {}
+    links = soup.find_all('a', href=True)
+    itm_links = [link for link in links if '/itm/' in link['href']]
+    itm_links = itm_links[:max_items]
+    for link in itm_links:
+        url = link.get('href')
+        if url.startswith('/'):
+            url = 'https://www.ebay.co.uk' + url
+        item_id = extract_item_id(url)
+        if not item_id:
+            continue
+        title = clean_title(link.get_text(strip=True))
+        if not title:
+            continue
+        price = None
+        shipping = None
+        best_offer = False
+        auction = False
+        parent = link.parent
+        for _ in range(5):
+            if parent:
+                price = extract_price_jsonld(parent, url) or extract_price_css(parent)
+                if price and not is_gbp_price(price):
+                    price = None
+                shipping = extract_shipping(parent, item_price=price)
+                if shipping and shipping != "Бесплатно" and not is_gbp_price(shipping):
+                    shipping = None
+                best_offer = extract_best_offer(parent)
+                auction = extract_auction(parent)
+                if price or shipping or best_offer or auction:
+                    break
+                parent = parent.parent
+        items[item_id] = {
+            'url': url,
+            'title': title,
+            'price': price,
+            'shipping': shipping,
+            'best_offer': best_offer,
+            'auction': auction
+        }
+    return items
+
 def perform_initial_snapshot():
     logging.info("Начальный снимок...")
     html = fetch_ebay_html_with_retry()
@@ -246,10 +493,9 @@ def perform_initial_snapshot():
         return False
     items = parse_ebay_listings(html, max_items=50)
     if not items:
-        logging.warning("Не удалось извлечь товары. Структура страницы могла измениться.")
         return False
     add_seen_ids_batch(list(items.keys()))
-    logging.info(f"Снимок: добавлено {len(items)} товаров")
+    logging.info(f"Снимок: {len(items)} товаров")
     return True
 
 def check_and_send_new_items():
@@ -263,19 +509,22 @@ def check_and_send_new_items():
     for item_id, data in current.items():
         if item_id not in seen:
             new.append({'id': item_id, **data})
-            logging.info(f"НОВЫЙ: {data['title'][:50]} | цена: {data['price']} | доставка: {data['shipping']}")
+            logging.info(f"НОВЫЙ: {data['title'][:50]}... цена: {data['price']}, доставка: {data.get('shipping')}, best_offer: {data.get('best_offer')}, auction: {data.get('auction')}")
     if new:
         for item in new:
+            # Изменён заголовок: флаг Англии
             msg = f"🇬🇧 <b>НОВЫЙ ТОВАР Англия</b> 🇬🇧\n\n<b>{item['title']}</b>\n\n"
             if item['price']:
                 msg += f"💰 Цена: {item['price']}\n"
             else:
-                msg += f"💰 Цена не указана\n"
+                msg += f"💰 Цена не указана (не GBP)\n"
             if item['shipping']:
                 msg += f"🚚 Доставка: {item['shipping']}\n"
-            if item['best_offer']:
+            else:
+                msg += f"🚚 Доставка: не указана\n"
+            if item.get('best_offer', False):
                 msg += f"✅ Сделать предложение (Best Offer)\n"
-            if item['auction']:
+            if item.get('auction', False):
                 msg += f"⏰ Аукцион\n"
             msg += f"\n🔗 <a href='{item['url']}'>Ссылка на товар</a>"
             send_telegram_message(msg)
@@ -284,42 +533,13 @@ def check_and_send_new_items():
     else:
         logging.info("Новых нет")
 
-def telegram_listener():
-    global is_paused
-    last_update_id = 0
-    while True:
-        try:
-            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-            params = {'offset': last_update_id + 1, 'timeout': 30}
-            r = requests.get(url, params=params, timeout=35)
-            if r.status_code == 200:
-                updates = r.json().get('result', [])
-                for update in updates:
-                    last_update_id = update['update_id']
-                    msg = update.get('message')
-                    if msg and str(msg.get('chat', {}).get('id')) == TELEGRAM_CHAT_ID:
-                        text = msg.get('text', '').strip()
-                        if text == '/stop':
-                            is_paused = True
-                            send_telegram_message("⏸ Бот приостановлен. /start - возобновить")
-                        elif text == '/start':
-                            is_paused = False
-                            send_telegram_message("▶ Бот продолжает работу")
-                        elif text == '/reset':
-                            reset_database()
-                            send_telegram_message("🔄 База очищена. При следующей проверке бот сделает новый снимок.")
-            time.sleep(1)
-        except Exception as e:
-            logging.error(f"Ошибка слушателя: {e}")
-            time.sleep(5)
-
 def bot_worker():
     global is_paused
-    logging.info("Бот-воркер запущен")
+    logging.info("🤖 Бот-воркер запущен")
     init_db()
     if is_db_empty():
         if not perform_initial_snapshot():
-            send_telegram_message("❌ Ошибка инициализации: не удалось получить товары")
+            send_telegram_message("❌ Ошибка инициализации")
             return
         send_telegram_message("✅ Бот запущен, начальный снимок сделан")
     else:
@@ -331,24 +551,24 @@ def bot_worker():
         try:
             check_and_send_new_items()
             wait = max(60, CHECK_INTERVAL + random.uniform(-30, 60))
-            logging.info(f"Следующая проверка через {int(wait)} секунд")
+            logging.info(f"Следующая проверка через {wait:.0f} секунд.")
             time.sleep(wait)
         except Exception as e:
-            logging.error(f"Ошибка в цикле: {e}", exc_info=True)
+            logging.error(f"Ошибка в основном цикле: {e}", exc_info=True)
             time.sleep(120)
 
 @app.route('/')
 def index():
-    return "eBay bot is running (UK, debug)"
+    return "eBay бот работает (UK, интервал 60 сек, Best Offer + Auction)"
 
 @app.route('/health')
 def health():
     return "OK", 200
 
 if __name__ == "__main__":
-    send_telegram_message("🚀 Бот запущен (UK, отладка). Команды: /stop /start /reset")
+    send_telegram_message("🚀 Бот запущен (Великобритания, GBP). Интервал 60 сек, отслеживаю Best Offer и аукционы")
     threading.Thread(target=telegram_listener, daemon=True).start()
-    worker = threading.Thread(target=bot_worker, daemon=False)
-    worker.start()
+    worker_thread = threading.Thread(target=bot_worker, daemon=False)
+    worker_thread.start()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
