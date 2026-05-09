@@ -14,8 +14,9 @@ from flask import Flask
 from dotenv import load_dotenv
 import psycopg2
 from psycopg2.extras import execute_values
+from collections import Counter
 
-# Отключаем проверку SSL для Bright Data
+# Отключаем проверку SSL
 ssl._create_default_https_context = ssl._create_unverified_context
 
 try:
@@ -30,13 +31,15 @@ load_dotenv()
 EBAY_SEARCH_URL = os.getenv("EBAY_SEARCH_URL")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))   # 60 секунд
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
 DATABASE_URL = os.getenv("DATABASE_URL")
+PROXY_LIST_URL = os.getenv("PROXY_LIST")  # ссылка на API с прокси
+PROXY_REFRESH_INTERVAL = 15 * 60  # обновлять список каждые 15 минут
+
 MAX_ITEMS = 20
-MAX_RETRIES = 20
+MAX_RETRIES = 20  # максимальное количество попыток с разными прокси
 RETRY_DELAY = 5
 
-# Принудительная локализация Великобритании и фунты стерлингов
 if '?' in EBAY_SEARCH_URL:
     EBAY_SEARCH_URL += '&LH_PrefLoc=3&_ipg=240&_sop=10'
 else:
@@ -49,19 +52,129 @@ if not all([EBAY_SEARCH_URL, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DATABASE_URL]
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 app = Flask(__name__)
 
-# ============ ГЛОБАЛЬНЫЕ ФЛАГИ ============
 is_paused = False
 
-# ============ РОТАЦИЯ USER-AGENT ============
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) Gecko/20100101 Firefox/144.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
+# ============ ПРОФИЛИ БРАУЗЕРОВ ============
+BROWSER_PROFILES = [
+    {
+        'name': 'Chrome146',
+        'ua': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+        'sec_ch_ua': '"Google Chrome";v="146", "Chromium";v="146", "Not_A Brand";v="99"',
+        'impersonate': "chrome146"
+    },
+    {
+        'name': 'Firefox147',
+        'ua': "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0",
+        'sec_ch_ua': '"Firefox";v="147", "Not_A Brand";v="99"',
+        'impersonate': "firefox147"
+    },
+    {
+        'name': 'Safari26.4',
+        'ua': "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.4 Safari/605.1.15",
+        'sec_ch_ua': '"Safari";v="26", "Not_A Brand";v="99"',
+        'impersonate': "safari260"
+    },
+    {
+        'name': 'Chrome_Universal',
+        'ua': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+        'sec_ch_ua': '"Google Chrome";v="146", "Chromium";v="146", "Not_A Brand";v="99"',
+        'impersonate': "chrome"
+    },
+    {
+        'name': 'Firefox_Universal',
+        'ua': "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0",
+        'sec_ch_ua': '"Firefox";v="147", "Not_A Brand";v="99"',
+        'impersonate': "firefox"
+    },
+    {
+        'name': 'Safari_Universal',
+        'ua': "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.4 Safari/605.1.15",
+        'sec_ch_ua': '"Safari";v="26", "Not_A Brand";v="99"',
+        'impersonate': "safari"
+    },
+    {
+        'name': 'Chrome148_Custom',
+        'ua': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+        'sec_ch_ua': '"Google Chrome";v="148", "Chromium";v="148", "Not_A Brand";v="99"',
+        'impersonate': "chrome"
+    },
 ]
 
-# ============ РАБОТА С БАЗОЙ ДАННЫХ ============
+def get_random_browser_profile():
+    return random.choice(BROWSER_PROFILES)
+
+profile_stats = Counter()
+
+# ============ МЕНЕДЖЕР ПРОКСИ ============
+class ProxyManager:
+    def __init__(self, proxy_list_url=None):
+        self.proxy_list_url = proxy_list_url
+        self.proxies = []          # список рабочих прокси
+        self.lock = threading.Lock()
+        self.last_refresh = 0
+        self.refresh_interval = PROXY_REFRESH_INTERVAL
+
+    def fetch_proxies_from_api(self):
+        """Загружает список прокси из API. Возвращает список строк вида http://ip:port"""
+        if not self.proxy_list_url:
+            return []
+        try:
+            logging.info(f"Загрузка прокси из {self.proxy_list_url}")
+            resp = requests.get(self.proxy_list_url, timeout=20)
+            if resp.status_code != 200:
+                logging.error(f"Ошибка загрузки прокси: HTTP {resp.status_code}")
+                return []
+            text = resp.text.strip()
+            proxies = []
+            for line in text.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                # формат: protocol://ip:port (например http://1.2.3.4:8080)
+                if '://' not in line:
+                    line = 'http://' + line
+                proxies.append(line)
+            logging.info(f"Загружено {len(proxies)} прокси")
+            return proxies
+        except Exception as e:
+            logging.error(f"Ошибка при получении прокси: {e}")
+            return []
+
+    def refresh_proxies(self):
+        """Обновляет пул рабочих прокси (если список пуст или истек интервал)"""
+        with self.lock:
+            now = time.time()
+            if self.proxies and (now - self.last_refresh) < self.refresh_interval:
+                return  # список не пуст и недавно обновляли
+            new_proxies = self.fetch_proxies_from_api()
+            if new_proxies:
+                self.proxies = new_proxies
+                self.last_refresh = now
+                logging.info(f"Пул прокси обновлён: {len(self.proxies)} доступно")
+            else:
+                if not self.proxies:
+                    logging.warning("Не удалось загрузить прокси, работаем без прокси")
+                else:
+                    logging.warning("Не удалось обновить прокси, продолжаем использовать старые")
+
+    def get_proxy(self):
+        """Возвращает случайный прокси из пула или None, если пул пуст"""
+        self.refresh_proxies()
+        with self.lock:
+            if not self.proxies:
+                return None
+            return random.choice(self.proxies)
+
+    def mark_bad_proxy(self, bad_proxy):
+        """Удаляет нерабочий прокси из пула"""
+        with self.lock:
+            if bad_proxy in self.proxies:
+                self.proxies.remove(bad_proxy)
+                logging.info(f"Прокси {bad_proxy} удалён (нерабочий/заблокирован). Осталось {len(self.proxies)} прокси")
+
+proxy_manager = ProxyManager(PROXY_LIST_URL)
+
+# ============ БАЗА ДАННЫХ ============
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL)
 
@@ -92,7 +205,7 @@ def is_db_empty():
             cur.execute("SELECT NOT EXISTS (SELECT 1 FROM seen_items)")
             return cur.fetchone()[0]
 
-# ============ ОТПРАВКА СООБЩЕНИЙ В TELEGRAM ============
+# ============ TELEGRAM ============
 def send_telegram_message(message, parse_mode='HTML'):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': message, 'parse_mode': parse_mode, 'disable_web_page_preview': False}
@@ -103,7 +216,6 @@ def send_telegram_message(message, parse_mode='HTML'):
     except Exception as e:
         logging.error(f"Не удалось отправить в Telegram: {e}")
 
-# ============ ОБРАБОТЧИК КОМАНД (LONG POLLING) ============
 def telegram_listener():
     global is_paused
     logging.info("🔁 Поток слушателя команд Telegram запущен")
@@ -133,50 +245,88 @@ def telegram_listener():
             logging.error(f"Ошибка в слушателе Telegram: {e}")
             time.sleep(5)
 
-# ============ ЗАПРОС К EBAY (БЕЗ ПРОКСИ) ============
+# ============ ЗАПРОС К EBAY С ПРОКСИ И ЛОГИРОВАНИЕМ ============
 def fetch_ebay_html_with_retry():
-    # Куки для Великобритании
     cookies = {'ebay': '%2F', 'm': 'GB', 's': 'UK', 'siteid': '3'}
+    
     for attempt in range(1, MAX_RETRIES + 1):
-        current_ua = random.choice(USER_AGENTS)
+        profile = get_random_browser_profile()
+        proxy = proxy_manager.get_proxy()  # может быть None
+        
+        ua_short = profile['ua'][:60] + "..." if len(profile['ua']) > 60 else profile['ua']
+        proxy_info = f"прокси={proxy}" if proxy else "без прокси"
+        logging.info(f"🔍 Попытка {attempt}/{MAX_RETRIES} | Профиль: {profile['name']} (impersonate={profile['impersonate']}) | {proxy_info} | UA: {ua_short}")
+        
         headers = {
-            'User-Agent': current_ua,
+            'User-Agent': profile['ua'],
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
             'Accept-Language': 'en-GB,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
             'Referer': 'https://www.ebay.co.uk/',
-            'X-EBay-Site-Id': '3',          # 3 = Великобритания
-            'Sec-Ch-Ua': '"Google Chrome";v="142", "Chromium";v="142", "Not_A Brand";v="99"',
             'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
+            'Cache-Control': 'max-age=0',
+            'X-EBay-Site-Id': '3',
+            'Sec-Ch-Ua': profile['sec_ch_ua'],
+            'Sec-Ch-Ua-Mobile': '?0',
+            'Sec-Ch-Ua-Platform': '"Windows"' if 'Windows' in profile['ua'] else '"macOS"',
         }
+
         if attempt > 1:
-            time.sleep(random.uniform(1.5, 3.5))
+            sleep_time = random.uniform(1.0, 3.0)  # меньшая пауза, так как прокси уже меняется
+            logging.info(f"⏳ Пауза перед попыткой {attempt}: {sleep_time:.1f} сек")
+            time.sleep(sleep_time)
+
         try:
+            proxies_dict = {'http': proxy, 'https': proxy} if proxy else None
             response = cffi_requests.get(
                 EBAY_SEARCH_URL,
                 headers=headers,
                 cookies=cookies,
-                impersonate="chrome142",
-                # proxies полностью убраны
+                impersonate=profile['impersonate'],
+                proxies=proxies_dict,
                 verify=False,
-                timeout=35
+                timeout=30,
+                allow_redirects=True
             )
+            
+            # Проверка на блокировку
+            is_blocked = False
             if response.status_code == 200:
-                logging.info(f"✅ Загружено (попытка {attempt}, UA={current_ua[:40]}...)")
-                return response.text
+                text_lower = response.text.lower()
+                if 'pardon our interruption' in text_lower or 'access denied' in text_lower or 'robot' in text_lower:
+                    is_blocked = True
+                    logging.warning(f"🚫 БЛОКИРОВКА (страница защиты) для профиля {profile['name']}, прокси {proxy}")
+                else:
+                    # Успех
+                    logging.info(f"✅ УСПЕШНО загружено с профилем {profile['name']} (прокси {proxy})")
+                    return response.text
             elif response.status_code == 403:
-                logging.warning(f"⚠️ 403 Forbidden (попытка {attempt})")
-                if attempt < MAX_RETRIES:
-                    time.sleep(RETRY_DELAY + random.uniform(2, 5))
+                is_blocked = True
+                logging.warning(f"🚫 БЛОКИРОВКА (HTTP 403) для профиля {profile['name']}, прокси {proxy}")
             else:
-                logging.warning(f"Попытка {attempt}/{MAX_RETRIES}: HTTP {response.status_code}")
-                if attempt < MAX_RETRIES:
-                    time.sleep(RETRY_DELAY)
+                logging.warning(f"⚠️ НЕУДАЧА: HTTP {response.status_code} для {profile['name']}, прокси {proxy}")
+
+            # Если блокировка или ошибка, удаляем прокси (если использовался)
+            if is_blocked and proxy:
+                proxy_manager.mark_bad_proxy(proxy)
+            # Продолжаем цикл — следующая попытка возьмёт новый прокси и профиль
+
         except Exception as e:
-            logging.error(f"Попытка {attempt}/{MAX_RETRIES}: {e}")
-            if attempt < MAX_RETRIES:
-                time.sleep(RETRY_DELAY + random.uniform(1, 3))
+            error_msg = str(e)
+            logging.error(f"❌ ОШИБКА для профиля {profile['name']} прокси {proxy}: {error_msg}")
+            if proxy:
+                proxy_manager.mark_bad_proxy(proxy)
+            # Не ждём долго, идём к следующему прокси
+
+    # Если все попытки исчерпаны
+    logging.error(f"❌❌❌ НЕ УДАЛОСЬ ЗАГРУЗИТЬ ПОСЛЕ {MAX_RETRIES} ПОПЫТОК")
     return None
 
+# ============ ПАРСИНГ (без изменений, функции остаются те же) ============
 def extract_item_id(url):
     if not url or '/itm/' not in url:
         return None
@@ -548,14 +698,14 @@ def bot_worker():
 
 @app.route('/')
 def index():
-    return "eBay бот работает (UK, без прокси, интервал 60 сек, Best Offer + Auction)"
+    return "eBay бот работает (UK, с поддержкой прокси из API)"
 
 @app.route('/health')
 def health():
     return "OK", 200
 
 if __name__ == "__main__":
-    send_telegram_message("🚀 Бот запущен (Великобритания, без прокси, GBP). Интервал 60 сек, команды /stop /start")
+    send_telegram_message("🚀 Бот запущен (Великобритания, прокси из API). Интервал 60 сек, команды /stop /start")
     threading.Thread(target=telegram_listener, daemon=True).start()
     worker_thread = threading.Thread(target=bot_worker, daemon=False)
     worker_thread.start()
