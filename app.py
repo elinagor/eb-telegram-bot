@@ -53,42 +53,42 @@ app = Flask(__name__)
 is_paused = False
 
 # ============ РОТАЦИЯ USER-AGENT, SEC-CH-UA И IMPERSONATE ============
-# Теперь каждый профиль содержит полностью совместимую тройку: ua, sec_ch_ua, target
+# *** ИСПРАВЛЕНО: значения impersonate заменены на поддерживаемые ***
 BROWSER_PROFILES = [
-    {   # Chrome 148.0.7778.96
-        'ua': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.7778.96 Safari/537.36",
-        'sec_ch_ua': '"Google Chrome";v="148", "Chromium";v="148", "Not_A Brand";v="99"',
-        'impersonate': "chrome148"
+    {   # Chrome 146 (вместо 148, если версия curl_cffi старая)
+        'ua': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+        'sec_ch_ua': '"Google Chrome";v="146", "Chromium";v="146", "Not_A Brand";v="99"',
+        'impersonate': "chrome146"
     },
-    {   # Chrome 148.0.7778.97 (Edge)
-        'ua': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.7778.97 Safari/537.36 Edg/148.0.7778.97",
-        'sec_ch_ua': '"Microsoft Edge";v="148", "Chromium";v="148", "Not_A Brand";v="99"',
-        'impersonate': "edge148"
+    {   # Edge 146 (вместо 148)
+        'ua': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0",
+        'sec_ch_ua': '"Microsoft Edge";v="146", "Chromium";v="146", "Not_A Brand";v="99"',
+        'impersonate': "edge146"   # Используем edge146, так как edge148 может не поддерживаться
     },
-    {   # Chrome 148.0.7778.96 (macOS)
-        'ua': "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.7778.96 Safari/537.36",
-        'sec_ch_ua': '"Google Chrome";v="148", "Chromium";v="148", "Not_A Brand";v="99"',
-        'impersonate': "chrome148"
+    {   # Firefox 147 (поддерживается в curl_cffi 0.15.0+)
+        'ua': "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0",
+        'sec_ch_ua': '"Firefox";v="147", "Not_A Brand";v="99"',
+        'impersonate': "firefox147"
     },
-    {   # Edge 148.0.3967.54
-        'ua': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.3967.54 Safari/537.36 Edg/148.0.3967.54",
-        'sec_ch_ua': '"Microsoft Edge";v="148", "Chromium";v="148", "Not_A Brand";v="99"',
-        'impersonate': "edge148"
-    },
-    {   # Safari 26.4
+    {   # Safari 26.4 (поддерживается)
         'ua': "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.4 Safari/605.1.15",
         'sec_ch_ua': '"Safari";v="26", "Not_A Brand";v="99"',
-        'impersonate': "safari260"   # safari260 для версии 26.4
+        'impersonate': "safari260"
     },
-    {   # Firefox 150.0.2
-        'ua': "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:150.0) Gecko/20100101 Firefox/150.0",
-        'sec_ch_ua': '"Firefox";v="150", "Not_A Brand";v="99"',
-        'impersonate': "firefox150"
+    {   # Добавляем вариант с chrome (универсальный)
+        'ua': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+        'sec_ch_ua': '"Google Chrome";v="146", "Chromium";v="146", "Not_A Brand";v="99"',
+        'impersonate': "chrome"
     },
-    {   # Firefox 150.0.2 (macOS)
-        'ua': "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:150.0) Gecko/20100101 Firefox/150.0",
-        'sec_ch_ua': '"Firefox";v="150", "Not_A Brand";v="99"',
-        'impersonate': "firefox150"
+    {   # Добавляем вариант с firefox (универсальный)
+        'ua': "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0",
+        'sec_ch_ua': '"Firefox";v="147", "Not_A Brand";v="99"',
+        'impersonate': "firefox"
+    },
+    {   # Добавляем вариант с safari (универсальный)
+        'ua': "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.4 Safari/605.1.15",
+        'sec_ch_ua': '"Safari";v="26", "Not_A Brand";v="99"',
+        'impersonate': "safari"
     },
 ]
 
