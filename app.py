@@ -53,47 +53,85 @@ app = Flask(__name__)
 is_paused = False
 
 # ============ РОТАЦИЯ USER-AGENT, SEC-CH-UA И IMPERSONATE ============
-# *** ИСПРАВЛЕНО: значения impersonate заменены на поддерживаемые ***
+# Основной профиль – Firefox 147 (проверено, что работает)
+# При неудачах будет переключение на другие профили
 BROWSER_PROFILES = [
-    {   # Chrome 146 (вместо 148, если версия curl_cffi старая)
-        'ua': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-        'sec_ch_ua': '"Google Chrome";v="146", "Chromium";v="146", "Not_A Brand";v="99"',
-        'impersonate': "chrome146"
-    },
-    {   # Edge 146 (вместо 148)
-        'ua': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0",
-        'sec_ch_ua': '"Microsoft Edge";v="146", "Chromium";v="146", "Not_A Brand";v="99"',
-        'impersonate': "edge146"   # Используем edge146, так как edge148 может не поддерживаться
-    },
-    {   # Firefox 147 (поддерживается в curl_cffi 0.15.0+)
+    {
+        'name': 'firefox147',
         'ua': "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0",
         'sec_ch_ua': '"Firefox";v="147", "Not_A Brand";v="99"',
-        'impersonate': "firefox147"
+        'impersonate': "firefox147",
+        'priority': 1  # основной
     },
-    {   # Safari 26.4 (поддерживается)
-        'ua': "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.4 Safari/605.1.15",
-        'sec_ch_ua': '"Safari";v="26", "Not_A Brand";v="99"',
-        'impersonate': "safari260"
-    },
-    {   # Добавляем вариант с chrome (универсальный)
-        'ua': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-        'sec_ch_ua': '"Google Chrome";v="146", "Chromium";v="146", "Not_A Brand";v="99"',
-        'impersonate': "chrome"
-    },
-    {   # Добавляем вариант с firefox (универсальный)
+    {
+        'name': 'firefox_universal',
         'ua': "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0",
         'sec_ch_ua': '"Firefox";v="147", "Not_A Brand";v="99"',
-        'impersonate': "firefox"
+        'impersonate': "firefox",
+        'priority': 2
     },
-    {   # Добавляем вариант с safari (универсальный)
+    {
+        'name': 'chrome148',
+        'ua': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.7778.96 Safari/537.36",
+        'sec_ch_ua': '"Google Chrome";v="148", "Chromium";v="148", "Not_A Brand";v="99"',
+        'impersonate': "chrome",   # универсальный chrome, поддерживается
+        'priority': 3
+    },
+    {
+        'name': 'safari260',
         'ua': "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.4 Safari/605.1.15",
         'sec_ch_ua': '"Safari";v="26", "Not_A Brand";v="99"',
-        'impersonate': "safari"
+        'impersonate': "safari260",
+        'priority': 4
     },
+    {
+        'name': 'chrome_universal',
+        'ua': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.7778.96 Safari/537.36",
+        'sec_ch_ua': '"Google Chrome";v="148", "Chromium";v="148", "Not_A Brand";v="99"',
+        'impersonate': "chrome",
+        'priority': 5
+    }
 ]
 
-def get_random_browser_profile():
-    return random.choice(BROWSER_PROFILES)
+# Сортируем профили по приоритету (чем меньше число, тем выше приоритет)
+BROWSER_PROFILES.sort(key=lambda x: x['priority'])
+
+def get_next_profile(current_profile_name=None, failed_profiles=None):
+    """
+    Возвращает следующий профиль для попытки.
+    Если current_profile_name не указан – возвращает первый (основной).
+    Если failed_profiles содержит имена профилей, которые уже не работают,
+    то перебираем следующие по приоритету.
+    """
+    if failed_profiles is None:
+        failed_profiles = []
+    
+    # Сначала пробуем основной (первый в списке)
+    if current_profile_name is None:
+        return BROWSER_PROFILES[0]
+    
+    # Находим индекс текущего профиля
+    current_index = None
+    for i, p in enumerate(BROWSER_PROFILES):
+        if p['name'] == current_profile_name:
+            current_index = i
+            break
+    
+    if current_index is None:
+        return BROWSER_PROFILES[0]
+    
+    # Пытаемся взять следующий, который не в списке failed_profiles
+    for i in range(current_index + 1, len(BROWSER_PROFILES)):
+        if BROWSER_PROFILES[i]['name'] not in failed_profiles:
+            return BROWSER_PROFILES[i]
+    
+    # Если все перебрали и все failed, начинаем сначала с первого
+    for p in BROWSER_PROFILES:
+        if p['name'] not in failed_profiles:
+            return p
+    
+    # Если все профили в чёрном списке – сбрасываем чёрный список и берём первый
+    return BROWSER_PROFILES[0]
 
 # ============ РАБОТА С БАЗОЙ ДАННЫХ ============
 def get_db_connection():
@@ -167,14 +205,32 @@ def telegram_listener():
             logging.error(f"Ошибка в слушателе Telegram: {e}")
             time.sleep(5)
 
-# ============ ЗАПРОС К EBAY (С ИСПОЛЬЗОВАНИЕМ ПРОФИЛЕЙ) ============
+# ============ ЗАПРОС К EBAY С ИНТЕЛЛЕКТУАЛЬНОЙ РОТАЦИЕЙ ПРОФИЛЕЙ ============
 def fetch_ebay_html_with_retry():
-    # Куки для Великобритании
     cookies = {'ebay': '%2F', 'm': 'GB', 's': 'UK', 'siteid': '3'}
+    
+    # Статистика неудач для каждого профиля
+    profile_fail_count = {p['name']: 0 for p in BROWSER_PROFILES}
+    current_profile = None
+    consecutive_failures = 0
+    
     for attempt in range(1, MAX_RETRIES + 1):
-        profile = get_random_browser_profile()
+        # Логика выбора профиля:
+        # - Если текущий профиль не задан, берём основной (первый в списке)
+        # - Если подряд идёт 3 неудачи с текущим профилем, переключаемся на следующий
+        if current_profile is None:
+            current_profile = BROWSER_PROFILES[0]
+            consecutive_failures = 0
+        elif consecutive_failures >= 3:
+            # Меняем профиль
+            old_name = current_profile['name']
+            current_profile = get_next_profile(current_profile['name'], failed_profiles=[])
+            logging.info(f"🔄 Смена профиля: {old_name} -> {current_profile['name']} после {consecutive_failures} неудач")
+            consecutive_failures = 0
+        
+        # Формируем заголовки согласно выбранному профилю
         headers = {
-            'User-Agent': profile['ua'],
+            'User-Agent': current_profile['ua'],
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
             'Accept-Language': 'en-GB,en;q=0.9',
             'Accept-Encoding': 'gzip, deflate, br',
@@ -186,9 +242,9 @@ def fetch_ebay_html_with_retry():
             'Sec-Fetch-User': '?1',
             'Cache-Control': 'max-age=0',
             'X-EBay-Site-Id': '3',
-            'Sec-Ch-Ua': profile['sec_ch_ua'],
+            'Sec-Ch-Ua': current_profile['sec_ch_ua'],
             'Sec-Ch-Ua-Mobile': '?0',
-            'Sec-Ch-Ua-Platform': '"Windows"' if 'Windows' in profile['ua'] else '"macOS"',
+            'Sec-Ch-Ua-Platform': '"Windows"' if 'Windows' in current_profile['ua'] else '"macOS"',
         }
         
         if attempt > 1:
@@ -201,41 +257,59 @@ def fetch_ebay_html_with_retry():
                 EBAY_SEARCH_URL,
                 headers=headers,
                 cookies=cookies,
-                impersonate=profile['impersonate'],
+                impersonate=current_profile['impersonate'],
                 verify=False,
                 timeout=35,
                 allow_redirects=True
             )
             
-            # Проверяем, не пришла ли капча или страница блокировки
+            # Проверка на страницу блокировки
+            is_blocked = False
             if response.status_code == 200:
-                if 'pardon our interruption' in response.text.lower() or 'access denied' in response.text.lower():
-                    logging.warning(f"Обнаружена страница блокировки (попытка {attempt})")
-                    if attempt < MAX_RETRIES:
-                        continue
-                    else:
-                        return None
+                text_lower = response.text.lower()
+                if 'pardon our interruption' in text_lower or 'access denied' in text_lower or 'robot' in text_lower:
+                    is_blocked = True
+                    logging.warning(f"🚫 Обнаружена страница блокировки (попытка {attempt}, профиль: {current_profile['name']})")
             
-            if response.status_code == 200:
-                logging.info(f"✅ Загружено (попытка {attempt}, профиль: {profile['impersonate']})")
+            if response.status_code == 200 and not is_blocked:
+                # Успех – сбрасываем счётчик неудач
+                profile_fail_count[current_profile['name']] = 0
+                consecutive_failures = 0
+                logging.info(f"✅ Загружено (попытка {attempt}, профиль: {current_profile['name']})")
                 return response.text
-            elif response.status_code == 403:
-                logging.warning(f"⚠️ 403 Forbidden (попытка {attempt}, профиль: {profile['impersonate']})")
-                if attempt < MAX_RETRIES:
-                    sleep_time = RETRY_DELAY * 2 + random.uniform(5, 15)  # Увеличиваем паузу при 403
-                    time.sleep(sleep_time)
             else:
-                logging.warning(f"Попытка {attempt}/{MAX_RETRIES}: HTTP {response.status_code}")
+                # Неудача – увеличиваем счётчики
+                profile_fail_count[current_profile['name']] += 1
+                consecutive_failures += 1
+                
+                if response.status_code == 403:
+                    logging.warning(f"⚠️ 403 Forbidden (попытка {attempt}, профиль: {current_profile['name']})")
+                else:
+                    logging.warning(f"Попытка {attempt}/{MAX_RETRIES}: HTTP {response.status_code} (профиль: {current_profile['name']})")
+                
                 if attempt < MAX_RETRIES:
-                    time.sleep(RETRY_DELAY)
+                    sleep_time = RETRY_DELAY + random.uniform(2, 8) if is_blocked else RETRY_DELAY
+                    time.sleep(sleep_time)
         except Exception as e:
-            logging.error(f"Попытка {attempt}/{MAX_RETRIES}: {e}")
-            if attempt < MAX_RETRIES:
-                sleep_time = RETRY_DELAY * 2 + random.uniform(1, 3)
-                time.sleep(sleep_time)
+            error_msg = str(e)
+            if "Impersonating" in error_msg and "not supported" in error_msg:
+                # Такой профиль не поддерживается – помечаем как permanently failed
+                logging.error(f"❌ Профиль {current_profile['name']} не поддерживается curl_cffi. Пропускаем.")
+                profile_fail_count[current_profile['name']] = 999  # чтобы больше не использовать
+                # Принудительно переключаемся на следующий
+                current_profile = get_next_profile(current_profile['name'], failed_profiles=[p for p, cnt in profile_fail_count.items() if cnt >= 999])
+                consecutive_failures = 0
+                continue
+            else:
+                logging.error(f"Попытка {attempt}/{MAX_RETRIES}: {e}")
+                consecutive_failures += 1
+                if attempt < MAX_RETRIES:
+                    time.sleep(RETRY_DELAY + random.uniform(1, 3))
+    
+    logging.error("Исчерпаны все попытки, не удалось получить страницу eBay")
     return None
 
-# ============ ФУНКЦИИ ПАРСИНГА ============
+# ============ ФУНКЦИИ ПАРСИНГА (без изменений) ============
 def extract_item_id(url):
     if not url or '/itm/' not in url:
         return None
@@ -607,14 +681,14 @@ def bot_worker():
 
 @app.route('/')
 def index():
-    return "eBay бот работает (UK, улучшенная имитация браузера)"
+    return "eBay бот работает (UK, интеллектуальная ротация профилей)"
 
 @app.route('/health')
 def health():
     return "OK", 200
 
 if __name__ == "__main__":
-    send_telegram_message("🚀 Бот запущен (Великобритания, улучшенная имитация браузера). Интервал 60 сек, команды /stop /start")
+    send_telegram_message("🚀 Бот запущен (Великобритания, умная ротация профилей, основной Firefox 147). Интервал 60 сек, команды /stop /start")
     threading.Thread(target=telegram_listener, daemon=True).start()
     worker_thread = threading.Thread(target=bot_worker, daemon=False)
     worker_thread.start()
