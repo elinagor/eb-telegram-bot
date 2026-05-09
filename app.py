@@ -14,6 +14,7 @@ from flask import Flask
 from dotenv import load_dotenv
 import psycopg2
 from psycopg2.extras import execute_values
+from collections import Counter
 
 # Отключаем проверку SSL
 ssl._create_default_https_context = ssl._create_unverified_context
@@ -50,54 +51,57 @@ app = Flask(__name__)
 
 is_paused = False
 
-# ============ РОТАЦИЯ ПРОФИЛЕЙ (ТОЛЬКО ПОДДЕРЖИВАЕМЫЕ) ============
+# ============ ПРОФИЛИ БРАУЗЕРОВ (ТОЛЬКО ПРОВЕРЕННЫЕ) ============
 BROWSER_PROFILES = [
-    # Chrome 146 (стабильный)
     {
+        'name': 'Chrome146',
         'ua': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
         'sec_ch_ua': '"Google Chrome";v="146", "Chromium";v="146", "Not_A Brand";v="99"',
         'impersonate': "chrome146"
     },
-    # Firefox 147 (стабильный)
     {
+        'name': 'Firefox147',
         'ua': "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0",
         'sec_ch_ua': '"Firefox";v="147", "Not_A Brand";v="99"',
         'impersonate': "firefox147"
     },
-    # Safari 26.4 (стабильный)
     {
+        'name': 'Safari26.4',
         'ua': "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.4 Safari/605.1.15",
         'sec_ch_ua': '"Safari";v="26", "Not_A Brand";v="99"',
         'impersonate': "safari260"
     },
-    # Универсальный Chrome (работает всегда)
     {
+        'name': 'Chrome_Universal',
         'ua': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
         'sec_ch_ua': '"Google Chrome";v="146", "Chromium";v="146", "Not_A Brand";v="99"',
         'impersonate': "chrome"
     },
-    # Универсальный Firefox
     {
+        'name': 'Firefox_Universal',
         'ua': "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0",
         'sec_ch_ua': '"Firefox";v="147", "Not_A Brand";v="99"',
         'impersonate': "firefox"
     },
-    # Универсальный Safari
     {
+        'name': 'Safari_Universal',
         'ua': "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.4 Safari/605.1.15",
         'sec_ch_ua': '"Safari";v="26", "Not_A Brand";v="99"',
         'impersonate': "safari"
     },
-    # === НОВЫЙ ПРОФИЛЬ (ПО ВАШЕМУ ЗАПРОСУ) ===
     {
+        'name': 'Chrome148_Custom',
         'ua': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
         'sec_ch_ua': '"Google Chrome";v="148", "Chromium";v="148", "Not_A Brand";v="99"',
-        'impersonate': "chrome"         # используем универсальную имитацию, т.к. chrome148 может не поддерживаться
+        'impersonate': "chrome"
     },
 ]
 
 def get_random_browser_profile():
     return random.choice(BROWSER_PROFILES)
+
+# Счётчики для статистики
+profile_stats = Counter()
 
 # ============ БАЗА ДАННЫХ ============
 def get_db_connection():
@@ -170,11 +174,19 @@ def telegram_listener():
             logging.error(f"Ошибка в слушателе Telegram: {e}")
             time.sleep(5)
 
-# ============ ЗАПРОС К EBAY ============
+# ============ ЗАПРОС К EBAY С ДЕТАЛЬНЫМ ЛОГИРОВАНИЕМ ============
 def fetch_ebay_html_with_retry():
     cookies = {'ebay': '%2F', 'm': 'GB', 's': 'UK', 'siteid': '3'}
+    last_attempt_profile = None
+    
     for attempt in range(1, MAX_RETRIES + 1):
         profile = get_random_browser_profile()
+        last_attempt_profile = profile
+        ua_short = profile['ua'][:60] + "..." if len(profile['ua']) > 60 else profile['ua']
+        
+        # Детальное логирование перед запросом
+        logging.info(f"🔍 Попытка {attempt}/{MAX_RETRIES} | Профиль: {profile['name']} (impersonate={profile['impersonate']}) | UA: {ua_short}")
+        
         headers = {
             'User-Agent': profile['ua'],
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
@@ -195,7 +207,7 @@ def fetch_ebay_html_with_retry():
 
         if attempt > 1:
             sleep_time = random.uniform(2.0, 5.0)
-            logging.info(f"Пауза перед повторной попыткой {attempt}: {sleep_time:.1f} сек")
+            logging.info(f"⏳ Пауза перед попыткой {attempt}: {sleep_time:.1f} сек")
             time.sleep(sleep_time)
 
         try:
@@ -209,30 +221,57 @@ def fetch_ebay_html_with_retry():
                 allow_redirects=True
             )
 
+            # Проверка на страницу блокировки
+            is_blocked = False
             if response.status_code == 200:
-                if 'pardon our interruption' in response.text.lower() or 'access denied' in response.text.lower():
-                    logging.warning(f"Обнаружена страница блокировки (попытка {attempt})")
-                    if attempt < MAX_RETRIES:
-                        continue
-                    else:
-                        return None
-                logging.info(f"✅ Загружено (попытка {attempt}, профиль: {profile['impersonate']})")
-                return response.text
+                text_lower = response.text.lower()
+                if 'pardon our interruption' in text_lower or 'access denied' in text_lower or 'robot' in text_lower:
+                    is_blocked = True
+                    profile_stats[profile['name']] += 1
+                    logging.warning(f"🚫 БЛОКИРОВКА (страница защиты) для профиля {profile['name']} (impersonate={profile['impersonate']}), попытка {attempt}")
+                else:
+                    # Успех
+                    profile_stats[profile['name']] = profile_stats.get(profile['name'], 0) + 1
+                    logging.info(f"✅ УСПЕШНО загружено с профилем {profile['name']} (попытка {attempt})")
+                    # Сбросим счётчики после успеха (не обязательно)
+                    return response.text
             elif response.status_code == 403:
-                logging.warning(f"⚠️ 403 Forbidden (попытка {attempt}, профиль: {profile['impersonate']})")
-                if attempt < MAX_RETRIES:
-                    time.sleep(RETRY_DELAY * 2 + random.uniform(5, 15))
+                is_blocked = True
+                profile_stats[profile['name']] += 1
+                logging.warning(f"🚫 БЛОКИРОВКА (HTTP 403) для профиля {profile['name']}, попытка {attempt}")
             else:
-                logging.warning(f"Попытка {attempt}/{MAX_RETRIES}: HTTP {response.status_code}")
-                if attempt < MAX_RETRIES:
-                    time.sleep(RETRY_DELAY)
+                profile_stats[profile['name']] += 1
+                logging.warning(f"⚠️ НЕУДАЧА: HTTP {response.status_code} для профиля {profile['name']}, попытка {attempt}")
+
+            if is_blocked and attempt < MAX_RETRIES:
+                time.sleep(RETRY_DELAY * 2 + random.uniform(5, 15))
+                continue
+            elif not is_blocked and attempt < MAX_RETRIES:
+                time.sleep(RETRY_DELAY)
+
         except Exception as e:
-            logging.error(f"Попытка {attempt}/{MAX_RETRIES}: {e}")
+            error_msg = str(e)
+            profile_stats[profile['name']] += 1
+            if "not supported" in error_msg:
+                logging.error(f"❌ ОШИБКА: Профиль {profile['name']} (impersonate={profile['impersonate']}) не поддерживается вашей версией curl_cffi: {error_msg}")
+            else:
+                logging.error(f"❌ ИСКЛЮЧЕНИЕ для профиля {profile['name']}: {error_msg}")
             if attempt < MAX_RETRIES:
                 time.sleep(RETRY_DELAY * 2 + random.uniform(1, 3))
+
+    # Если все попытки исчерпаны, выводим статистику
+    logging.error(f"❌❌❌ НЕ УДАЛОСЬ ЗАГРУЗИТЬ ПОСЛЕ {MAX_RETRIES} ПОПЫТОК")
+    logging.info(f"📊 Статистика использования профилей за эту сессию: {dict(profile_stats)}")
+    # Определим, какие профили чаще блокировались
+    if profile_stats:
+        most_blocked = max(profile_stats.items(), key=lambda x: x[1])
+        logging.info(f"🔴 Чаще всего блокировался профиль: {most_blocked[0]} ({most_blocked[1]} раз)")
     return None
 
-# ============ ПАРСИНГ ============
+# ============ ОСТАЛЬНЫЕ ФУНКЦИИ (ПАРСИНГ, БАЗА, TELEGRAM, РАБОЧИЙ ЦИКЛ) ============
+# (все остальные функции остаются без изменений, они уже были корректны)
+# Для экономии места я их повторю, но они идентичны предыдущей версии, кроме добавления импорта Counter в начале
+
 def extract_item_id(url):
     if not url or '/itm/' not in url:
         return None
@@ -604,14 +643,14 @@ def bot_worker():
 
 @app.route('/')
 def index():
-    return "eBay бот работает (UK, исправлен список профилей, добавлен Chrome/148)"
+    return "eBay бот работает (UK, улучшенное логирование)"
 
 @app.route('/health')
 def health():
     return "OK", 200
 
 if __name__ == "__main__":
-    send_telegram_message("🚀 Бот запущен (Великобритания, обновлённые профили). Интервал 60 сек, команды /stop /start")
+    send_telegram_message("🚀 Бот запущен (Великобритания, детальное логирование профилей). Интервал 60 сек, команды /stop /start")
     threading.Thread(target=telegram_listener, daemon=True).start()
     worker_thread = threading.Thread(target=bot_worker, daemon=False)
     worker_thread.start()
