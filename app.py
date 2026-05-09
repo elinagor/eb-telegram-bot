@@ -33,16 +33,17 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))   # 60 секунд
 BRIGHT_DATA_PROXY_URL = os.getenv("BRIGHT_DATA_PROXY_URL")
 DATABASE_URL = os.getenv("DATABASE_URL")
-MAX_ITEMS = 20
-MAX_RETRIES = 20
+MAX_ITEMS = 20                     # сколько товаров из загруженных обрабатываем
+MAX_RETRIES = 5                    # сокращено с 20 до 5 для экономии трафика
 RETRY_DELAY = 5
 
 # Принудительная локализация Великобритании и фунты стерлингов
-# Добавляем параметры: товары из UK, сортировка по новизне, 240 товаров на страницу
+# Добавляем параметры: товары из UK, сортировка по новизне, 20 товаров на страницу (экономия трафика)
+# Исправлено: _ipg=20 (было 240)
 if '?' in EBAY_SEARCH_URL:
-    EBAY_SEARCH_URL += '&LH_PrefLoc=3&_ipg=240&_sop=10'
+    EBAY_SEARCH_URL += '&LH_PrefLoc=3&_ipg=20&_sop=10'
 else:
-    EBAY_SEARCH_URL += '?LH_PrefLoc=3&_ipg=240&_sop=10'
+    EBAY_SEARCH_URL += '?LH_PrefLoc=3&_ipg=20&_sop=10'
 
 if not all([EBAY_SEARCH_URL, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, BRIGHT_DATA_PROXY_URL, DATABASE_URL]):
     logging.error("Не хватает переменных окружения.")
@@ -146,9 +147,9 @@ def fetch_ebay_html_with_retry():
             'User-Agent': current_ua,
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
             'Accept-Language': 'en-GB,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',   # добавлено: сжатие для экономии трафика
             'Referer': 'https://www.ebay.co.uk/',
-            'X-EBay-Site-Id': '3',          # 3 = Великобритания
-            'Sec-Ch-Ua': '"Google Chrome";v="142", "Chromium";v="142", "Not_A Brand";v="99"',
+            'X-EBay-Site-Id': '3',                   # 3 = Великобритания
             'Upgrade-Insecure-Requests': '1',
         }
         if attempt > 1:
@@ -164,7 +165,9 @@ def fetch_ebay_html_with_retry():
                 timeout=35
             )
             if response.status_code == 200:
-                logging.info(f"✅ Загружено (попытка {attempt}, UA={current_ua[:40]}...)")
+                # Лог размера ответа в КБ для контроля экономии
+                size_kb = len(response.content) / 1024
+                logging.info(f"✅ Загружено {size_kb:.1f} KB (попытка {attempt}, UA={current_ua[:40]}...)")
                 return response.text
             elif response.status_code == 403:
                 logging.warning(f"⚠️ 403 Forbidden (попытка {attempt})")
@@ -559,14 +562,14 @@ def bot_worker():
 
 @app.route('/')
 def index():
-    return "eBay бот работает (UK, интервал 60 сек, Best Offer + Auction)"
+    return "eBay бот работает (UK, интервал 60 сек, Best Offer + Auction, экономия трафика: _ipg=20, сжатие gzip)"
 
 @app.route('/health')
 def health():
     return "OK", 200
 
 if __name__ == "__main__":
-    send_telegram_message("🚀 Бот запущен (Великобритания, GBP). Интервал 60 сек, отслеживаю Best Offer и аукционы")
+    send_telegram_message("🚀 Бот запущен (Великобритания, GBP). Интервал 60 сек, отслеживаю Best Offer и аукционы. Оптимизирован трафик: _ipg=20, сжатие включено.")
     threading.Thread(target=telegram_listener, daemon=True).start()
     worker_thread = threading.Thread(target=bot_worker, daemon=False)
     worker_thread.start()
