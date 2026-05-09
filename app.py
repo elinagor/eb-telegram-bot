@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 import psycopg2
 from psycopg2.extras import execute_values
 
-# Отключаем проверку SSL для Bright Data
+# Отключаем проверку SSL
 ssl._create_default_https_context = ssl._create_unverified_context
 
 try:
@@ -31,20 +31,18 @@ EBAY_SEARCH_URL = os.getenv("EBAY_SEARCH_URL")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))   # 60 секунд
-BRIGHT_DATA_PROXY_URL = os.getenv("BRIGHT_DATA_PROXY_URL")
 DATABASE_URL = os.getenv("DATABASE_URL")
 MAX_ITEMS = 20
 MAX_RETRIES = 20
 RETRY_DELAY = 5
 
 # Принудительная локализация Великобритании и фунты стерлингов
-# Добавляем параметры: товары из UK, сортировка по новизне, 240 товаров на страницу
 if '?' in EBAY_SEARCH_URL:
     EBAY_SEARCH_URL += '&LH_PrefLoc=3&_ipg=240&_sop=10'
 else:
     EBAY_SEARCH_URL += '?LH_PrefLoc=3&_ipg=240&_sop=10'
 
-if not all([EBAY_SEARCH_URL, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, BRIGHT_DATA_PROXY_URL, DATABASE_URL]):
+if not all([EBAY_SEARCH_URL, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DATABASE_URL]):
     logging.error("Не хватает переменных окружения.")
     sys.exit(1)
 
@@ -54,14 +52,48 @@ app = Flask(__name__)
 # ============ ГЛОБАЛЬНЫЕ ФЛАГИ ============
 is_paused = False
 
-# ============ РОТАЦИЯ USER-AGENT ============
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) Gecko/20100101 Firefox/144.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
+# ============ РОТАЦИЯ USER-AGENT, SEC-CH-UA И IMPERSONATE ============
+# Теперь каждый профиль содержит полностью совместимую тройку: ua, sec_ch_ua, target
+BROWSER_PROFILES = [
+    {   # Chrome 148.0.7778.96
+        'ua': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.7778.96 Safari/537.36",
+        'sec_ch_ua': '"Google Chrome";v="148", "Chromium";v="148", "Not_A Brand";v="99"',
+        'impersonate': "chrome148"
+    },
+    {   # Chrome 148.0.7778.97 (Edge)
+        'ua': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.7778.97 Safari/537.36 Edg/148.0.7778.97",
+        'sec_ch_ua': '"Microsoft Edge";v="148", "Chromium";v="148", "Not_A Brand";v="99"',
+        'impersonate': "edge148"
+    },
+    {   # Chrome 148.0.7778.96 (macOS)
+        'ua': "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.7778.96 Safari/537.36",
+        'sec_ch_ua': '"Google Chrome";v="148", "Chromium";v="148", "Not_A Brand";v="99"',
+        'impersonate': "chrome148"
+    },
+    {   # Edge 148.0.3967.54
+        'ua': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.3967.54 Safari/537.36 Edg/148.0.3967.54",
+        'sec_ch_ua': '"Microsoft Edge";v="148", "Chromium";v="148", "Not_A Brand";v="99"',
+        'impersonate': "edge148"
+    },
+    {   # Safari 26.4
+        'ua': "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.4 Safari/605.1.15",
+        'sec_ch_ua': '"Safari";v="26", "Not_A Brand";v="99"',
+        'impersonate': "safari260"   # safari260 для версии 26.4
+    },
+    {   # Firefox 150.0.2
+        'ua': "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:150.0) Gecko/20100101 Firefox/150.0",
+        'sec_ch_ua': '"Firefox";v="150", "Not_A Brand";v="99"',
+        'impersonate': "firefox150"
+    },
+    {   # Firefox 150.0.2 (macOS)
+        'ua': "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:150.0) Gecko/20100101 Firefox/150.0",
+        'sec_ch_ua': '"Firefox";v="150", "Not_A Brand";v="99"',
+        'impersonate': "firefox150"
+    },
 ]
+
+def get_random_browser_profile():
+    return random.choice(BROWSER_PROFILES)
 
 # ============ РАБОТА С БАЗОЙ ДАННЫХ ============
 def get_db_connection():
@@ -135,41 +167,63 @@ def telegram_listener():
             logging.error(f"Ошибка в слушателе Telegram: {e}")
             time.sleep(5)
 
-# ============ ЗАПРОС К EBAY ============
+# ============ ЗАПРОС К EBAY (С ИСПОЛЬЗОВАНИЕМ ПРОФИЛЕЙ) ============
 def fetch_ebay_html_with_retry():
-    proxies = {"http": BRIGHT_DATA_PROXY_URL, "https": BRIGHT_DATA_PROXY_URL}
     # Куки для Великобритании
     cookies = {'ebay': '%2F', 'm': 'GB', 's': 'UK', 'siteid': '3'}
     for attempt in range(1, MAX_RETRIES + 1):
-        current_ua = random.choice(USER_AGENTS)
+        profile = get_random_browser_profile()
         headers = {
-            'User-Agent': current_ua,
+            'User-Agent': profile['ua'],
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
             'Accept-Language': 'en-GB,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
             'Referer': 'https://www.ebay.co.uk/',
-            'X-EBay-Site-Id': '3',          # 3 = Великобритания
-            'Sec-Ch-Ua': '"Google Chrome";v="142", "Chromium";v="142", "Not_A Brand";v="99"',
             'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
+            'Cache-Control': 'max-age=0',
+            'X-EBay-Site-Id': '3',
+            'Sec-Ch-Ua': profile['sec_ch_ua'],
+            'Sec-Ch-Ua-Mobile': '?0',
+            'Sec-Ch-Ua-Platform': '"Windows"' if 'Windows' in profile['ua'] else '"macOS"',
         }
+        
         if attempt > 1:
-            time.sleep(random.uniform(1.5, 3.5))
+            sleep_time = random.uniform(2.0, 5.0)
+            logging.info(f"Пауза перед повторной попыткой {attempt}: {sleep_time:.1f} сек")
+            time.sleep(sleep_time)
+        
         try:
             response = cffi_requests.get(
                 EBAY_SEARCH_URL,
                 headers=headers,
                 cookies=cookies,
-                impersonate="chrome142",
-                proxies=proxies,
+                impersonate=profile['impersonate'],
                 verify=False,
-                timeout=35
+                timeout=35,
+                allow_redirects=True
             )
+            
+            # Проверяем, не пришла ли капча или страница блокировки
             if response.status_code == 200:
-                logging.info(f"✅ Загружено (попытка {attempt}, UA={current_ua[:40]}...)")
+                if 'pardon our interruption' in response.text.lower() or 'access denied' in response.text.lower():
+                    logging.warning(f"Обнаружена страница блокировки (попытка {attempt})")
+                    if attempt < MAX_RETRIES:
+                        continue
+                    else:
+                        return None
+            
+            if response.status_code == 200:
+                logging.info(f"✅ Загружено (попытка {attempt}, профиль: {profile['impersonate']})")
                 return response.text
             elif response.status_code == 403:
-                logging.warning(f"⚠️ 403 Forbidden (попытка {attempt})")
+                logging.warning(f"⚠️ 403 Forbidden (попытка {attempt}, профиль: {profile['impersonate']})")
                 if attempt < MAX_RETRIES:
-                    time.sleep(RETRY_DELAY + random.uniform(2, 5))
+                    sleep_time = RETRY_DELAY * 2 + random.uniform(5, 15)  # Увеличиваем паузу при 403
+                    time.sleep(sleep_time)
             else:
                 logging.warning(f"Попытка {attempt}/{MAX_RETRIES}: HTTP {response.status_code}")
                 if attempt < MAX_RETRIES:
@@ -177,9 +231,11 @@ def fetch_ebay_html_with_retry():
         except Exception as e:
             logging.error(f"Попытка {attempt}/{MAX_RETRIES}: {e}")
             if attempt < MAX_RETRIES:
-                time.sleep(RETRY_DELAY + random.uniform(1, 3))
+                sleep_time = RETRY_DELAY * 2 + random.uniform(1, 3)
+                time.sleep(sleep_time)
     return None
 
+# ============ ФУНКЦИИ ПАРСИНГА ============
 def extract_item_id(url):
     if not url or '/itm/' not in url:
         return None
@@ -193,20 +249,16 @@ def clean_title(title):
     title = re.sub(r'(?i)new\s*listing', '', title)
     title = re.sub(r'(?i)\blisting\b', '', title)
     title = re.sub(r'(?i)\bnew\b', '', title)
-    title = re.sub(r'[^\w\s£€$]', ' ', title)   # оставляем £, €, $
+    title = re.sub(r'[^\w\s£€$]', ' ', title)
     title = re.sub(r'\s+', ' ', title).strip()
     return title
 
 def is_gbp_price(text):
-    """Проверяет, является ли текст ценой в фунтах стерлингов (£)"""
     if not text: return False
-    # Явный символ £ или GBP
     if re.search(r'£|\bGBP\b', text, re.I):
         return True
-    # Если есть другие валюты ($, €) — не GBP
     if re.search(r'[$€]|USD|EUR', text, re.I):
         return False
-    # Если есть цифры и возможно десятичный разделитель, но нет других валют — считаем потенциально GBP
     return re.search(r'\d', text) is not None
 
 def extract_price_jsonld(card, url=None, soup=None):
@@ -245,7 +297,6 @@ def extract_price_jsonld(card, url=None, soup=None):
                             candidates.append((price, currency))
             except:
                 continue
-    # Приоритет GBP
     for price, curr in candidates:
         if curr == 'GBP' or (curr == '' and str(price).startswith('£')):
             return f"£{price}"
@@ -356,7 +407,6 @@ def extract_shipping(card, item_price=None):
             return pc
     return None
 
-# ============ ОПРЕДЕЛЕНИЕ BEST OFFER ============
 def extract_best_offer(card):
     text = card.get_text()
     if re.search(r'or\s+best\s+offer', text, re.I):
@@ -372,7 +422,6 @@ def extract_best_offer(card):
         return True
     return False
 
-# ============ ОПРЕДЕЛЕНИЕ АУКЦИОНА (BIDS) ============
 def extract_auction(card):
     text = card.get_text()
     if re.search(r'\d+\s+bids?\b', text, re.I):
@@ -512,7 +561,6 @@ def check_and_send_new_items():
             logging.info(f"НОВЫЙ: {data['title'][:50]}... цена: {data['price']}, доставка: {data.get('shipping')}, best_offer: {data.get('best_offer')}, auction: {data.get('auction')}")
     if new:
         for item in new:
-            # Изменён заголовок: флаг Англии
             msg = f"🇬🇧 <b>НОВЫЙ ТОВАР Англия</b> 🇬🇧\n\n<b>{item['title']}</b>\n\n"
             if item['price']:
                 msg += f"💰 Цена: {item['price']}\n"
@@ -559,14 +607,14 @@ def bot_worker():
 
 @app.route('/')
 def index():
-    return "eBay бот работает (UK, интервал 60 сек, Best Offer + Auction)"
+    return "eBay бот работает (UK, улучшенная имитация браузера)"
 
 @app.route('/health')
 def health():
     return "OK", 200
 
 if __name__ == "__main__":
-    send_telegram_message("🚀 Бот запущен (Великобритания, GBP). Интервал 60 сек, отслеживаю Best Offer и аукционы")
+    send_telegram_message("🚀 Бот запущен (Великобритания, улучшенная имитация браузера). Интервал 60 сек, команды /stop /start")
     threading.Thread(target=telegram_listener, daemon=True).start()
     worker_thread = threading.Thread(target=bot_worker, daemon=False)
     worker_thread.start()
