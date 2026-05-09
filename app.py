@@ -29,15 +29,15 @@ load_dotenv()
 EBAY_SEARCH_URL = os.getenv("EBAY_SEARCH_URL")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-BRIGHT_DATA_PROXY_URL = os.getenv("BRIGHT_DATA_PROXY_URL")
 DATABASE_URL = os.getenv("DATABASE_URL")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
 MAX_ITEMS = 20
 MAX_RETRIES = 20
 RETRY_DELAY = 5
 
-if not all([EBAY_SEARCH_URL, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, BRIGHT_DATA_PROXY_URL, DATABASE_URL]):
-    logging.error("Не хватает переменных окружения. Нужны: EBAY_SEARCH_URL, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, BRIGHT_DATA_PROXY_URL, DATABASE_URL")
+# Проверяем только необходимые переменные (прокси не требуется)
+if not all([EBAY_SEARCH_URL, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DATABASE_URL]):
+    logging.error("Не хватает переменных окружения. Нужны: EBAY_SEARCH_URL, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DATABASE_URL")
     sys.exit(1)
 
 # Принудительная локализация Великобритании и сортировка по новизне
@@ -108,9 +108,8 @@ def send_telegram_message(message, parse_mode='HTML'):
     except Exception as e:
         logging.error(f"Не удалось отправить в Telegram: {e}")
 
-# ============ ЗАПРОС К EBAY (ЧЕРЕЗ ПРОКСИ) ============
+# ============ ЗАПРОС К EBAY (ПРЯМОЙ, БЕЗ ПРОКСИ) ============
 def fetch_ebay_html_with_retry():
-    proxies = {"http": BRIGHT_DATA_PROXY_URL, "https": BRIGHT_DATA_PROXY_URL}
     cookies = {'ebay': '%2F', 'm': 'GB', 's': 'UK', 'siteid': '3'}
     for attempt in range(1, MAX_RETRIES + 1):
         current_ua = random.choice(USER_AGENTS)
@@ -131,7 +130,7 @@ def fetch_ebay_html_with_retry():
                 headers=headers,
                 cookies=cookies,
                 impersonate="chrome142",
-                proxies=proxies,
+                # прокси не используем
                 verify=False,
                 timeout=35
             )
@@ -153,10 +152,9 @@ def parse_ebay_listings(html, max_items=MAX_ITEMS):
     if not html:
         return {}
     soup = BeautifulSoup(html, 'html.parser')
-    # Ищем карточки: используем div с классом s-card
+    # Ищем карточки: div с классом s-card или li.s-card
     cards = soup.select('div.s-card, li.s-card')
     if not cards:
-        # Fallback: ищем старые s-item
         cards = soup.select('li.s-item')
         if not cards:
             logging.warning("Карточки не найдены. На странице нет s-card или s-item")
@@ -180,14 +178,13 @@ def parse_ebay_listings(html, max_items=MAX_ITEMS):
             continue
         item_id = item_id_match.group(1)
         
-        # Название: ищем span.s-card__title или span[role="heading"]
+        # Название
         title_elem = card.select_one('span.s-card__title')
         if not title_elem:
             title_elem = card.select_one('div[role="heading"]')
         if not title_elem:
             title_elem = link
         title = title_elem.get_text(strip=True)
-        # Чистим от "New listing"
         title = re.sub(r'(?i)new listing', '', title).strip()
         if not title:
             continue
@@ -198,9 +195,9 @@ def parse_ebay_listings(html, max_items=MAX_ITEMS):
             price_elem = card.select_one('span.su-styled-text.primary.bold.large-1')
         price = price_elem.get_text(strip=True) if price_elem else None
         if price and not re.search(r'£', price):
-            price = None  # Не GBP
+            price = None  # не GBP
         
-        # Доставка: ищем span.su-styled-text.secondary.large с текстом delivery
+        # Доставка
         shipping = None
         for elem in card.select('span.su-styled-text.secondary.large'):
             text = elem.get_text(strip=True)
@@ -212,12 +209,14 @@ def parse_ebay_listings(html, max_items=MAX_ITEMS):
                 elif 'free' in text.lower():
                     shipping = "Бесплатно"
                     break
+        
         # Best Offer
         best_offer = False
         for elem in card.select('span.su-styled-text.secondary.large'):
             if 'or Best Offer' in elem.get_text():
                 best_offer = True
                 break
+        
         # Аукцион
         auction = bool(re.search(r'\d+\s+bids?\b', card.get_text(), re.I))
         
@@ -335,14 +334,14 @@ def bot_worker():
 # ============ FLASK ============
 @app.route('/')
 def index():
-    return "eBay bot is running (UK, proxy, new selectors)"
+    return "eBay bot is running (UK, no proxy)"
 
 @app.route('/health')
 def health():
     return "OK", 200
 
 if __name__ == "__main__":
-    send_telegram_message("🚀 Бот запущен (UK, прокси, новые селекторы). Команды: /stop /start /reset")
+    send_telegram_message("🚀 Бот запущен (UK, без прокси). Команды: /stop /start /reset")
     threading.Thread(target=telegram_listener, daemon=True).start()
     worker = threading.Thread(target=bot_worker, daemon=False)
     worker.start()
