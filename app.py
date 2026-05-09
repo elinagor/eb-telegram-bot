@@ -35,7 +35,7 @@ MAX_ITEMS = 20
 MAX_RETRIES = 20
 RETRY_DELAY = 5
 
-# Проверяем только необходимые переменные (прокси не требуется)
+# Проверяем только необходимые переменные
 if not all([EBAY_SEARCH_URL, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DATABASE_URL]):
     logging.error("Не хватает переменных окружения. Нужны: EBAY_SEARCH_URL, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DATABASE_URL")
     sys.exit(1)
@@ -108,7 +108,7 @@ def send_telegram_message(message, parse_mode='HTML'):
     except Exception as e:
         logging.error(f"Не удалось отправить в Telegram: {e}")
 
-# ============ ЗАПРОС К EBAY (ПРЯМОЙ, БЕЗ ПРОКСИ) ============
+# ============ ЗАПРОС К EBAY (С ОТЛАДКОЙ) ============
 def fetch_ebay_html_with_retry():
     cookies = {'ebay': '%2F', 'm': 'GB', 's': 'UK', 'siteid': '3'}
     for attempt in range(1, MAX_RETRIES + 1):
@@ -130,12 +130,19 @@ def fetch_ebay_html_with_retry():
                 headers=headers,
                 cookies=cookies,
                 impersonate="chrome142",
-                # прокси не используем
                 verify=False,
                 timeout=35
             )
             if response.status_code == 200:
                 logging.info(f"✅ Загружено (попытка {attempt})")
+                # Отладка: сохраняем первые 500 символов в лог
+                html_preview = response.text[:500]
+                logging.info(f"HTML preview: {html_preview}")
+                # Если нет карточек, сохраняем полный HTML в файл
+                if 's-card' not in html_preview and 's-item' not in html_preview and '/itm/' not in html_preview:
+                    with open('ebay_debug.html', 'w', encoding='utf-8') as f:
+                        f.write(response.text)
+                    logging.error("Страница не содержит карточек товаров. Полный HTML сохранён в ebay_debug.html")
                 return response.text
             else:
                 logging.warning(f"HTTP {response.status_code} (попытка {attempt})")
@@ -147,18 +154,18 @@ def fetch_ebay_html_with_retry():
                 time.sleep(RETRY_DELAY)
     return None
 
-# ============ ПАРСИНГ СТРАНИЦЫ ============
+# ============ ПАРСИНГ (НОВЫЕ СЕЛЕКТОРЫ) ============
 def parse_ebay_listings(html, max_items=MAX_ITEMS):
     if not html:
         return {}
     soup = BeautifulSoup(html, 'html.parser')
-    # Ищем карточки: div с классом s-card или li.s-card
+    # Ищем карточки – приоритет на новые классы
     cards = soup.select('div.s-card, li.s-card')
     if not cards:
         cards = soup.select('li.s-item')
-        if not cards:
-            logging.warning("Карточки не найдены. На странице нет s-card или s-item")
-            return {}
+    if not cards:
+        logging.warning("Карточки не найдены. На странице нет s-card или s-item")
+        return {}
     
     logging.info(f"Найдено карточек: {len(cards)}")
     items = {}
@@ -166,7 +173,7 @@ def parse_ebay_listings(html, max_items=MAX_ITEMS):
     for card in cards:
         if processed >= max_items:
             break
-        # Ссылка на товар
+        # Ссылка
         link = card.select_one('a[href*="/itm/"]')
         if not link:
             continue
@@ -277,7 +284,6 @@ def check_and_send_new_items():
     else:
         logging.info("Новых нет")
 
-# ============ ПОТОКИ ============
 def telegram_listener():
     global is_paused
     last_update_id = 0
@@ -331,17 +337,16 @@ def bot_worker():
             logging.error(f"Ошибка в цикле: {e}", exc_info=True)
             time.sleep(120)
 
-# ============ FLASK ============
 @app.route('/')
 def index():
-    return "eBay bot is running (UK, no proxy)"
+    return "eBay bot is running (UK, debug)"
 
 @app.route('/health')
 def health():
     return "OK", 200
 
 if __name__ == "__main__":
-    send_telegram_message("🚀 Бот запущен (UK, без прокси). Команды: /stop /start /reset")
+    send_telegram_message("🚀 Бот запущен (UK, отладка). Команды: /stop /start /reset")
     threading.Thread(target=telegram_listener, daemon=True).start()
     worker = threading.Thread(target=bot_worker, daemon=False)
     worker.start()
