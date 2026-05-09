@@ -92,6 +92,14 @@ def is_db_empty():
             cur.execute("SELECT NOT EXISTS (SELECT 1 FROM seen_items)")
             return cur.fetchone()[0]
 
+def reset_database():
+    """Полностью очищает таблицу seen_items"""
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM seen_items")
+        conn.commit()
+    logging.info("База данных очищена")
+
 # ============ ОТПРАВКА СООБЩЕНИЙ В TELEGRAM ============
 def send_telegram_message(message, parse_mode='HTML'):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -103,7 +111,7 @@ def send_telegram_message(message, parse_mode='HTML'):
     except Exception as e:
         logging.error(f"Не удалось отправить в Telegram: {e}")
 
-# ============ ОБРАБОТЧИК КОМАНД (LONG POLLING) ============
+# ============ ОБРАБОТЧИК КОМАНД ============
 def telegram_listener():
     global is_paused
     logging.info("🔁 Поток слушателя команд Telegram запущен")
@@ -128,14 +136,17 @@ def telegram_listener():
                             is_paused = False
                             send_telegram_message("▶ Бот продолжает работу")
                             logging.info("Команда /start - продолжение")
+                        elif text == '/reset':
+                            reset_database()
+                            send_telegram_message("🔄 База данных очищена. Бот сделает новый снимок при следующей проверке.")
+                            logging.info("Команда /reset - очистка БД")
             time.sleep(1)
         except Exception as e:
             logging.error(f"Ошибка в слушателе Telegram: {e}")
             time.sleep(5)
 
-# ============ ЗАПРОС К EBAY (БЕЗ ПРОКСИ) ============
+# ============ ЗАПРОС К EBAY ============
 def fetch_ebay_html_with_retry():
-    # Куки для Великобритании
     cookies = {'ebay': '%2F', 'm': 'GB', 's': 'UK', 'siteid': '3'}
     for attempt in range(1, MAX_RETRIES + 1):
         current_ua = random.choice(USER_AGENTS)
@@ -144,7 +155,7 @@ def fetch_ebay_html_with_retry():
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
             'Accept-Language': 'en-GB,en;q=0.9',
             'Referer': 'https://www.ebay.co.uk/',
-            'X-EBay-Site-Id': '3',          # 3 = Великобритания
+            'X-EBay-Site-Id': '3',
             'Sec-Ch-Ua': '"Google Chrome";v="142", "Chromium";v="142", "Not_A Brand";v="99"',
             'Upgrade-Insecure-Requests': '1',
         }
@@ -156,7 +167,6 @@ def fetch_ebay_html_with_retry():
                 headers=headers,
                 cookies=cookies,
                 impersonate="chrome142",
-                # proxies полностью убраны
                 verify=False,
                 timeout=35
             )
@@ -225,8 +235,7 @@ def extract_price_jsonld(card, url=None, soup=None):
             pass
     if soup and url:
         for script in soup.find_all('script', type='application/ld+json'):
-            if not script.string:
-                continue
+            if not script.string: continue
             try:
                 data = json.loads(script.string)
                 if isinstance(data, dict) and data.get('url') == url:
@@ -387,8 +396,14 @@ def parse_ebay_listings(html, max_items=MAX_ITEMS):
     cards = soup.select('li.s-item')
     if not cards:
         cards = soup.select('.s-item')
+    
+    log_cards = len(cards)
+    logging.info(f"Найдено карточек: {log_cards}")
+    
     if not cards:
+        logging.warning("Карточки не найдены, переходим к fallback-методу")
         return parse_ebay_listings_fallback(soup, max_items)
+    
     items = {}
     processed = 0
     for card in cards:
@@ -437,6 +452,7 @@ def parse_ebay_listings_fallback(soup, max_items):
     items = {}
     links = soup.find_all('a', href=True)
     itm_links = [link for link in links if '/itm/' in link['href']]
+    logging.info(f"Fallback: найдено ссылок /itm/: {len(itm_links)}")
     itm_links = itm_links[:max_items]
     for link in itm_links:
         url = link.get('href')
@@ -474,6 +490,7 @@ def parse_ebay_listings_fallback(soup, max_items):
             'best_offer': best_offer,
             'auction': auction
         }
+    logging.info(f"Fallback обработано товаров: {len(items)}")
     return items
 
 def perform_initial_snapshot():
@@ -483,6 +500,7 @@ def perform_initial_snapshot():
         return False
     items = parse_ebay_listings(html, max_items=50)
     if not items:
+        logging.warning("Снимок не дал товаров. Возможно, изменилась структура страницы.")
         return False
     add_seen_ids_batch(list(items.keys()))
     logging.info(f"Снимок: {len(items)} товаров")
@@ -499,7 +517,7 @@ def check_and_send_new_items():
     for item_id, data in current.items():
         if item_id not in seen:
             new.append({'id': item_id, **data})
-            logging.info(f"НОВЫЙ: {data['title'][:50]}... цена: {data['price']}, доставка: {data.get('shipping')}, best_offer: {data.get('best_offer')}, auction: {data.get('auction')}")
+            logging.info(f"НОВЫЙ: {data['title'][:50]}... цена: {data['price']}, доставка: {data.get('shipping')}")
     if new:
         for item in new:
             msg = f"🇬🇧 <b>НОВЫЙ ТОВАР Англия</b> 🇬🇧\n\n<b>{item['title']}</b>\n\n"
@@ -528,7 +546,7 @@ def bot_worker():
     init_db()
     if is_db_empty():
         if not perform_initial_snapshot():
-            send_telegram_message("❌ Ошибка инициализации")
+            send_telegram_message("❌ Ошибка инициализации: не удалось получить товары. Проверьте URL или структуру eBay.")
             return
         send_telegram_message("✅ Бот запущен, начальный снимок сделан")
     else:
@@ -548,14 +566,14 @@ def bot_worker():
 
 @app.route('/')
 def index():
-    return "eBay бот работает (UK, без прокси, интервал 60 сек, Best Offer + Auction)"
+    return "eBay бот работает (UK, без прокси, команды /stop /start /reset)"
 
 @app.route('/health')
 def health():
     return "OK", 200
 
 if __name__ == "__main__":
-    send_telegram_message("🚀 Бот запущен (Великобритания, без прокси, GBP). Интервал 60 сек, команды /stop /start")
+    send_telegram_message("🚀 Бот запущен (Великобритания, без прокси, GBP). Команды: /stop /start /reset")
     threading.Thread(target=telegram_listener, daemon=True).start()
     worker_thread = threading.Thread(target=bot_worker, daemon=False)
     worker_thread.start()
