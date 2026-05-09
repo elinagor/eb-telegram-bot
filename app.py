@@ -30,16 +30,13 @@ load_dotenv()
 EBAY_SEARCH_URL = os.getenv("EBAY_SEARCH_URL")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))   # 60 секунд
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
 BRIGHT_DATA_PROXY_URL = os.getenv("BRIGHT_DATA_PROXY_URL")
 DATABASE_URL = os.getenv("DATABASE_URL")
-MAX_ITEMS = 20                     # сколько товаров из загруженных обрабатываем
-MAX_RETRIES = 5                    # сокращено с 20 до 5 для экономии трафика
+MAX_ITEMS = 20
+MAX_RETRIES = 5
 RETRY_DELAY = 5
 
-# Принудительная локализация Великобритании и фунты стерлингов
-# Добавляем параметры: товары из UK, сортировка по новизне, 20 товаров на страницу (экономия трафика)
-# Исправлено: _ipg=20 (было 240)
 if '?' in EBAY_SEARCH_URL:
     EBAY_SEARCH_URL += '&LH_PrefLoc=3&_ipg=20&_sop=10'
 else:
@@ -52,10 +49,8 @@ if not all([EBAY_SEARCH_URL, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, BRIGHT_DATA_P
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 app = Flask(__name__)
 
-# ============ ГЛОБАЛЬНЫЕ ФЛАГИ ============
 is_paused = False
 
-# ============ РОТАЦИЯ USER-AGENT ============
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
@@ -64,7 +59,6 @@ USER_AGENTS = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
 ]
 
-# ============ РАБОТА С БАЗОЙ ДАННЫХ ============
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL)
 
@@ -95,7 +89,6 @@ def is_db_empty():
             cur.execute("SELECT NOT EXISTS (SELECT 1 FROM seen_items)")
             return cur.fetchone()[0]
 
-# ============ ОТПРАВКА СООБЩЕНИЙ В TELEGRAM ============
 def send_telegram_message(message, parse_mode='HTML'):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': message, 'parse_mode': parse_mode, 'disable_web_page_preview': False}
@@ -106,7 +99,6 @@ def send_telegram_message(message, parse_mode='HTML'):
     except Exception as e:
         logging.error(f"Не удалось отправить в Telegram: {e}")
 
-# ============ ОБРАБОТЧИК КОМАНД (LONG POLLING) ============
 def telegram_listener():
     global is_paused
     logging.info("🔁 Поток слушателя команд Telegram запущен")
@@ -136,10 +128,8 @@ def telegram_listener():
             logging.error(f"Ошибка в слушателе Telegram: {e}")
             time.sleep(5)
 
-# ============ ЗАПРОС К EBAY ============
 def fetch_ebay_html_with_retry():
     proxies = {"http": BRIGHT_DATA_PROXY_URL, "https": BRIGHT_DATA_PROXY_URL}
-    # Куки для Великобритании
     cookies = {'ebay': '%2F', 'm': 'GB', 's': 'UK', 'siteid': '3'}
     for attempt in range(1, MAX_RETRIES + 1):
         current_ua = random.choice(USER_AGENTS)
@@ -147,9 +137,9 @@ def fetch_ebay_html_with_retry():
             'User-Agent': current_ua,
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
             'Accept-Language': 'en-GB,en;q=0.9',
-            'Accept-Encoding': 'gzip, deflate, br',   # добавлено: сжатие для экономии трафика
+            'Accept-Encoding': 'gzip, deflate, br',
             'Referer': 'https://www.ebay.co.uk/',
-            'X-EBay-Site-Id': '3',                   # 3 = Великобритания
+            'X-EBay-Site-Id': '3',
             'Upgrade-Insecure-Requests': '1',
         }
         if attempt > 1:
@@ -165,7 +155,6 @@ def fetch_ebay_html_with_retry():
                 timeout=35
             )
             if response.status_code == 200:
-                # Лог размера ответа в КБ для контроля экономии
                 size_kb = len(response.content) / 1024
                 logging.info(f"✅ Загружено {size_kb:.1f} KB (попытка {attempt}, UA={current_ua[:40]}...)")
                 return response.text
@@ -196,118 +185,107 @@ def clean_title(title):
     title = re.sub(r'(?i)new\s*listing', '', title)
     title = re.sub(r'(?i)\blisting\b', '', title)
     title = re.sub(r'(?i)\bnew\b', '', title)
-    title = re.sub(r'[^\w\s£€$]', ' ', title)   # оставляем £, €, $
+    title = re.sub(r'[^\w\s£€$]', ' ', title)
     title = re.sub(r'\s+', ' ', title).strip()
     return title
 
 def is_gbp_price(text):
-    """Проверяет, является ли текст ценой в фунтах стерлингов (£)"""
     if not text: return False
-    # Явный символ £ или GBP
     if re.search(r'£|\bGBP\b', text, re.I):
         return True
-    # Если есть другие валюты ($, €) — не GBP
     if re.search(r'[$€]|USD|EUR', text, re.I):
         return False
-    # Если есть цифры и возможно десятичный разделитель, но нет других валют — считаем потенциально GBP
     return re.search(r'\d', text) is not None
 
-# ============ НОВАЯ РОБАСТНАЯ ФУНКЦИЯ ИЗВЛЕЧЕНИЯ ЦЕНЫ ============
+# ============ УЛУЧШЕННОЕ ИЗВЛЕЧЕНИЕ ЦЕНЫ С ЛОГИРОВАНИЕМ ============
 def extract_price_robust(card, url=None, soup=None):
     """
-    Универсальный парсер цены:
-    1. Собирает все текстовые элементы внутри карточки, содержащие символ £.
-    2. Из каждого текста извлекает числа с плавающей точкой (цены).
-    3. Выбирает минимальное найденное число и форматирует его с £.
-    4. Если ничего не найдено, пытается извлечь из JSON-LD.
+    Универсальный парсер цены с подробным логированием.
+    Возвращает строку с ценой в формате £X.XX или None.
     """
-    candidates = []
+    all_price_texts = []
+    numeric_prices = []
 
-    # ---- 1. Поиск по всем элементам с классом, содержащим "price", "cost" ----
+    # 1. Ищем все элементы с классом, содержащим "price" или "cost"
     price_elements = card.find_all(attrs={'class': re.compile(r'price|cost', re.I)})
     for elem in price_elements:
         text = elem.get_text(strip=True)
         if text and '£' in text:
-            candidates.append(text)
+            all_price_texts.append(text)
 
-    # ---- 2. Поиск любых элементов, содержащих "£" и цифры ----
-    # Ищем все span, div, p и т.д., у которых в тексте есть £
-    all_spans = card.find_all(['span', 'div', 'p', 'h3', 'h4'])
-    for elem in all_spans:
+    # 2. Ищем элементы с символом £ в любом теге, ограничивая длину текста 100 символами
+    all_tags = card.find_all(['span', 'div', 'p', 'h3', 'h4', 'li', 'a'])
+    for elem in all_tags:
         text = elem.get_text(strip=True)
-        if text and '£' in text and re.search(r'\d', text):
-            # Проверяем, что текст не слишком длинный (не описание)
-            if len(text) < 100:
-                candidates.append(text)
+        if text and '£' in text and re.search(r'\d', text) and len(text) < 100:
+            all_price_texts.append(text)
 
-    # ---- 3. Если нет кандидатов, ищем по специфическим селекторам (старый метод) ----
-    if not candidates:
-        selectors = ['span.s-item__price', '[data-testid="item-price"]', '.s-item__detail .s-item__price',
-                     '.s-item__price', '.su-styled-text.primary.bold.large-1.s-card__price']
-        for sel in selectors:
-            elem = card.select_one(sel)
-            if elem:
-                text = elem.get_text(strip=True)
-                if text and '£' in text:
-                    candidates.append(text)
-                    break
+    # 3. Специфические селекторы eBay
+    specific_selectors = [
+        'span.s-item__price', '[data-testid="item-price"]', '.s-item__detail .s-item__price',
+        '.s-item__price', '.su-styled-text.primary.bold.large-1.s-card__price',
+        '.s-item__price-msrp', '.s-item__price--strikethrough'
+    ]
+    for sel in specific_selectors:
+        elem = card.select_one(sel)
+        if elem:
+            text = elem.get_text(strip=True)
+            if text and '£' in text:
+                all_price_texts.append(text)
 
-    # ---- 4. Из каждого текста извлекаем все числа с символом £ ----
-    numeric_prices = []
-    for text in candidates:
-        # Находим все цены вида £x.xx или £x,xxx.xx
+    # Если нет текстов с £, пробуем JSON-LD
+    if not all_price_texts:
+        scripts = card.find_all('script', type='application/ld+json')
+        for script in scripts:
+            if not script.string:
+                continue
+            try:
+                data = json.loads(script.string)
+                if isinstance(data, dict):
+                    offers = data.get('offers')
+                    if isinstance(offers, dict):
+                        price = offers.get('price')
+                        currency = offers.get('priceCurrency', '')
+                        if price and price != '0' and currency == 'GBP':
+                            numeric_prices.append(float(price))
+                    elif isinstance(offers, list):
+                        for off in offers:
+                            price = off.get('price')
+                            currency = off.get('priceCurrency', '')
+                            if price and price != '0' and currency == 'GBP':
+                                numeric_prices.append(float(price))
+            except:
+                continue
+        if numeric_prices:
+            best = min(numeric_prices)
+            logging.info(f"Цена из JSON-LD: {numeric_prices} -> выбрана {best}")
+            return f"£{int(best)}" if best.is_integer() else f"£{best:.2f}"
+        return None
+
+    # Из всех собранных текстов извлекаем числа с символом £
+    for text in all_price_texts:
+        # Ищем числа вида £12.34 или £12,34 или £1234.56
         matches = re.findall(r'£\s*([\d,]+(?:\.\d{1,2})?)', text)
         for m in matches:
             try:
-                clean = m.replace(',', '')
+                clean = m.replace(',', '')  # удаляем запятые тысяч
                 price_val = float(clean)
                 numeric_prices.append(price_val)
             except ValueError:
                 continue
 
-    # ---- 5. Если есть числа, берём минимальное ----
     if numeric_prices:
         best = min(numeric_prices)
-        # Отладочный лог, чтобы видеть, какие цены найдены
-        logging.debug(f"Найдены цены: {numeric_prices}, выбрана {best}")
+        # Логируем все найденные цены для отладки
+        logging.info(f"Найдены цены в HTML: {numeric_prices} -> выбрана минимальная {best}")
         if best.is_integer():
             return f"£{int(best)}"
         else:
+            # Форматируем с двумя знаками после точки, без округления вверх
             return f"£{best:.2f}"
-
-    # ---- 6. Если ничего не нашли, пробуем JSON-LD ----
-    # (оставляем JSON-LD как резерв, но с условием, что берём минимальную цену из всех предложений)
-    scripts = card.find_all('script', type='application/ld+json')
-    json_candidates = []
-    for script in scripts:
-        if not script.string:
-            continue
-        try:
-            data = json.loads(script.string)
-            if isinstance(data, dict):
-                offers = data.get('offers')
-                if isinstance(offers, dict):
-                    price = offers.get('price')
-                    currency = offers.get('priceCurrency', '')
-                    if price and price != '0' and currency == 'GBP':
-                        json_candidates.append(float(price))
-                elif isinstance(offers, list):
-                    for off in offers:
-                        price = off.get('price')
-                        currency = off.get('priceCurrency', '')
-                        if price and price != '0' and currency == 'GBP':
-                            json_candidates.append(float(price))
-        except:
-            continue
-
-    if json_candidates:
-        best = min(json_candidates)
-        if best.is_integer():
-            return f"£{int(best)}"
-        else:
-            return f"£{best:.2f}"
-
-    return None
+    else:
+        logging.warning("Не удалось найти цену в HTML и JSON-LD")
+        return None
 
 def extract_shipping(card, item_price=None):
     script = card.find('script', type='application/ld+json')
@@ -386,7 +364,6 @@ def extract_shipping(card, item_price=None):
             return pc
     return None
 
-# ============ ОПРЕДЕЛЕНИЕ BEST OFFER ============
 def extract_best_offer(card):
     text = card.get_text()
     if re.search(r'or\s+best\s+offer', text, re.I):
@@ -402,7 +379,6 @@ def extract_best_offer(card):
         return True
     return False
 
-# ============ ОПРЕДЕЛЕНИЕ АУКЦИОНА (BIDS) ============
 def extract_auction(card):
     text = card.get_text()
     if re.search(r'\d+\s+bids?\b', text, re.I):
@@ -420,7 +396,6 @@ def extract_auction(card):
         return True
     return False
 
-# ============ ОСНОВНОЙ ПАРСЕР ============
 def parse_ebay_listings(html, max_items=MAX_ITEMS):
     if not html:
         return {}
@@ -455,7 +430,6 @@ def parse_ebay_listings(html, max_items=MAX_ITEMS):
             if not title:
                 continue
 
-        # ИСПРАВЛЕНИЕ: используем новую робастную функцию
         price = extract_price_robust(card, url, soup)
         if price and not is_gbp_price(price):
             price = None
