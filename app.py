@@ -140,7 +140,7 @@ def telegram_listener():
             logging.error(f"Ошибка в слушателе Telegram: {e}")
             time.sleep(5)
 
-# ============ ЗАПРОС К EBAY (БЕЗ ПРОКСИ) ============
+# ============ ЗАПРОС К EBAY С ОТЛАДКОЙ ============
 def fetch_ebay_html_with_retry():
     cookies = {'ebay': '%2F', 'm': 'GB', 's': 'UK', 'siteid': '3'}
     for attempt in range(1, MAX_RETRIES + 1):
@@ -166,7 +166,17 @@ def fetch_ebay_html_with_retry():
                 timeout=35
             )
             if response.status_code == 200:
+                # Сохраняем первые 2000 символов HTML в лог для отладки
+                html_preview = response.text[:2000]
                 logging.info(f"✅ Загружено (попытка {attempt}, UA={current_ua[:40]}...)")
+                # Проверяем, есть ли признаки капчи или редиректа
+                if "robot" in html_preview.lower() or "captcha" in html_preview.lower():
+                    logging.error("Обнаружена капча или блокировка! Страница содержит robot/captcha.")
+                    # Пробуем другой UA и увеличиваем задержку
+                    time.sleep(10)
+                    continue
+                if "ebay.com/sch/" not in html_preview and "ebay.co.uk/sch/" not in html_preview:
+                    logging.warning("Похоже, страница не содержит результатов поиска. Первые 500 символов: " + html_preview[:500])
                 return response.text
             elif response.status_code == 403:
                 logging.warning(f"⚠️ 403 Forbidden (попытка {attempt})")
@@ -183,12 +193,13 @@ def fetch_ebay_html_with_retry():
     return None
 
 def extract_item_id(url):
-    if not url or '/itm/' not in url:
+    if not url:
         return None
-    try:
-        return url.split('/itm/')[1].split('?')[0]
-    except IndexError:
-        return None
+    # Ищем /itm/ в любом месте URL
+    match = re.search(r'/itm/(\d+)', url)
+    if match:
+        return match.group(1)
+    return None
 
 def clean_title(title):
     if not title: return ""
@@ -207,193 +218,120 @@ def is_gbp_price(text):
         return False
     return re.search(r'\d', text) is not None
 
-# ============ НОВЫЕ ФУНКЦИИ ПАРСИНГА ДЛЯ НОВЫХ КЛАССОВ ============
-def extract_price_from_card(card):
-    """Ищет цену в карточке нового формата."""
-    # Сначала ищем span.s-card__price
-    price_span = card.select_one('span.s-card__price')
-    if price_span:
-        text = price_span.get_text(strip=True)
-        if is_gbp_price(text):
-            return text
-    # Если не нашли, пробуем su-styled-text primary bold large-1
-    fallback = card.select_one('span.su-styled-text.primary.bold.large-1')
-    if fallback:
-        text = fallback.get_text(strip=True)
-        if is_gbp_price(text):
-            return text
-    # Старый метод (на всякий случай)
-    return extract_price_css(card)
-
-def extract_price_css(card):
-    """Старый метод – оставлен для совместимости."""
-    candidates = []
-    selectors = ['span.s-item__price', '[data-testid="item-price"]', '.s-item__detail .s-item__price']
-    for sel in selectors:
-        for elem in card.select(sel):
-            text = elem.get_text(strip=True)
-            if text:
-                candidates.append(text)
-    for elem in card.select('[class*="price"]'):
-        text = elem.get_text(strip=True)
-        if text:
-            candidates.append(text)
-    for cand in candidates:
-        if is_gbp_price(cand):
-            parts = cand.split()
-            for p in parts:
-                if is_gbp_price(p):
-                    return p
-            return cand
-    if candidates:
-        return candidates[0]
-    return None
-
-def extract_shipping_from_card(card):
-    """Извлекает стоимость доставки из карточки нового формата."""
-    # Ищем элемент с классом su-styled-text secondary large и текстом, содержащим "delivery"
-    for elem in card.select('span.su-styled-text.secondary.large'):
-        text = elem.get_text(strip=True)
-        if not text:
-            continue
-        if re.search(r'delivery|shipping', text, re.I):
-            # Извлекаем цену, например "+£1.55"
-            match = re.search(r'([£€$]\s*[\d,]+\.?\d*)', text)
-            if match:
-                return match.group(1)
-            if 'free' in text.lower():
-                return "Бесплатно"
-            return text
-    # Старый метод – на случай, если новый не сработал
-    return extract_shipping(card)
-
-def extract_shipping(card, item_price=None):
-    """Старая универсальная функция – оставлена как fallback."""
-    script = card.find('script', type='application/ld+json')
-    if script and script.string:
-        try:
-            data = json.loads(script.string)
-            if isinstance(data, dict):
-                offers = data.get('offers')
-                if isinstance(offers, dict):
-                    shipping = offers.get('shippingCost')
-                    if shipping is not None:
-                        if shipping == 0 or str(shipping) == '0':
-                            return "Бесплатно"
-                        if isinstance(shipping, (int, float)):
-                            currency = offers.get('priceCurrency', '')
-                            amount = f"{currency} {shipping}" if currency else str(shipping)
-                            return amount
-        except:
-            pass
-    # Поиск по CSS-селекторам
-    shipping_selectors = [
-        'span.s-item__shipping', 'div.s-item__shipping',
-        'span.s-item__logisticsCost', 'span.s-item__delivery',
-        'span.su-styled-text', '.su-styled-text.secondary.large',
-    ]
-    for sel in shipping_selectors:
-        for elem in card.select(sel):
-            text = elem.get_text(strip=True)
-            if not text:
-                continue
-            if re.search(r'(?i)(buy it now|best offer|make offer|watch)', text):
-                continue
-            if re.search(r'(?i)free|delivery|shipping', text):
-                if 'free' in text.lower():
-                    return "Бесплатно"
-                match = re.search(r'([£€$]\s*[\d,]+\.?\d*)', text)
-                if match:
-                    return match.group(1)
-    return None
-
-def extract_best_offer_from_card(card):
-    """Ищет индикатор 'or Best Offer' в карточке нового формата."""
-    for elem in card.select('span.su-styled-text.secondary.large'):
-        text = elem.get_text(strip=True)
-        if re.search(r'or\s+best\s+offer', text, re.I):
-            return True
-    # Старый метод на случай редизайна
-    return extract_best_offer(card)
-
-def extract_best_offer(card):
-    """Старая функция для обратной совместимости."""
-    text = card.get_text()
-    if re.search(r'or\s+best\s+offer', text, re.I):
-        return True
-    best_offer_selectors = [
-        '.s-item__best-offer', '.s-item__detail--best-offer', '.s-item__bonus',
-        '[class*="bestOffer"]', '[class*="best-offer"]'
-    ]
-    for sel in best_offer_selectors:
-        if card.select_one(sel):
-            return True
-    return False
-
-def extract_auction_from_card(card):
-    """Определяет аукцион по наличию bids."""
-    text = card.get_text()
-    if re.search(r'\d+\s+bids?\b', text, re.I):
-        return True
-    if re.search(r'\bplace\s+bid\b', text, re.I):
-        return True
-    # Специфичные классы для аукционов
-    if card.select_one('.s-item__bid-count, .s-card__bid-count'):
-        return True
-    return False
-
-# ============ ОСНОВНАЯ ФУНКЦИЯ ПАРСИНГА (НОВАЯ) ============
+# ============ НОВАЯ УНИВЕРСАЛЬНАЯ ФУНКЦИЯ ПАРСИНГА ============
 def parse_ebay_listings(html, max_items=MAX_ITEMS):
     if not html:
         return {}
     soup = BeautifulSoup(html, 'html.parser')
-    # Новый основной селектор – карточка с классом s-card (может быть div или li)
-    cards = soup.select('div.s-card, li.s-card')
-    if not cards:
-        # Fallback: ищем старые .s-item
-        cards = soup.select('li.s-item')
-    if not cards:
-        # Второй fallback: ищем любые элементы, содержащие ссылку /itm/
-        return parse_ebay_listings_fallback(soup, max_items)
     
-    logging.info(f"Найдено карточек: {len(cards)}")
+    # Универсальный поиск всех ссылок, содержащих /itm/
+    all_links = soup.find_all('a', href=True)
+    item_links = []
+    for link in all_links:
+        href = link.get('href', '')
+        if '/itm/' in href:
+            item_links.append(link)
+        elif 'ebay.co.uk/itm/' in href:
+            item_links.append(link)
+        elif 'ebay.com/itm/' in href:
+            item_links.append(link)
+    
+    logging.info(f"Найдено ссылок /itm/: {len(item_links)}")
+    if not item_links:
+        # Дополнительная отладка: записываем в файл HTML для анализа
+        with open('ebay_debug.html', 'w', encoding='utf-8') as f:
+            f.write(html)
+        logging.error("HTML сохранён в ebay_debug.html. Проверьте содержимое вручную.")
+        return {}
+    
     items = {}
     processed = 0
-    for card in cards:
+    for link in item_links:
         if processed >= max_items:
             break
-        # Ссылка на товар
-        link_elem = card.select_one('a[href*="/itm/"]')
-        if not link_elem:
+        url = link.get('href')
+        if not url:
             continue
-        url = link_elem.get('href')
         if url.startswith('/'):
             url = 'https://www.ebay.co.uk' + url
         item_id = extract_item_id(url)
         if not item_id:
             continue
-        # Название: ищем span.s-card__title или div[role="heading"]
-        title_elem = card.select_one('span.s-card__title')
-        if not title_elem:
-            title_elem = card.select_one('div[role="heading"]')
-        if not title_elem:
-            title_elem = link_elem
-        raw_title = title_elem.get_text(strip=True) if title_elem else ''
-        title = clean_title(raw_title)
+        
+        # Пытаемся найти название: ближайший элемент с классом или просто текст ссылки
+        title = None
+        # Ищем родительский div, который может содержать название
+        parent = link
+        for _ in range(4):
+            title_span = parent.find_previous_sibling('span', class_=re.compile(r's-card__title|s-item__title'))
+            if title_span:
+                title = clean_title(title_span.get_text(strip=True))
+                break
+            # Ищем div с ролью heading
+            heading_div = parent.find_previous_sibling('div', {'role': 'heading'})
+            if heading_div:
+                title = clean_title(heading_div.get_text(strip=True))
+                break
+            parent = parent.parent
         if not title:
+            title = clean_title(link.get_text(strip=True))
+        if not title or len(title) < 3:
             continue
-        # Цена
-        price = extract_price_from_card(card)
+        
+        # Цена: ищем ближайший span с классом содержащим price или s-card__price
+        price = None
+        # Ищем в том же контейнере (родительский блок вокруг ссылки)
+        container = link.parent
+        for _ in range(3):
+            price_elem = container.select_one('span.s-card__price, span.su-styled-text.primary.bold.large-1, span.s-item__price')
+            if price_elem:
+                price = price_elem.get_text(strip=True)
+                if is_gbp_price(price):
+                    break
+                else:
+                    price = None
+            container = container.parent
         if price and not is_gbp_price(price):
             price = None
+        
         # Доставка
-        shipping = extract_shipping_from_card(card)
-        if shipping and shipping != "Бесплатно" and not is_gbp_price(shipping):
-            shipping = None
+        shipping = None
+        shipping_elem = None
+        # Ищем span с классом su-styled-text secondary large и текстом delivery
+        for elem in link.parent.find_all('span', class_='su-styled-text'):
+            text = elem.get_text(strip=True)
+            if 'delivery' in text or 'shipping' in text:
+                shipping_elem = elem
+                break
+        if shipping_elem:
+            text = shipping_elem.get_text(strip=True)
+            if 'free' in text.lower():
+                shipping = "Бесплатно"
+            else:
+                match = re.search(r'([£€$]\s*[\d,]+\.?\d*)', text)
+                if match:
+                    shipping = match.group(1)
+        if not shipping:
+            # fallback
+            shipping_text = link.parent.get_text()
+            if 'free shipping' in shipping_text.lower():
+                shipping = "Бесплатно"
+            else:
+                match = re.search(r'\+?([£€$]\s*[\d,]+\.?\d*)\s*delivery', shipping_text.lower())
+                if match:
+                    shipping = match.group(1)
+        
         # Best Offer
-        best_offer = extract_best_offer_from_card(card)
-        # Аукцион
-        auction = extract_auction_from_card(card)
+        best_offer = False
+        for elem in link.parent.find_all('span', class_='su-styled-text'):
+            if 'or Best Offer' in elem.get_text():
+                best_offer = True
+                break
+        
+        # Auction
+        auction = False
+        if re.search(r'\d+\s+bids?', link.parent.get_text(), re.I):
+            auction = True
         
         items[item_id] = {
             'url': url,
@@ -404,52 +342,8 @@ def parse_ebay_listings(html, max_items=MAX_ITEMS):
             'auction': auction
         }
         processed += 1
+    
     logging.info(f"Обработано товаров: {len(items)}")
-    return items
-
-def parse_ebay_listings_fallback(soup, max_items):
-    items = {}
-    links = soup.find_all('a', href=True)
-    itm_links = [link for link in links if '/itm/' in link['href']]
-    logging.info(f"Fallback: найдено ссылок /itm/: {len(itm_links)}")
-    itm_links = itm_links[:max_items]
-    for link in itm_links:
-        url = link.get('href')
-        if url.startswith('/'):
-            url = 'https://www.ebay.co.uk' + url
-        item_id = extract_item_id(url)
-        if not item_id:
-            continue
-        title = clean_title(link.get_text(strip=True))
-        if not title:
-            continue
-        price = None
-        shipping = None
-        best_offer = False
-        auction = False
-        parent = link.parent
-        for _ in range(5):
-            if parent:
-                price = extract_price_from_card(parent)
-                if price and not is_gbp_price(price):
-                    price = None
-                shipping = extract_shipping_from_card(parent)
-                if shipping and shipping != "Бесплатно" and not is_gbp_price(shipping):
-                    shipping = None
-                best_offer = extract_best_offer_from_card(parent)
-                auction = extract_auction_from_card(parent)
-                if price or shipping or best_offer or auction:
-                    break
-                parent = parent.parent
-        items[item_id] = {
-            'url': url,
-            'title': title,
-            'price': price,
-            'shipping': shipping,
-            'best_offer': best_offer,
-            'auction': auction
-        }
-    logging.info(f"Fallback обработано товаров: {len(items)}")
     return items
 
 # ============ СНИМОК И ОТПРАВКА ============
@@ -526,14 +420,14 @@ def bot_worker():
 
 @app.route('/')
 def index():
-    return "eBay бот работает (UK, новые селекторы s-card)"
+    return "eBay бот работает (UK, универсальный парсинг)"
 
 @app.route('/health')
 def health():
     return "OK", 200
 
 if __name__ == "__main__":
-    send_telegram_message("🚀 Бот запущен (UK). Команды: /stop /start /reset")
+    send_telegram_message("🚀 Бот запущен (UK). Команды: /stop /start /reset. В случае ошибки проверяйте логи.")
     threading.Thread(target=telegram_listener, daemon=True).start()
     worker_thread = threading.Thread(target=bot_worker, daemon=False)
     worker_thread.start()
