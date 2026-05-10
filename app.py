@@ -366,7 +366,7 @@ def _make_request(proxy, profile, cookies):
 def fetch_ebay_html_with_retry():
     return fetch_ebay_html_with_fixed_pair()
 
-# ============ ПАРСИНГ (С ИСПРАВЛЕННЫМ EXTRACT_SHIPPING) ============
+# ============ ПАРСИНГ ============
 def extract_item_id(url):
     if not url or '/itm/' not in url:
         return None
@@ -461,9 +461,9 @@ def extract_price_css(card):
         return candidates[0]
     return None
 
-# ============ ИСПРАВЛЕННАЯ ФУНКЦИЯ EXTRACT_SHIPPING ============
+# ============ ИСПРАВЛЕННАЯ ФУНКЦИЯ EXTRACT_SHIPPING (бесплатно для любых free delivery) ============
 def extract_shipping(card, item_price=None):
-    # 1. Сначала ищем через JSON-LD (структурированные данные)
+    # 1. JSON-LD (структурированные данные)
     script = card.find('script', type='application/ld+json')
     if script and script.string:
         try:
@@ -496,12 +496,12 @@ def extract_shipping(card, item_price=None):
         except:
             pass
 
-    # 2. Поиск по CSS-селекторам, специфичным для доставки
+    # 2. Поиск по CSS-селекторам
     shipping_selectors = [
         'span.s-item__shipping', 'div.s-item__shipping',
         'span.s-item__logisticsCost', 'span.s-item__delivery',
-        'span.su-styled-text', '.su-styled-text.secondary.large',  # добавлено для текстовой доставки
-        '[class*="shippingCost"]', '[class*="delivery"]',         # общие классы с доставкой
+        'span.su-styled-text', '.su-styled-text.secondary.large',
+        '[class*="shippingCost"]', '[class*="delivery"]',
         '.s-item__detail--shipping', '.s-item__delivery-costs'
     ]
     for sel in shipping_selectors:
@@ -510,51 +510,49 @@ def extract_shipping(card, item_price=None):
             text = re.sub(r'\s+', ' ', text)
             if not text:
                 continue
-            # Пропускаем элементы с действиями (купить, сделать предложение и т.п.)
+            # Пропускаем элементы с действиями
             if re.search(r'(?i)(buy it now|best offer|make offer|watch|add to cart)', text):
                 continue
-            # Если есть слово "free" — бесплатно
-            if 'free' in text.lower():
+            # Если в тексте есть "free" – считаем бесплатной доставкой
+            if re.search(r'\bfree\b', text.lower()):
                 return "Бесплатно"
-            # Если есть символы валюты — извлекаем цену
+            # Если есть символы валюты – извлекаем цену
             match = re.search(r'([£€$]\s*[\d,]+\.?\d*)', text)
             if match:
                 price_candidate = match.group(1)
                 if item_price and price_candidate == item_price:
                     continue
                 return price_candidate
-            # Если текст похож на описание доставки (содержит delivery/shipping и не является очень коротким)
+            # Если текст описывает доставку (содержит delivery/shipping) и не тривиален
             if re.search(r'(?i)(delivery|shipping)', text) and len(text) > 5:
-                # Если это не просто "delivery" или "shipping", а что-то более информативное
                 if len(text) > 10 or re.search(r'\d', text):
                     return text
-                # Иначе, возможно, пустой или неинформативный, пропускаем
-    # 3. Поиск по всему HTML карточки (регулярные выражения как запасной вариант)
-    html = str(card)
-    if re.search(r'(?i)free\s+shipping', html):
+
+    # 3. Поиск по всему HTML карточки (регулярные выражения)
+    html = str(card).lower()
+    if re.search(r'free\s+delivery', html) or re.search(r'free\s+shipping', html):
         return "Бесплатно"
-    # Поиск фраз "delivery in X-X days", "delivery time", "shipping: £..." и т.д.
-    match = re.search(r'(?i)\+?\s*([£€$]\s*[\d,]+\.?\d*)\s*(delivery|shipping)', html)
+    # Поиск цены доставки
+    match = re.search(r'\+?\s*([£€$]\s*[\d,]+\.?\d*)\s*(delivery|shipping)', html)
     if match:
         pc = match.group(1)
         if not (item_price and pc == item_price):
             return pc
-    match = re.search(r'(?i)shipping:\s*([£€$]\s*[\d,]+\.?\d*)', html)
+    match = re.search(r'shipping:\s*([£€$]\s*[\d,]+\.?\d*)', html)
     if match:
         pc = match.group(1)
         if not (item_price and pc == item_price):
             return pc
-    # Теперь ищем текстовые описания доставки (например, "delivery in 2-3 days")
-    match = re.search(r'(?i)(delivery in\s+\d+[-\s]*\d*\s*(days?|weeks?|business days?|working days?))', html)
+    # Текстовые описания доставки (без цены)
+    match = re.search(r'(delivery in\s+\d+[-\s]*\d*\s*(days?|weeks?|business days?|working days?))', html)
     if match:
         return match.group(1).strip()
-    match = re.search(r'(?i)(delivery time\s*:\s*[\w\s\d-]+)', html)
+    match = re.search(r'(delivery time\s*:\s*[\w\s\d-]+)', html)
     if match:
         return match.group(1).strip()
-    match = re.search(r'(?i)(shipping in\s+\d+[-\s]*\d*\s*(days?|weeks?))', html)
+    match = re.search(r'(shipping in\s+\d+[-\s]*\d*\s*(days?|weeks?))', html)
     if match:
         return match.group(1).strip()
-    # Если ничего не найдено, возвращаем None
     return None
 
 def extract_best_offer(card):
@@ -573,7 +571,6 @@ def extract_best_offer(card):
     return False
 
 def extract_auction(card):
-    """Определение аукциона (исправлено ранее)"""
     if card.select_one('.su-styled-text.secondary.large'):
         elem = card.select_one('.su-styled-text.secondary.large')
         text = elem.get_text(strip=True).lower()
@@ -644,7 +641,6 @@ def parse_ebay_listings(html, max_items=MAX_ITEMS):
         if price and not is_gbp_price(price):
             price = None
         shipping = extract_shipping(card, item_price=price)
-        # Если shipping получился числовым, но потом мы хотим текстовое описание? Оставляем как есть.
         best_offer = extract_best_offer(card)
         auction = extract_auction(card)
         items[item_id] = {
@@ -772,14 +768,14 @@ def bot_worker():
 
 @app.route('/')
 def index():
-    return "eBay бот работает (фиксация пары, исправлен парсинг delivery)"
+    return "eBay бот работает (фиксация пары, улучшено определение бесплатной доставки)"
 
 @app.route('/health')
 def health():
     return "OK", 200
 
 if __name__ == "__main__":
-    send_telegram_message("🚀 Бот запущен (Великобритания, доработано определение доставки). Интервал 60 сек, команды /stop /start")
+    send_telegram_message("🚀 Бот запущен (Великобритания, 'Free delivery' → Бесплатно). Интервал 60 сек, команды /stop /start")
     threading.Thread(target=telegram_listener, daemon=True).start()
     worker_thread = threading.Thread(target=bot_worker, daemon=False)
     worker_thread.start()
