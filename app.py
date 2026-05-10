@@ -32,11 +32,11 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
 DATABASE_URL = os.getenv("DATABASE_URL")
-PROXY_LIST_URL = os.getenv("PROXY_LIST")  # ссылка на API с прокси
-PROXY_REFRESH_INTERVAL = 15 * 60  # обновлять список каждые 15 минут
+PROXY_LIST_URL = os.getenv("PROXY_LIST")
+PROXY_REFRESH_INTERVAL = 15 * 60
 
 MAX_ITEMS = 20
-MAX_SEARCH_ATTEMPTS = 20  # число попыток для поиска рабочей пары
+MAX_SEARCH_ATTEMPTS = 20
 RETRY_DELAY = 2
 
 if '?' in EBAY_SEARCH_URL:
@@ -107,16 +107,13 @@ BROWSER_PROFILES = [
 ]
 
 def get_random_profile():
-    """Возвращает случайный активный (не disabled) профиль"""
     active = [p for p in BROWSER_PROFILES if not p.get('disabled', False)]
     if not active:
-        # если вдруг все отключены — включаем заново первый
         BROWSER_PROFILES[0]['disabled'] = False
         active = [BROWSER_PROFILES[0]]
     return random.choice(active)
 
 def disable_profile(profile_name):
-    """Отключает профиль, если он вызывает ошибку not supported"""
     for p in BROWSER_PROFILES:
         if p['name'] == profile_name:
             p['disabled'] = True
@@ -127,7 +124,7 @@ def disable_profile(profile_name):
 class ProxyManager:
     def __init__(self, proxy_list_url=None):
         self.proxy_list_url = proxy_list_url
-        self.proxies = []          # список рабочих прокси
+        self.proxies = []
         self.lock = threading.Lock()
         self.last_refresh = 0
         self.refresh_interval = PROXY_REFRESH_INTERVAL
@@ -190,8 +187,8 @@ proxy_manager = ProxyManager(PROXY_LIST_URL)
 # ============ ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ДЛЯ ФИКСИРОВАННОЙ ПАРЫ ============
 fixed_proxy = None
 fixed_profile = None
-fixed_profile_failures = 0   # счётчик последовательных ошибок фиксированной пары
-MAX_FIXED_FAILURES = 2       # после 2 ошибок подряд сбрасываем пару
+fixed_profile_failures = 0
+MAX_FIXED_FAILURES = 2
 
 # ============ БАЗА ДАННЫХ ============
 def get_db_connection():
@@ -264,13 +261,12 @@ def telegram_listener():
             logging.error(f"Ошибка в слушателе Telegram: {e}")
             time.sleep(5)
 
-# ============ ФУНКЦИЯ ЗАПРОСА С ФИКСАЦИЕЙ УСПЕШНОЙ ПАРЫ ============
+# ============ ФУНКЦИЯ ЗАПРОСА С ФИКСАЦИЕЙ ============
 def fetch_ebay_html_with_fixed_pair():
     global fixed_proxy, fixed_profile, fixed_profile_failures
 
     cookies = {'ebay': '%2F', 'm': 'GB', 's': 'UK', 'siteid': '3'}
 
-    # Если есть зафиксированная пара — пробуем её
     if fixed_proxy is not None and fixed_profile is not None:
         logging.info(f"🔁 Используем зафиксированную пару: прокси {fixed_proxy}, профиль {fixed_profile['name']}")
         success, html = _make_request(fixed_proxy, fixed_profile, cookies)
@@ -286,11 +282,8 @@ def fetch_ebay_html_with_fixed_pair():
                 fixed_profile = None
                 fixed_profile_failures = 0
             else:
-                # Даём паре ещё шанс, но вернём None, чтобы вызвался поиск заново? Нет, нужно всё равно вернуть None, чтобы парсер не упал.
-                # Лучше здесь вернуть None, и в check_and_send_new_items будет повторная попытка через fetch_ebay_html_with_retry.
                 return None
 
-    # Поиск новой рабочей пары
     for attempt in range(1, MAX_SEARCH_ATTEMPTS + 1):
         proxy = proxy_manager.get_random_proxy()
         profile = get_random_profile()
@@ -303,15 +296,12 @@ def fetch_ebay_html_with_fixed_pair():
             fixed_profile_failures = 0
             return html
         else:
-            # Если ошибка "not supported", отключаем профиль навсегда
-            # (это уже обработано внутри _make_request)
             continue
 
     logging.error("❌ Не удалось найти рабочую пару после всех попыток")
     return None
 
 def _make_request(proxy, profile, cookies):
-    """Выполняет один запрос с заданным прокси и профилем. Возвращает (success, html)"""
     headers = {
         'User-Agent': profile['ua'],
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
@@ -343,7 +333,6 @@ def _make_request(proxy, profile, cookies):
             allow_redirects=True
         )
 
-        # Проверка на блокировку
         if response.status_code == 200:
             text_lower = response.text.lower()
             if 'pardon our interruption' in text_lower or 'access denied' in text_lower or 'robot' in text_lower:
@@ -375,10 +364,9 @@ def _make_request(proxy, profile, cookies):
         return False, None
 
 def fetch_ebay_html_with_retry():
-    """Совместимая обёртка для старого названия"""
     return fetch_ebay_html_with_fixed_pair()
 
-# ============ ПАРСИНГ (без изменений) ============
+# ============ ПАРСИНГ (с улучшенным определением аукциона) ============
 def extract_item_id(url):
     if not url or '/itm/' not in url:
         return None
@@ -565,21 +553,52 @@ def extract_best_offer(card):
         return True
     return False
 
+# ============ ИСПРАВЛЕННАЯ ФУНКЦИЯ ОПРЕДЕЛЕНИЯ АУКЦИОНА ============
 def extract_auction(card):
+    """
+    Определяет, является ли товар аукционом.
+    Ищет: фразу "X bids", "place bid", специальные CSS-классы, атрибуты, иконки.
+    """
+    # 1. Проверяем текст карточки
     text = card.get_text()
+    # Паттерн: цифра + пробел(ы) + "bid" или "bids"
     if re.search(r'\d+\s+bids?\b', text, re.I):
         return True
     if re.search(r'\bplace\s+bid\b', text, re.I):
         return True
+    # Дополнительно: если есть "bids" без цифры, но при этом нет противопоказаний
+    if re.search(r'\bbids?\b', text, re.I) and not re.search(r'buy it now', text, re.I):
+        return True
+
+    # 2. Поиск по селекторам (расширенный список)
     auction_selectors = [
-        '.s-item__bid-count', '.s-item__bids', '[class*="bidCount"]',
-        '[class*="bids"]', '.vi-bidrev'
+        '.s-item__bid-count',           # стандартный класс
+        '.s-item__bids',
+        '[class*="bidCount"]',
+        '[class*="bids"]',
+        '[class*="bid-count"]',
+        '.vi-bidrev',
+        '.s-item__detail--bid-count',
+        '[data-testid="bid-count"]',
+        '.bidCount',                    # возможный класс
+        'span.bids',                    # прямой тег с классом
+        '.s-item__auction',             # иногда встречается
+        '.auction-badge'                # бейдж аукциона
     ]
     for sel in auction_selectors:
         if card.select_one(sel):
             return True
+
+    # 3. Поиск ссылки на ставку (старый метод)
     if card.select_one('a[href*="bid"]'):
         return True
+
+    # 4. Поиск по атрибутам (data-*)
+    if card.select_one('[data-auction="true"]'):
+        return True
+    if card.select_one('[data-testid*="auction"]'):
+        return True
+
     return False
 
 def parse_ebay_listings(html, max_items=MAX_ITEMS):
@@ -622,7 +641,7 @@ def parse_ebay_listings(html, max_items=MAX_ITEMS):
         if shipping and shipping != "Бесплатно" and not is_gbp_price(shipping):
             shipping = None
         best_offer = extract_best_offer(card)
-        auction = extract_auction(card)
+        auction = extract_auction(card)   # используем исправленную функцию
         items[item_id] = {
             'url': url,
             'title': title,
@@ -750,14 +769,14 @@ def bot_worker():
 
 @app.route('/')
 def index():
-    return "eBay бот работает (фиксация успешной пары прокси+браузер)"
+    return "eBay бот работает (фиксация пары, улучшенное определение аукциона)"
 
 @app.route('/health')
 def health():
     return "OK", 200
 
 if __name__ == "__main__":
-    send_telegram_message("🚀 Бот запущен (Великобритания, фиксация рабочей пары). Интервал 60 сек, команды /stop /start")
+    send_telegram_message("🚀 Бот запущен (Великобритания, исправлено определение аукциона). Интервал 60 сек, команды /stop /start")
     threading.Thread(target=telegram_listener, daemon=True).start()
     worker_thread = threading.Thread(target=bot_worker, daemon=False)
     worker_thread.start()
