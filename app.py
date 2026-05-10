@@ -366,7 +366,7 @@ def _make_request(proxy, profile, cookies):
 def fetch_ebay_html_with_retry():
     return fetch_ebay_html_with_fixed_pair()
 
-# ============ ПАРСИНГ (С ИСПРАВЛЕННЫМ АУКЦИОНОМ) ============
+# ============ ПАРСИНГ (С ИСПРАВЛЕННЫМ EXTRACT_SHIPPING) ============
 def extract_item_id(url):
     if not url or '/itm/' not in url:
         return None
@@ -461,7 +461,9 @@ def extract_price_css(card):
         return candidates[0]
     return None
 
+# ============ ИСПРАВЛЕННАЯ ФУНКЦИЯ EXTRACT_SHIPPING ============
 def extract_shipping(card, item_price=None):
+    # 1. Сначала ищем через JSON-LD (структурированные данные)
     script = card.find('script', type='application/ld+json')
     if script and script.string:
         try:
@@ -494,11 +496,13 @@ def extract_shipping(card, item_price=None):
         except:
             pass
 
+    # 2. Поиск по CSS-селекторам, специфичным для доставки
     shipping_selectors = [
         'span.s-item__shipping', 'div.s-item__shipping',
         'span.s-item__logisticsCost', 'span.s-item__delivery',
-        'span.su-styled-text', '.su-styled-text.secondary.large',
-        '[class*="shippingCost"]'
+        'span.su-styled-text', '.su-styled-text.secondary.large',  # добавлено для текстовой доставки
+        '[class*="shippingCost"]', '[class*="delivery"]',         # общие классы с доставкой
+        '.s-item__detail--shipping', '.s-item__delivery-costs'
     ]
     for sel in shipping_selectors:
         for elem in card.select(sel):
@@ -506,26 +510,30 @@ def extract_shipping(card, item_price=None):
             text = re.sub(r'\s+', ' ', text)
             if not text:
                 continue
+            # Пропускаем элементы с действиями (купить, сделать предложение и т.п.)
             if re.search(r'(?i)(buy it now|best offer|make offer|watch|add to cart)', text):
                 continue
-            if not re.search(r'(?i)(free|shipping|delivery|postage|shipping cost)', text):
-                continue
+            # Если есть слово "free" — бесплатно
             if 'free' in text.lower():
                 return "Бесплатно"
+            # Если есть символы валюты — извлекаем цену
             match = re.search(r'([£€$]\s*[\d,]+\.?\d*)', text)
             if match:
                 price_candidate = match.group(1)
                 if item_price and price_candidate == item_price:
                     continue
                 return price_candidate
-            if len(text) < 30 and not re.search(r'\d', text):
-                if 'free' in text.lower():
-                    return "Бесплатно"
-                return text
-
+            # Если текст похож на описание доставки (содержит delivery/shipping и не является очень коротким)
+            if re.search(r'(?i)(delivery|shipping)', text) and len(text) > 5:
+                # Если это не просто "delivery" или "shipping", а что-то более информативное
+                if len(text) > 10 or re.search(r'\d', text):
+                    return text
+                # Иначе, возможно, пустой или неинформативный, пропускаем
+    # 3. Поиск по всему HTML карточки (регулярные выражения как запасной вариант)
     html = str(card)
     if re.search(r'(?i)free\s+shipping', html):
         return "Бесплатно"
+    # Поиск фраз "delivery in X-X days", "delivery time", "shipping: £..." и т.д.
     match = re.search(r'(?i)\+?\s*([£€$]\s*[\d,]+\.?\d*)\s*(delivery|shipping)', html)
     if match:
         pc = match.group(1)
@@ -536,6 +544,17 @@ def extract_shipping(card, item_price=None):
         pc = match.group(1)
         if not (item_price and pc == item_price):
             return pc
+    # Теперь ищем текстовые описания доставки (например, "delivery in 2-3 days")
+    match = re.search(r'(?i)(delivery in\s+\d+[-\s]*\d*\s*(days?|weeks?|business days?|working days?))', html)
+    if match:
+        return match.group(1).strip()
+    match = re.search(r'(?i)(delivery time\s*:\s*[\w\s\d-]+)', html)
+    if match:
+        return match.group(1).strip()
+    match = re.search(r'(?i)(shipping in\s+\d+[-\s]*\d*\s*(days?|weeks?))', html)
+    if match:
+        return match.group(1).strip()
+    # Если ничего не найдено, возвращаем None
     return None
 
 def extract_best_offer(card):
@@ -553,65 +572,39 @@ def extract_best_offer(card):
         return True
     return False
 
-# ============ ИСПРАВЛЕННАЯ ФУНКЦИЯ ОПРЕДЕЛЕНИЯ АУКЦИОНА ============
 def extract_auction(card):
-    """
-    Определяет, является ли товар аукционом.
-    Учитывает: "X bids", "place bid", специальные CSS-классы, особенно .su-styled-text.secondary.large
-    """
-    # 1. Проверка по конкретному классу, который вы нашли
+    """Определение аукциона (исправлено ранее)"""
     if card.select_one('.su-styled-text.secondary.large'):
         elem = card.select_one('.su-styled-text.secondary.large')
         text = elem.get_text(strip=True).lower()
-        if 'bid' in text:   # содержит "bid" или "bids"
+        if 'bid' in text:
             return True
-
-    # 2. Поиск по расширенным селекторам, связанным с количеством ставок
     auction_selectors = [
-        '.s-item__bid-count',
-        '.s-item__bids',
-        '[class*="bidCount"]',
-        '[class*="bids"]',
-        '[class*="bid-count"]',
-        '.vi-bidrev',
-        '.s-item__detail--bid-count',
-        '[data-testid="bid-count"]',
-        '.bidCount',
-        'span.bids',
-        '.s-item__auction',
-        '.auction-badge',
-        '.s-item__bid-count__text',
-        '.bid-count',
-        '.bids-count'
+        '.s-item__bid-count', '.s-item__bids', '[class*="bidCount"]',
+        '[class*="bids"]', '[class*="bid-count"]', '.vi-bidrev',
+        '.s-item__detail--bid-count', '[data-testid="bid-count"]', '.bidCount',
+        'span.bids', '.s-item__auction', '.auction-badge', '.s-item__bid-count__text',
+        '.bid-count', '.bids-count'
     ]
     for sel in auction_selectors:
         found = card.select_one(sel)
         if found:
-            text = found.get_text(strip=True).lower()
-            if 'bid' in text or text.isdigit():
+            txt = found.get_text(strip=True).lower()
+            if 'bid' in txt or txt.isdigit():
                 return True
-
-    # 3. Проверка текста карточки (с цифрой или без)
     full_text = card.get_text().lower()
-    # Паттерн: цифра (включая 0) + пробел(ы) + "bid" или "bids"
     if re.search(r'\d+\s+bids?\b', full_text):
         return True
     if re.search(r'\bplace\s+bid\b', full_text):
         return True
-    # Если есть "bids" и нет явных признаков "buy it now"
     if 'bids' in full_text and 'buy it now' not in full_text:
         return True
-
-    # 4. Ссылки на ставку
     if card.select_one('a[href*="bid"]'):
         return True
-
-    # 5. data-атрибуты
     if card.select_one('[data-auction="true"]'):
         return True
     if card.select_one('[data-testid*="auction"]'):
         return True
-
     return False
 
 def parse_ebay_listings(html, max_items=MAX_ITEMS):
@@ -651,10 +644,9 @@ def parse_ebay_listings(html, max_items=MAX_ITEMS):
         if price and not is_gbp_price(price):
             price = None
         shipping = extract_shipping(card, item_price=price)
-        if shipping and shipping != "Бесплатно" and not is_gbp_price(shipping):
-            shipping = None
+        # Если shipping получился числовым, но потом мы хотим текстовое описание? Оставляем как есть.
         best_offer = extract_best_offer(card)
-        auction = extract_auction(card)   # исправленная функция
+        auction = extract_auction(card)
         items[item_id] = {
             'url': url,
             'title': title,
@@ -693,8 +685,6 @@ def parse_ebay_listings_fallback(soup, max_items):
                 if price and not is_gbp_price(price):
                     price = None
                 shipping = extract_shipping(parent, item_price=price)
-                if shipping and shipping != "Бесплатно" and not is_gbp_price(shipping):
-                    shipping = None
                 best_offer = extract_best_offer(parent)
                 auction = extract_auction(parent)
                 if price or shipping or best_offer or auction:
@@ -782,14 +772,14 @@ def bot_worker():
 
 @app.route('/')
 def index():
-    return "eBay бот работает (фиксация пары, надёжное определение аукциона)"
+    return "eBay бот работает (фиксация пары, исправлен парсинг delivery)"
 
 @app.route('/health')
 def health():
     return "OK", 200
 
 if __name__ == "__main__":
-    send_telegram_message("🚀 Бот запущен (Великобритания, исправлен парсинг 0 bids). Интервал 60 сек, команды /stop /start")
+    send_telegram_message("🚀 Бот запущен (Великобритания, доработано определение доставки). Интервал 60 сек, команды /stop /start")
     threading.Thread(target=telegram_listener, daemon=True).start()
     worker_thread = threading.Thread(target=bot_worker, daemon=False)
     worker_thread.start()
