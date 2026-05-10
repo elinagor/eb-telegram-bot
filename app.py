@@ -366,7 +366,7 @@ def _make_request(proxy, profile, cookies):
 def fetch_ebay_html_with_retry():
     return fetch_ebay_html_with_fixed_pair()
 
-# ============ ПАРСИНГ (с улучшенным определением аукциона) ============
+# ============ ПАРСИНГ (С ИСПРАВЛЕННЫМ АУКЦИОНОМ) ============
 def extract_item_id(url):
     if not url or '/itm/' not in url:
         return None
@@ -557,22 +557,18 @@ def extract_best_offer(card):
 def extract_auction(card):
     """
     Определяет, является ли товар аукционом.
-    Ищет: фразу "X bids", "place bid", специальные CSS-классы, атрибуты, иконки.
+    Учитывает: "X bids", "place bid", специальные CSS-классы, особенно .su-styled-text.secondary.large
     """
-    # 1. Проверяем текст карточки
-    text = card.get_text()
-    # Паттерн: цифра + пробел(ы) + "bid" или "bids"
-    if re.search(r'\d+\s+bids?\b', text, re.I):
-        return True
-    if re.search(r'\bplace\s+bid\b', text, re.I):
-        return True
-    # Дополнительно: если есть "bids" без цифры, но при этом нет противопоказаний
-    if re.search(r'\bbids?\b', text, re.I) and not re.search(r'buy it now', text, re.I):
-        return True
+    # 1. Проверка по конкретному классу, который вы нашли
+    if card.select_one('.su-styled-text.secondary.large'):
+        elem = card.select_one('.su-styled-text.secondary.large')
+        text = elem.get_text(strip=True).lower()
+        if 'bid' in text:   # содержит "bid" или "bids"
+            return True
 
-    # 2. Поиск по селекторам (расширенный список)
+    # 2. Поиск по расширенным селекторам, связанным с количеством ставок
     auction_selectors = [
-        '.s-item__bid-count',           # стандартный класс
+        '.s-item__bid-count',
         '.s-item__bids',
         '[class*="bidCount"]',
         '[class*="bids"]',
@@ -580,20 +576,37 @@ def extract_auction(card):
         '.vi-bidrev',
         '.s-item__detail--bid-count',
         '[data-testid="bid-count"]',
-        '.bidCount',                    # возможный класс
-        'span.bids',                    # прямой тег с классом
-        '.s-item__auction',             # иногда встречается
-        '.auction-badge'                # бейдж аукциона
+        '.bidCount',
+        'span.bids',
+        '.s-item__auction',
+        '.auction-badge',
+        '.s-item__bid-count__text',
+        '.bid-count',
+        '.bids-count'
     ]
     for sel in auction_selectors:
-        if card.select_one(sel):
-            return True
+        found = card.select_one(sel)
+        if found:
+            text = found.get_text(strip=True).lower()
+            if 'bid' in text or text.isdigit():
+                return True
 
-    # 3. Поиск ссылки на ставку (старый метод)
+    # 3. Проверка текста карточки (с цифрой или без)
+    full_text = card.get_text().lower()
+    # Паттерн: цифра (включая 0) + пробел(ы) + "bid" или "bids"
+    if re.search(r'\d+\s+bids?\b', full_text):
+        return True
+    if re.search(r'\bplace\s+bid\b', full_text):
+        return True
+    # Если есть "bids" и нет явных признаков "buy it now"
+    if 'bids' in full_text and 'buy it now' not in full_text:
+        return True
+
+    # 4. Ссылки на ставку
     if card.select_one('a[href*="bid"]'):
         return True
 
-    # 4. Поиск по атрибутам (data-*)
+    # 5. data-атрибуты
     if card.select_one('[data-auction="true"]'):
         return True
     if card.select_one('[data-testid*="auction"]'):
@@ -641,7 +654,7 @@ def parse_ebay_listings(html, max_items=MAX_ITEMS):
         if shipping and shipping != "Бесплатно" and not is_gbp_price(shipping):
             shipping = None
         best_offer = extract_best_offer(card)
-        auction = extract_auction(card)   # используем исправленную функцию
+        auction = extract_auction(card)   # исправленная функция
         items[item_id] = {
             'url': url,
             'title': title,
@@ -769,14 +782,14 @@ def bot_worker():
 
 @app.route('/')
 def index():
-    return "eBay бот работает (фиксация пары, улучшенное определение аукциона)"
+    return "eBay бот работает (фиксация пары, надёжное определение аукциона)"
 
 @app.route('/health')
 def health():
     return "OK", 200
 
 if __name__ == "__main__":
-    send_telegram_message("🚀 Бот запущен (Великобритания, исправлено определение аукциона). Интервал 60 сек, команды /stop /start")
+    send_telegram_message("🚀 Бот запущен (Великобритания, исправлен парсинг 0 bids). Интервал 60 сек, команды /stop /start")
     threading.Thread(target=telegram_listener, daemon=True).start()
     worker_thread = threading.Thread(target=bot_worker, daemon=False)
     worker_thread.start()
