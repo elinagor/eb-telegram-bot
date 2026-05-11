@@ -393,6 +393,11 @@ def is_gbp_price(text):
     return re.search(r'\d', text) is not None
 
 def extract_price_jsonld(card, url=None, soup=None):
+    # Сначала попробуем найти диапазон через CSS (более надёжно)
+    range_price = extract_range_price(card)
+    if range_price:
+        return range_price
+
     script = card.find('script', type='application/ld+json')
     candidates = []
     if script and script.string:
@@ -438,7 +443,58 @@ def extract_price_jsonld(card, url=None, soup=None):
             return str(price)
     return None
 
+def extract_range_price(card):
+    """
+    Ищет конструкцию вида: £X.XX to £YY.YY внутри карточки.
+    Возвращает строку вида "£X.XX до £YY.YY" или None.
+    """
+    # Ищем все элементы с ценой (классы, содержащие s-card__price или подобные)
+    price_spans = card.select('span.s-card__price, span.s-item__price, [class*="price"]')
+    # Пройдёмся по ним, чтобы найти три подряд: цена, 'to', цена
+    for i in range(len(price_spans) - 2):
+        first = price_spans[i].get_text(strip=True)
+        middle = price_spans[i+1].get_text(strip=True).lower()
+        third = price_spans[i+2].get_text(strip=True)
+        # Проверяем, что middle содержит "to", а first и third похожи на цены
+        if 'to' in middle and re.search(r'[£€$]', first) and re.search(r'[£€$]', third):
+            # Извлекаем символ валюты из first (или third)
+            currency_match = re.search(r'([£€$])', first)
+            currency = currency_match.group(1) if currency_match else '£'
+            # Очищаем first и third от лишних пробелов, оставляем как есть
+            first_clean = first
+            third_clean = third
+            return f"{first_clean} до {third_clean}"
+    # Альтернативный поиск: ищем элемент с текстом "to" и затем ближайшие цены
+    to_elem = card.find(string=re.compile(r'\bto\b', re.I))
+    if to_elem:
+        parent = to_elem.find_parent()
+        if parent:
+            # Ищем цены слева и справа
+            prev_price = None
+            next_price = None
+            # Ищем предыдущий элемент с ценой
+            for sibling in parent.previous_siblings:
+                if hasattr(sibling, 'get_text'):
+                    txt = sibling.get_text(strip=True)
+                    if re.search(r'[£€$]\s*[\d,]+\.?\d*', txt):
+                        prev_price = txt
+                        break
+            for sibling in parent.next_siblings:
+                if hasattr(sibling, 'get_text'):
+                    txt = sibling.get_text(strip=True)
+                    if re.search(r'[£€$]\s*[\d,]+\.?\d*', txt):
+                        next_price = txt
+                        break
+            if prev_price and next_price:
+                return f"{prev_price} до {next_price}"
+    return None
+
 def extract_price_css(card):
+    # Сначала проверяем, нет ли диапазона
+    range_price = extract_range_price(card)
+    if range_price:
+        return range_price
+
     candidates = []
     selectors = ['span.s-item__price', '[data-testid="item-price"]', '.s-item__detail .s-item__price']
     for sel in selectors:
@@ -461,9 +517,8 @@ def extract_price_css(card):
         return candidates[0]
     return None
 
-# ============ ИСПРАВЛЕННАЯ ФУНКЦИЯ EXTRACT_SHIPPING (бесплатно для любых free delivery) ============
 def extract_shipping(card, item_price=None):
-    # 1. JSON-LD (структурированные данные)
+    # 1. JSON-LD
     script = card.find('script', type='application/ld+json')
     if script and script.string:
         try:
@@ -496,7 +551,7 @@ def extract_shipping(card, item_price=None):
         except:
             pass
 
-    # 2. Поиск по CSS-селекторам
+    # 2. CSS селекторы
     shipping_selectors = [
         'span.s-item__shipping', 'div.s-item__shipping',
         'span.s-item__logisticsCost', 'span.s-item__delivery',
@@ -510,29 +565,24 @@ def extract_shipping(card, item_price=None):
             text = re.sub(r'\s+', ' ', text)
             if not text:
                 continue
-            # Пропускаем элементы с действиями
             if re.search(r'(?i)(buy it now|best offer|make offer|watch|add to cart)', text):
                 continue
-            # Если в тексте есть "free" – считаем бесплатной доставкой
             if re.search(r'\bfree\b', text.lower()):
                 return "Бесплатно"
-            # Если есть символы валюты – извлекаем цену
             match = re.search(r'([£€$]\s*[\d,]+\.?\d*)', text)
             if match:
                 price_candidate = match.group(1)
                 if item_price and price_candidate == item_price:
                     continue
                 return price_candidate
-            # Если текст описывает доставку (содержит delivery/shipping) и не тривиален
             if re.search(r'(?i)(delivery|shipping)', text) and len(text) > 5:
                 if len(text) > 10 or re.search(r'\d', text):
                     return text
 
-    # 3. Поиск по всему HTML карточки (регулярные выражения)
+    # 3. Поиск по HTML
     html = str(card).lower()
     if re.search(r'free\s+delivery', html) or re.search(r'free\s+shipping', html):
         return "Бесплатно"
-    # Поиск цены доставки
     match = re.search(r'\+?\s*([£€$]\s*[\d,]+\.?\d*)\s*(delivery|shipping)', html)
     if match:
         pc = match.group(1)
@@ -543,7 +593,6 @@ def extract_shipping(card, item_price=None):
         pc = match.group(1)
         if not (item_price and pc == item_price):
             return pc
-    # Текстовые описания доставки (без цены)
     match = re.search(r'(delivery in\s+\d+[-\s]*\d*\s*(days?|weeks?|business days?|working days?))', html)
     if match:
         return match.group(1).strip()
@@ -768,14 +817,14 @@ def bot_worker():
 
 @app.route('/')
 def index():
-    return "eBay бот работает (фиксация пары, улучшено определение бесплатной доставки)"
+    return "eBay бот работает (поддержка диапазонов цен: £X до £Y)"
 
 @app.route('/health')
 def health():
     return "OK", 200
 
 if __name__ == "__main__":
-    send_telegram_message("🚀 Бот запущен (Великобритания, 'Free delivery' → Бесплатно). Интервал 60 сек, команды /stop /start")
+    send_telegram_message("🚀 Бот запущен (Великобритания, исправлен парсинг двойной цены). Интервал 60 сек, команды /stop /start")
     threading.Thread(target=telegram_listener, daemon=True).start()
     worker_thread = threading.Thread(target=bot_worker, daemon=False)
     worker_thread.start()
