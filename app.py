@@ -30,7 +30,7 @@ load_dotenv()
 EBAY_SEARCH_URL = os.getenv("EBAY_SEARCH_URL")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "30"))
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
 DATABASE_URL = os.getenv("DATABASE_URL")
 PROXY_LIST_URL = os.getenv("PROXY_LIST")
 PROXY_REFRESH_INTERVAL = 15 * 60
@@ -392,8 +392,39 @@ def is_gbp_price(text):
         return False
     return re.search(r'\d', text) is not None
 
+def extract_range_price(card):
+    """Ищет конструкцию вида £X.XX to £YY.YY и возвращает строку '£X.XX до £YY.YY', а также список значений"""
+    price_spans = card.select('span.s-card__price, span.s-item__price, [class*="price"]')
+    for i in range(len(price_spans) - 2):
+        first = price_spans[i].get_text(strip=True)
+        middle = price_spans[i+1].get_text(strip=True).lower()
+        third = price_spans[i+2].get_text(strip=True)
+        if 'to' in middle and re.search(r'[£€$]', first) and re.search(r'[£€$]', third):
+            return f"{first} до {third}"
+    # Альтернативный поиск через текст 'to'
+    to_elem = card.find(string=re.compile(r'\bto\b', re.I))
+    if to_elem:
+        parent = to_elem.find_parent()
+        if parent:
+            prev_price = None
+            next_price = None
+            for sibling in parent.previous_siblings:
+                if hasattr(sibling, 'get_text'):
+                    txt = sibling.get_text(strip=True)
+                    if re.search(r'[£€$]\s*[\d,]+\.?\d*', txt):
+                        prev_price = txt
+                        break
+            for sibling in parent.next_siblings:
+                if hasattr(sibling, 'get_text'):
+                    txt = sibling.get_text(strip=True)
+                    if re.search(r'[£€$]\s*[\d,]+\.?\d*', txt):
+                        next_price = txt
+                        break
+            if prev_price and next_price:
+                return f"{prev_price} до {next_price}"
+    return None
+
 def extract_price_jsonld(card, url=None, soup=None):
-    # Сначала попробуем найти диапазон через CSS (более надёжно)
     range_price = extract_range_price(card)
     if range_price:
         return range_price
@@ -443,54 +474,7 @@ def extract_price_jsonld(card, url=None, soup=None):
             return str(price)
     return None
 
-def extract_range_price(card):
-    """
-    Ищет конструкцию вида: £X.XX to £YY.YY внутри карточки.
-    Возвращает строку вида "£X.XX до £YY.YY" или None.
-    """
-    # Ищем все элементы с ценой (классы, содержащие s-card__price или подобные)
-    price_spans = card.select('span.s-card__price, span.s-item__price, [class*="price"]')
-    # Пройдёмся по ним, чтобы найти три подряд: цена, 'to', цена
-    for i in range(len(price_spans) - 2):
-        first = price_spans[i].get_text(strip=True)
-        middle = price_spans[i+1].get_text(strip=True).lower()
-        third = price_spans[i+2].get_text(strip=True)
-        # Проверяем, что middle содержит "to", а first и third похожи на цены
-        if 'to' in middle and re.search(r'[£€$]', first) and re.search(r'[£€$]', third):
-            # Извлекаем символ валюты из first (или third)
-            currency_match = re.search(r'([£€$])', first)
-            currency = currency_match.group(1) if currency_match else '£'
-            # Очищаем first и third от лишних пробелов, оставляем как есть
-            first_clean = first
-            third_clean = third
-            return f"{first_clean} до {third_clean}"
-    # Альтернативный поиск: ищем элемент с текстом "to" и затем ближайшие цены
-    to_elem = card.find(string=re.compile(r'\bto\b', re.I))
-    if to_elem:
-        parent = to_elem.find_parent()
-        if parent:
-            # Ищем цены слева и справа
-            prev_price = None
-            next_price = None
-            # Ищем предыдущий элемент с ценой
-            for sibling in parent.previous_siblings:
-                if hasattr(sibling, 'get_text'):
-                    txt = sibling.get_text(strip=True)
-                    if re.search(r'[£€$]\s*[\d,]+\.?\d*', txt):
-                        prev_price = txt
-                        break
-            for sibling in parent.next_siblings:
-                if hasattr(sibling, 'get_text'):
-                    txt = sibling.get_text(strip=True)
-                    if re.search(r'[£€$]\s*[\d,]+\.?\d*', txt):
-                        next_price = txt
-                        break
-            if prev_price and next_price:
-                return f"{prev_price} до {next_price}"
-    return None
-
 def extract_price_css(card):
-    # Сначала проверяем, нет ли диапазона
     range_price = extract_range_price(card)
     if range_price:
         return range_price
@@ -517,7 +501,15 @@ def extract_price_css(card):
         return candidates[0]
     return None
 
-def extract_shipping(card, item_price=None):
+def extract_shipping(card, item_price=None, range_prices=None):
+    """
+    range_prices – список строк с ценами, которые уже используются как основной диапазон (чтобы не путать с доставкой)
+    """
+    # Сначала проверяем наличие бесплатной доставки (самый высокий приоритет)
+    html = str(card).lower()
+    if re.search(r'free\s+delivery', html) or re.search(r'free\s+shipping', html):
+        return "Бесплатно"
+
     # 1. JSON-LD
     script = card.find('script', type='application/ld+json')
     if script and script.string:
@@ -533,6 +525,9 @@ def extract_shipping(card, item_price=None):
                         if isinstance(shipping, (int, float)):
                             currency = offers.get('priceCurrency', '')
                             amount = f"{currency} {shipping}" if currency else str(shipping)
+                            # Проверяем, не совпадает ли цена доставки с одной из цен диапазона
+                            if range_prices and any(amount in p or p in amount for p in range_prices):
+                                return None
                             if item_price and str(shipping) == str(item_price) and currency == 'GBP':
                                 return None
                             return amount
@@ -545,6 +540,8 @@ def extract_shipping(card, item_price=None):
                         if isinstance(shipping, (int, float)):
                             currency = first.get('priceCurrency', '')
                             amount = f"{currency} {shipping}" if currency else str(shipping)
+                            if range_prices and any(amount in p or p in amount for p in range_prices):
+                                return None
                             if item_price and str(shipping) == str(item_price) and currency == 'GBP':
                                 return None
                             return amount
@@ -572,6 +569,8 @@ def extract_shipping(card, item_price=None):
             match = re.search(r'([£€$]\s*[\d,]+\.?\d*)', text)
             if match:
                 price_candidate = match.group(1)
+                if range_prices and any(price_candidate in p or p in price_candidate for p in range_prices):
+                    continue
                 if item_price and price_candidate == item_price:
                     continue
                 return price_candidate
@@ -579,20 +578,24 @@ def extract_shipping(card, item_price=None):
                 if len(text) > 10 or re.search(r'\d', text):
                     return text
 
-    # 3. Поиск по HTML
-    html = str(card).lower()
-    if re.search(r'free\s+delivery', html) or re.search(r'free\s+shipping', html):
-        return "Бесплатно"
+    # 3. Поиск по HTML (регулярные выражения)
     match = re.search(r'\+?\s*([£€$]\s*[\d,]+\.?\d*)\s*(delivery|shipping)', html)
     if match:
         pc = match.group(1)
-        if not (item_price and pc == item_price):
-            return pc
+        if range_prices and any(pc in p or p in pc for p in range_prices):
+            pass
+        else:
+            if not (item_price and pc == item_price):
+                return pc
     match = re.search(r'shipping:\s*([£€$]\s*[\d,]+\.?\d*)', html)
     if match:
         pc = match.group(1)
-        if not (item_price and pc == item_price):
-            return pc
+        if range_prices and any(pc in p or p in pc for p in range_prices):
+            pass
+        else:
+            if not (item_price and pc == item_price):
+                return pc
+    # Текстовые описания
     match = re.search(r'(delivery in\s+\d+[-\s]*\d*\s*(days?|weeks?|business days?|working days?))', html)
     if match:
         return match.group(1).strip()
@@ -687,9 +690,17 @@ def parse_ebay_listings(html, max_items=MAX_ITEMS):
             if not title:
                 continue
         price = extract_price_jsonld(card, url, soup) or extract_price_css(card)
+        # Если цена является диапазоном, извлечём обе части для исключения из доставки
+        range_prices = []
+        if price and ' до ' in price:
+            # Разделяем по ' до '
+            parts = price.split(' до ')
+            if len(parts) == 2:
+                range_prices = [parts[0].strip(), parts[1].strip()]
         if price and not is_gbp_price(price):
             price = None
-        shipping = extract_shipping(card, item_price=price)
+        # Передаём в extract_shipping список цен диапазона
+        shipping = extract_shipping(card, item_price=price, range_prices=range_prices)
         best_offer = extract_best_offer(card)
         auction = extract_auction(card)
         items[item_id] = {
@@ -808,7 +819,7 @@ def bot_worker():
             continue
         try:
             check_and_send_new_items()
-            wait = max(5, CHECK_INTERVAL + random.uniform(-15, 15))
+            wait = max(60, CHECK_INTERVAL + random.uniform(-30, 60))
             logging.info(f"Следующая проверка через {wait:.0f} секунд.")
             time.sleep(wait)
         except Exception as e:
@@ -817,14 +828,14 @@ def bot_worker():
 
 @app.route('/')
 def index():
-    return "eBay бот работает (поддержка диапазонов цен: £X до £Y)"
+    return "eBay бот работает (исправлено определение доставки при диапазонной цене)"
 
 @app.route('/health')
 def health():
     return "OK", 200
 
 if __name__ == "__main__":
-    send_telegram_message("🚀 Бот запущен (Великобритания, исправлен парсинг двойной цены). Интервал 60 сек, команды /stop /start")
+    send_telegram_message("🚀 Бот запущен (Великобритания, доставка не путается с диапазоном цен). Интервал 60 сек, команды /stop /start")
     threading.Thread(target=telegram_listener, daemon=True).start()
     worker_thread = threading.Thread(target=bot_worker, daemon=False)
     worker_thread.start()
