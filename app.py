@@ -393,7 +393,6 @@ def is_gbp_price(text):
     return re.search(r'\d', text) is not None
 
 def extract_range_price(card):
-    """Ищет конструкцию вида £X.XX to £YY.YY и возвращает строку '£X.XX до £YY.YY', а также список значений"""
     price_spans = card.select('span.s-card__price, span.s-item__price, [class*="price"]')
     for i in range(len(price_spans) - 2):
         first = price_spans[i].get_text(strip=True)
@@ -401,7 +400,6 @@ def extract_range_price(card):
         third = price_spans[i+2].get_text(strip=True)
         if 'to' in middle and re.search(r'[£€$]', first) and re.search(r'[£€$]', third):
             return f"{first} до {third}"
-    # Альтернативный поиск через текст 'to'
     to_elem = card.find(string=re.compile(r'\bto\b', re.I))
     if to_elem:
         parent = to_elem.find_parent()
@@ -502,15 +500,10 @@ def extract_price_css(card):
     return None
 
 def extract_shipping(card, item_price=None, range_prices=None):
-    """
-    range_prices – список строк с ценами, которые уже используются как основной диапазон (чтобы не путать с доставкой)
-    """
-    # Сначала проверяем наличие бесплатной доставки (самый высокий приоритет)
-    html = str(card).lower()
-    if re.search(r'free\s+delivery', html) or re.search(r'free\s+shipping', html):
+    html_lower = str(card).lower()
+    if re.search(r'free\s+delivery', html_lower) or re.search(r'free\s+shipping', html_lower):
         return "Бесплатно"
 
-    # 1. JSON-LD
     script = card.find('script', type='application/ld+json')
     if script and script.string:
         try:
@@ -525,7 +518,6 @@ def extract_shipping(card, item_price=None, range_prices=None):
                         if isinstance(shipping, (int, float)):
                             currency = offers.get('priceCurrency', '')
                             amount = f"{currency} {shipping}" if currency else str(shipping)
-                            # Проверяем, не совпадает ли цена доставки с одной из цен диапазона
                             if range_prices and any(amount in p or p in amount for p in range_prices):
                                 return None
                             if item_price and str(shipping) == str(item_price) and currency == 'GBP':
@@ -548,7 +540,6 @@ def extract_shipping(card, item_price=None, range_prices=None):
         except:
             pass
 
-    # 2. CSS селекторы
     shipping_selectors = [
         'span.s-item__shipping', 'div.s-item__shipping',
         'span.s-item__logisticsCost', 'span.s-item__delivery',
@@ -578,8 +569,7 @@ def extract_shipping(card, item_price=None, range_prices=None):
                 if len(text) > 10 or re.search(r'\d', text):
                     return text
 
-    # 3. Поиск по HTML (регулярные выражения)
-    match = re.search(r'\+?\s*([£€$]\s*[\d,]+\.?\d*)\s*(delivery|shipping)', html)
+    match = re.search(r'\+?\s*([£€$]\s*[\d,]+\.?\d*)\s*(delivery|shipping)', html_lower)
     if match:
         pc = match.group(1)
         if range_prices and any(pc in p or p in pc for p in range_prices):
@@ -587,7 +577,7 @@ def extract_shipping(card, item_price=None, range_prices=None):
         else:
             if not (item_price and pc == item_price):
                 return pc
-    match = re.search(r'shipping:\s*([£€$]\s*[\d,]+\.?\d*)', html)
+    match = re.search(r'shipping:\s*([£€$]\s*[\d,]+\.?\d*)', html_lower)
     if match:
         pc = match.group(1)
         if range_prices and any(pc in p or p in pc for p in range_prices):
@@ -595,14 +585,13 @@ def extract_shipping(card, item_price=None, range_prices=None):
         else:
             if not (item_price and pc == item_price):
                 return pc
-    # Текстовые описания
-    match = re.search(r'(delivery in\s+\d+[-\s]*\d*\s*(days?|weeks?|business days?|working days?))', html)
+    match = re.search(r'(delivery in\s+\d+[-\s]*\d*\s*(days?|weeks?|business days?|working days?))', html_lower)
     if match:
         return match.group(1).strip()
-    match = re.search(r'(delivery time\s*:\s*[\w\s\d-]+)', html)
+    match = re.search(r'(delivery time\s*:\s*[\w\s\d-]+)', html_lower)
     if match:
         return match.group(1).strip()
-    match = re.search(r'(shipping in\s+\d+[-\s]*\d*\s*(days?|weeks?))', html)
+    match = re.search(r'(shipping in\s+\d+[-\s]*\d*\s*(days?|weeks?))', html_lower)
     if match:
         return match.group(1).strip()
     return None
@@ -656,6 +645,34 @@ def extract_auction(card):
         return True
     return False
 
+def extract_buy_it_now_info(card):
+    """
+    Проверяет наличие надписи "Buy It Now" в карточке.
+    Если есть, возвращает цену Buy It Now (вторую цену в span.s-card__price).
+    Возвращает (has_buy_it_now, price) где has_buy_it_now - bool, price - строка или None.
+    """
+    buy_it_now_elem = card.find(string=re.compile(r'Buy It Now', re.I))
+    if not buy_it_now_elem:
+        return False, None
+    # Ищем все цены в карточке (обычно первая - цена аукциона, вторая - Buy It Now)
+    price_spans = card.select('span.s-card__price, span.s-item__price, [class*="price"]')
+    # Нас интересует вторая цена, если она есть
+    if len(price_spans) >= 2:
+        second_price = price_spans[1].get_text(strip=True)
+        # Проверяем, что это похоже на цену
+        if re.search(r'[£€$]', second_price):
+            return True, second_price
+    # Если не нашли вторую цену, пробуем найти цену рядом с элементом "Buy It Now"
+    parent = buy_it_now_elem.find_parent()
+    if parent:
+        # Ищем ближайший span с ценой после элемента
+        price_elem = parent.find_next('span', class_=re.compile(r'price'))
+        if price_elem:
+            price_text = price_elem.get_text(strip=True)
+            if re.search(r'[£€$]', price_text):
+                return True, price_text
+    return True, None  # есть надпись, но цену не нашли
+
 def parse_ebay_listings(html, max_items=MAX_ITEMS):
     if not html:
         return {}
@@ -690,26 +707,27 @@ def parse_ebay_listings(html, max_items=MAX_ITEMS):
             if not title:
                 continue
         price = extract_price_jsonld(card, url, soup) or extract_price_css(card)
-        # Если цена является диапазоном, извлечём обе части для исключения из доставки
         range_prices = []
         if price and ' до ' in price:
-            # Разделяем по ' до '
             parts = price.split(' до ')
             if len(parts) == 2:
                 range_prices = [parts[0].strip(), parts[1].strip()]
         if price and not is_gbp_price(price):
             price = None
-        # Передаём в extract_shipping список цен диапазона
         shipping = extract_shipping(card, item_price=price, range_prices=range_prices)
         best_offer = extract_best_offer(card)
         auction = extract_auction(card)
+        # Определяем наличие Buy It Now
+        has_bin, bin_price = extract_buy_it_now_info(card)
         items[item_id] = {
             'url': url,
             'title': title,
             'price': price,
             'shipping': shipping,
             'best_offer': best_offer,
-            'auction': auction
+            'auction': auction,
+            'has_buy_it_now': has_bin,
+            'buy_it_now_price': bin_price
         }
         processed += 1
     logging.info(f"Обработано товаров: {len(items)}")
@@ -734,6 +752,8 @@ def parse_ebay_listings_fallback(soup, max_items):
         shipping = None
         best_offer = False
         auction = False
+        has_bin = False
+        bin_price = None
         parent = link.parent
         for _ in range(5):
             if parent:
@@ -743,7 +763,8 @@ def parse_ebay_listings_fallback(soup, max_items):
                 shipping = extract_shipping(parent, item_price=price)
                 best_offer = extract_best_offer(parent)
                 auction = extract_auction(parent)
-                if price or shipping or best_offer or auction:
+                has_bin, bin_price = extract_buy_it_now_info(parent)
+                if price or shipping or best_offer or auction or has_bin:
                     break
                 parent = parent.parent
         items[item_id] = {
@@ -752,7 +773,9 @@ def parse_ebay_listings_fallback(soup, max_items):
             'price': price,
             'shipping': shipping,
             'best_offer': best_offer,
-            'auction': auction
+            'auction': auction,
+            'has_buy_it_now': has_bin,
+            'buy_it_now_price': bin_price
         }
     return items
 
@@ -779,7 +802,7 @@ def check_and_send_new_items():
     for item_id, data in current.items():
         if item_id not in seen:
             new.append({'id': item_id, **data})
-            logging.info(f"НОВЫЙ: {data['title'][:50]}... цена: {data['price']}, доставка: {data.get('shipping')}, best_offer: {data.get('best_offer')}, auction: {data.get('auction')}")
+            logging.info(f"НОВЫЙ: {data['title'][:50]}... цена: {data['price']}, доставка: {data.get('shipping')}, best_offer: {data.get('best_offer')}, auction: {data.get('auction')}, has_buy_it_now: {data.get('has_buy_it_now')}")
     if new:
         for item in new:
             msg = f"🇬🇧 <b>НОВЫЙ ТОВАР Англия</b> 🇬🇧\n\n<b>{item['title']}</b>\n\n"
@@ -793,8 +816,14 @@ def check_and_send_new_items():
                 msg += f"🚚 Доставка: не указана\n"
             if item.get('best_offer', False):
                 msg += f"✅ Сделать предложение (Best Offer)\n"
+            # Добавляем информацию об аукционе с учётом Buy It Now
             if item.get('auction', False):
-                msg += f"⏰ Аукцион\n"
+                if item.get('has_buy_it_now', False) and item.get('buy_it_now_price'):
+                    msg += f"⏰ Аукцион / Buy It Now цена: {item['buy_it_now_price']}\n"
+                elif item.get('has_buy_it_now', False):
+                    msg += f"⏰ Аукцион / Buy It Now\n"
+                else:
+                    msg += f"⏰ Аукцион\n"
             msg += f"\n🔗 <a href='{item['url']}'>Ссылка на товар</a>"
             send_telegram_message(msg)
             add_seen_ids_batch([item['id']])
@@ -828,14 +857,14 @@ def bot_worker():
 
 @app.route('/')
 def index():
-    return "eBay бот работает (исправлено определение доставки при диапазонной цене)"
+    return "eBay бот работает (аукцион с Buy It Now)"
 
 @app.route('/health')
 def health():
     return "OK", 200
 
 if __name__ == "__main__":
-    send_telegram_message("🚀 Бот запущен (Великобритания, доставка не путается с диапазоном цен). Интервал 60 сек, команды /stop /start")
+    send_telegram_message("🚀 Бот запущен (Великобритания, добавлена поддержка Buy It Now в аукционах). Интервал 60 сек, команды /stop /start")
     threading.Thread(target=telegram_listener, daemon=True).start()
     worker_thread = threading.Thread(target=bot_worker, daemon=False)
     worker_thread.start()
