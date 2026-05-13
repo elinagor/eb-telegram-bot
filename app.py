@@ -499,38 +499,43 @@ def extract_price_css(card):
         return candidates[0]
     return None
 
-# ============ ИСПРАВЛЕННАЯ ФУНКЦИЯ EXTRACT_SHIPPING ============
+# ============ ИСПРАВЛЕННАЯ ФУНКЦИЯ EXTRACT_SHIPPING (ПРИОРИТЕТ ПО DELIVERY) ============
 def extract_shipping(card, item_price=None, range_prices=None):
-    # 1. Сначала проверяем наличие бесплатной доставки
+    """
+    Извлекает информацию о доставке.
+    Приоритет: элемент .su-styled-text.secondary.large, содержащий 'delivery' или 'shipping'.
+    Затем JSON-LD, общие CSS-селекторы, регулярные выражения.
+    """
+    # 1. Самый высокий приоритет: ищем элемент с классом .su-styled-text.secondary.large,
+    #    который содержит слова delivery или shipping (игнорируя регистр)
+    for elem in card.select('.su-styled-text.secondary.large'):
+        text = elem.get_text(strip=True)
+        text_lower = text.lower()
+        if 'delivery' in text_lower or 'shipping' in text_lower:
+            # Если есть слово free
+            if 'free' in text_lower:
+                return "Бесплатно"
+            # Извлекаем цену: может быть вида "+£3.38 delivery" или "£3.38 delivery"
+            match = re.search(r'([+]\s*)?([£€$]\s*[\d,]+\.?\d*)', text)
+            if match:
+                price_candidate = match.group(2)
+                # Проверяем, что цена доставки не совпадает с ценой товара (основной или Buy It Now)
+                if range_prices and any(price_candidate in p or p in price_candidate for p in range_prices):
+                    # Если совпадает с ценой из диапазона (например, с ценой Buy It Now) – пропускаем
+                    pass
+                elif item_price and price_candidate == item_price:
+                    pass
+                else:
+                    return price_candidate
+            # Если цена не найдена, но текст не пустой – возвращаем сам текст (например, "Free delivery")
+            if len(text) > 3:
+                return text
+            # Если ничего не подошло, продолжаем поиск
+
+    # 2. Проверка на бесплатную доставку в любом месте карточки
     html_lower = str(card).lower()
     if re.search(r'free\s+delivery', html_lower) or re.search(r'free\s+shipping', html_lower):
         return "Бесплатно"
-
-    # 2. Ищем элемент с классом .su-styled-text.secondary.large, который содержит 'delivery' или 'shipping' (приоритет)
-    delivery_elem = None
-    for elem in card.select('.su-styled-text.secondary.large'):
-        text = elem.get_text(strip=True).lower()
-        if 'delivery' in text or 'shipping' in text:
-            delivery_elem = elem
-            break
-    if delivery_elem:
-        text = delivery_elem.get_text(strip=True)
-        # Извлекаем цену с символом £ или € или $, возможно с плюсом
-        match = re.search(r'([+]\s*)?([£€$]\s*[\d,]+\.?\d*)', text)
-        if match:
-            price_candidate = match.group(2)
-            # Проверяем, что это не совпадает с основной ценой или ценой диапазона
-            if range_prices and any(price_candidate in p or p in price_candidate for p in range_prices):
-                pass
-            elif item_price and price_candidate == item_price:
-                pass
-            else:
-                return price_candidate
-        # Если цену не нашли, но есть текст с delivery - возвращаем сам текст (например, "Free delivery")
-        if 'free' in text.lower():
-            return "Бесплатно"
-        if len(text) > 3:
-            return text
 
     # 3. JSON-LD (структурированные данные)
     script = card.find('script', type='application/ld+json')
@@ -571,7 +576,7 @@ def extract_shipping(card, item_price=None, range_prices=None):
         except:
             pass
 
-    # 4. CSS селекторы (общие)
+    # 4. CSS-селекторы (общие, но теперь уже после приоритетного поиска)
     shipping_selectors = [
         'span.s-item__shipping', 'div.s-item__shipping',
         'span.s-item__logisticsCost', 'span.s-item__delivery',
@@ -601,7 +606,7 @@ def extract_shipping(card, item_price=None, range_prices=None):
                 if len(text) > 10 or re.search(r'\d', text):
                     return text
 
-    # 5. Поиск по HTML (регулярные выражения)
+    # 5. Регулярные выражения по всему HTML
     match = re.search(r'\+?\s*([£€$]\s*[\d,]+\.?\d*)\s*(delivery|shipping)', html_lower)
     if match:
         pc = match.group(1)
@@ -879,14 +884,14 @@ def bot_worker():
 
 @app.route('/')
 def index():
-    return "eBay бот работает (исправлено определение доставки при наличии Buy It Now)"
+    return "eBay бот работает (доставка теперь точно берётся из элемента с delivery)"
 
 @app.route('/health')
 def health():
     return "OK", 200
 
 if __name__ == "__main__":
-    send_telegram_message("🚀 Бот запущен (Великобритания, доставка берётся из элемента с delivery). Интервал 60 сек, команды /stop /start")
+    send_telegram_message("🚀 Бот запущен (Великобритания, исправлено определение доставки для аукционов с Buy It Now). Интервал 60 сек, команды /stop /start")
     threading.Thread(target=telegram_listener, daemon=True).start()
     worker_thread = threading.Thread(target=bot_worker, daemon=False)
     worker_thread.start()
