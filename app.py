@@ -38,6 +38,8 @@ PROXY_REFRESH_INTERVAL = 15 * 60
 MAX_ITEMS = 20
 MAX_SEARCH_ATTEMPTS = 20
 RETRY_DELAY = 2
+GBP_TO_UAH = 60
+EXTRA_DELIVERY_COST = 120
 
 if '?' in EBAY_SEARCH_URL:
     EBAY_SEARCH_URL += '&LH_PrefLoc=3&_ipg=240&_sop=10'
@@ -499,45 +501,29 @@ def extract_price_css(card):
         return candidates[0]
     return None
 
-# ============ ИСПРАВЛЕННАЯ ФУНКЦИЯ EXTRACT_SHIPPING (ПРИОРИТЕТ ПО DELIVERY) ============
 def extract_shipping(card, item_price=None, range_prices=None):
-    """
-    Извлекает информацию о доставке.
-    Приоритет: элемент .su-styled-text.secondary.large, содержащий 'delivery' или 'shipping'.
-    Затем JSON-LD, общие CSS-селекторы, регулярные выражения.
-    """
-    # 1. Самый высокий приоритет: ищем элемент с классом .su-styled-text.secondary.large,
-    #    который содержит слова delivery или shipping (игнорируя регистр)
     for elem in card.select('.su-styled-text.secondary.large'):
         text = elem.get_text(strip=True)
         text_lower = text.lower()
         if 'delivery' in text_lower or 'shipping' in text_lower:
-            # Если есть слово free
             if 'free' in text_lower:
                 return "Бесплатно"
-            # Извлекаем цену: может быть вида "+£3.38 delivery" или "£3.38 delivery"
             match = re.search(r'([+]\s*)?([£€$]\s*[\d,]+\.?\d*)', text)
             if match:
                 price_candidate = match.group(2)
-                # Проверяем, что цена доставки не совпадает с ценой товара (основной или Buy It Now)
                 if range_prices and any(price_candidate in p or p in price_candidate for p in range_prices):
-                    # Если совпадает с ценой из диапазона (например, с ценой Buy It Now) – пропускаем
                     pass
                 elif item_price and price_candidate == item_price:
                     pass
                 else:
                     return price_candidate
-            # Если цена не найдена, но текст не пустой – возвращаем сам текст (например, "Free delivery")
             if len(text) > 3:
                 return text
-            # Если ничего не подошло, продолжаем поиск
 
-    # 2. Проверка на бесплатную доставку в любом месте карточки
     html_lower = str(card).lower()
     if re.search(r'free\s+delivery', html_lower) or re.search(r'free\s+shipping', html_lower):
         return "Бесплатно"
 
-    # 3. JSON-LD (структурированные данные)
     script = card.find('script', type='application/ld+json')
     if script and script.string:
         try:
@@ -576,7 +562,6 @@ def extract_shipping(card, item_price=None, range_prices=None):
         except:
             pass
 
-    # 4. CSS-селекторы (общие, но теперь уже после приоритетного поиска)
     shipping_selectors = [
         'span.s-item__shipping', 'div.s-item__shipping',
         'span.s-item__logisticsCost', 'span.s-item__delivery',
@@ -606,7 +591,6 @@ def extract_shipping(card, item_price=None, range_prices=None):
                 if len(text) > 10 or re.search(r'\d', text):
                     return text
 
-    # 5. Регулярные выражения по всему HTML
     match = re.search(r'\+?\s*([£€$]\s*[\d,]+\.?\d*)\s*(delivery|shipping)', html_lower)
     if match:
         pc = match.group(1)
@@ -623,7 +607,6 @@ def extract_shipping(card, item_price=None, range_prices=None):
         else:
             if not (item_price and pc == item_price):
                 return pc
-    # Текстовые описания
     match = re.search(r'(delivery in\s+\d+[-\s]*\d*\s*(days?|weeks?|business days?|working days?))', html_lower)
     if match:
         return match.group(1).strip()
@@ -819,6 +802,43 @@ def perform_initial_snapshot():
     logging.info(f"Снимок: {len(items)} товаров")
     return True
 
+def calculate_total_price(price_str, shipping_str, buy_it_now_price_str=None, is_auction=False):
+    """
+    Возвращает итоговую сумму в гривнах (int) или None, если нельзя вычислить.
+    price_str: строка вида "£11.85" или None/False
+    shipping_str: строка вида "£1.90" или "Бесплатно" или None
+    buy_it_now_price_str: строка вида "£5.36" или None
+    is_auction: bool
+    """
+    # Если цена не указана или это диапазон - не считаем
+    if not price_str or price_str == "Цена не указана (не GBP)" or "до" in price_str:
+        return None
+
+    # Извлекаем число из цены (используем ту, что для расчёта)
+    price_num = None
+    # Для аукциона с Buy It Now используем цену Buy It Now
+    if is_auction and buy_it_now_price_str:
+        match = re.search(r'([\d,]+\.?\d*)', buy_it_now_price_str.replace(',', ''))
+        if match:
+            price_num = float(match.group(1))
+    if price_num is None:
+        match = re.search(r'([\d,]+\.?\d*)', price_str.replace(',', ''))
+        if match:
+            price_num = float(match.group(1))
+    if price_num is None:
+        return None
+
+    # Извлекаем стоимость доставки
+    shipping_num = 0.0
+    if shipping_str and shipping_str != "Бесплатно" and shipping_str != "не указана" and shipping_str is not None:
+        match = re.search(r'([\d,]+\.?\d*)', shipping_str.replace(',', ''))
+        if match:
+            shipping_num = float(match.group(1))
+
+    total_gbp = price_num + shipping_num
+    total_uah = int(total_gbp * GBP_TO_UAH) + EXTRA_DELIVERY_COST
+    return total_uah
+
 def check_and_send_new_items():
     seen = get_seen_ids()
     logging.info(f"В базе {len(seen)} товаров")
@@ -851,7 +871,16 @@ def check_and_send_new_items():
                     msg += f"⏰ Аукцион / Buy It Now\n"
                 else:
                     msg += f"⏰ Аукцион\n"
-            msg += f"\n🔗 <a href='{item['url']}'>Ссылка на товар</a>"
+            # Добавляем итоговую сумму, если возможно
+            total = calculate_total_price(
+                item['price'],
+                item['shipping'],
+                item.get('buy_it_now_price'),
+                is_auction=item.get('auction', False)
+            )
+            if total is not None:
+                msg += f"\n<b>За все (с доставкой в Украину): {total}грн</b>"
+            msg += f"\n\n🔗 <a href='{item['url']}'>Ссылка на товар</a>"
             send_telegram_message(msg)
             add_seen_ids_batch([item['id']])
             time.sleep(1)
@@ -884,14 +913,14 @@ def bot_worker():
 
 @app.route('/')
 def index():
-    return "eBay бот работает (доставка теперь точно берётся из элемента с delivery)"
+    return "eBay бот работает (добавлен подсчёт итоговой суммы в гривнах)"
 
 @app.route('/health')
 def health():
     return "OK", 200
 
 if __name__ == "__main__":
-    send_telegram_message("🚀 Бот запущен (Великобритания, исправлено определение доставки для аукционов с Buy It Now). Интервал 60 сек, команды /stop /start")
+    send_telegram_message("🚀 Бот запущен (Великобритания, добавлен расчёт итоговой суммы с доставкой в Украину). Интервал 60 сек, команды /stop /start")
     threading.Thread(target=telegram_listener, daemon=True).start()
     worker_thread = threading.Thread(target=bot_worker, daemon=False)
     worker_thread.start()
