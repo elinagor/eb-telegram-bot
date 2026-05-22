@@ -805,16 +805,10 @@ def perform_initial_snapshot():
 def calculate_total_price(price_str, shipping_str, buy_it_now_price_str=None, is_auction=False):
     """
     Возвращает итоговую сумму в гривнах (int) или None, если нельзя вычислить.
-    price_str: строка вида "£11.85" или None/False
-    shipping_str: строка вида "£1.90" или "Бесплатно" или None
-    buy_it_now_price_str: строка вида "£5.36" или None
-    is_auction: bool
     """
-    # Если цена не указана или это диапазон - не считаем
     if not price_str or price_str == "Цена не указана (не GBP)" or "до" in price_str:
         return None
 
-    # Извлекаем число из цены (используем ту, что для расчёта)
     price_num = None
     # Для аукциона с Buy It Now используем цену Buy It Now
     if is_auction and buy_it_now_price_str:
@@ -828,7 +822,6 @@ def calculate_total_price(price_str, shipping_str, buy_it_now_price_str=None, is
     if price_num is None:
         return None
 
-    # Извлекаем стоимость доставки
     shipping_num = 0.0
     if shipping_str and shipping_str != "Бесплатно" and shipping_str != "не указана" and shipping_str is not None:
         match = re.search(r'([\d,]+\.?\d*)', shipping_str.replace(',', ''))
@@ -871,15 +864,17 @@ def check_and_send_new_items():
                     msg += f"⏰ Аукцион / Buy It Now\n"
                 else:
                     msg += f"⏰ Аукцион\n"
-            # Добавляем итоговую сумму, если возможно
-            total = calculate_total_price(
-                item['price'],
-                item['shipping'],
-                item.get('buy_it_now_price'),
-                is_auction=item.get('auction', False)
-            )
-            if total is not None:
-                msg += f"\n<b>За все (с доставкой в Украину): {total}грн</b>"
+            # Добавляем итоговую сумму, только если:
+            # - товар НЕ аукцион, ИЛИ (аукцион И есть Buy It Now)
+            if not item.get('auction', False) or (item.get('auction', False) and item.get('has_buy_it_now', False)):
+                total = calculate_total_price(
+                    item['price'],
+                    item['shipping'],
+                    item.get('buy_it_now_price'),
+                    is_auction=item.get('auction', False)
+                )
+                if total is not None:
+                    msg += f"\nЗа все (с доставкой в Украину): <b>{total}грн</b>"
             msg += f"\n\n🔗 <a href='{item['url']}'>Ссылка на товар</a>"
             send_telegram_message(msg)
             add_seen_ids_batch([item['id']])
@@ -913,14 +908,14 @@ def bot_worker():
 
 @app.route('/')
 def index():
-    return "eBay бот работает (добавлен подсчёт итоговой суммы в гривнах)"
+    return "eBay бот работает (итоговая сумма только для Buy It Now аукционов)"
 
 @app.route('/health')
 def health():
     return "OK", 200
 
 if __name__ == "__main__":
-    send_telegram_message("🚀 Бот запущен (Великобритания, добавлен расчёт итоговой суммы с доставкой в Украину). Интервал 60 сек, команды /stop /start")
+    send_telegram_message("🚀 Бот запущен (Великобритания, исправлено условие показа итоговой суммы). Интервал 60 сек, команды /stop /start")
     threading.Thread(target=telegram_listener, daemon=True).start()
     worker_thread = threading.Thread(target=bot_worker, daemon=False)
     worker_thread.start()
