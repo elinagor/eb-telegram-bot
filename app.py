@@ -899,7 +899,7 @@ def bot_worker():
             continue
         try:
             check_and_send_new_items()
-            wait = max(60, CHECK_INTERVAL + random.uniform(-30, 60))
+            wait = CHECK_INTERVAL + random.uniform(0, 12)   # CHECK_INTERVAL должен быть 60
             logging.info(f"Следующая проверка через {wait:.0f} секунд.")
             time.sleep(wait)
         except Exception as e:
