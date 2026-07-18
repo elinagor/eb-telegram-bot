@@ -30,10 +30,10 @@ load_dotenv()
 EBAY_SEARCH_URL = os.getenv("EBAY_SEARCH_URL")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "40"))  # базовый интервал, но теперь не используется
 DATABASE_URL = os.getenv("DATABASE_URL")
 PROXY_LIST_URL = os.getenv("PROXY_LIST")
-PROXY_REFRESH_INTERVAL = 15 * 60
+PROXY_REFRESH_INTERVAL = 5 * 60
 
 MAX_ITEMS = 20
 MAX_SEARCH_ATTEMPTS = 20
@@ -284,8 +284,10 @@ def fetch_ebay_html_with_fixed_pair():
                 fixed_profile = None
                 fixed_profile_failures = 0
             else:
+                # Возвращаем None, но не делаем паузу — это будет обработано в основном цикле
                 return None
 
+    # Поиск новой рабочей пары
     for attempt in range(1, MAX_SEARCH_ATTEMPTS + 1):
         proxy = proxy_manager.get_random_proxy()
         profile = get_random_profile()
@@ -297,8 +299,7 @@ def fetch_ebay_html_with_fixed_pair():
             fixed_profile = profile
             fixed_profile_failures = 0
             return html
-        else:
-            continue
+        # если не успешно, продолжаем
 
     logging.error("❌ Не удалось найти рабочую пару после всех попыток")
     return None
@@ -803,14 +804,10 @@ def perform_initial_snapshot():
     return True
 
 def calculate_total_price(price_str, shipping_str, buy_it_now_price_str=None, is_auction=False):
-    """
-    Возвращает итоговую сумму в гривнах (int) или None, если нельзя вычислить.
-    """
     if not price_str or price_str == "Цена не указана (не GBP)" or "до" in price_str:
         return None
 
     price_num = None
-    # Для аукциона с Buy It Now используем цену Buy It Now
     if is_auction and buy_it_now_price_str:
         match = re.search(r'([\d,]+\.?\d*)', buy_it_now_price_str.replace(',', ''))
         if match:
@@ -833,11 +830,13 @@ def calculate_total_price(price_str, shipping_str, buy_it_now_price_str=None, is
     return total_uah
 
 def check_and_send_new_items():
+    """Возвращает True, если страница успешно загружена и обработана, иначе False."""
     seen = get_seen_ids()
     logging.info(f"В базе {len(seen)} товаров")
     html = fetch_ebay_html_with_retry()
     if not html:
-        return
+        logging.warning("Не удалось загрузить страницу, проверка пропущена")
+        return False
     current = parse_ebay_listings(html)
     new = []
     for item_id, data in current.items():
@@ -864,8 +863,6 @@ def check_and_send_new_items():
                     msg += f"⏰ Аукцион / Buy It Now\n"
                 else:
                     msg += f"⏰ Аукцион\n"
-            # Добавляем итоговую сумму, только если:
-            # - товар НЕ аукцион, ИЛИ (аукцион И есть Buy It Now)
             if not item.get('auction', False) or (item.get('auction', False) and item.get('has_buy_it_now', False)):
                 total = calculate_total_price(
                     item['price'],
@@ -881,6 +878,7 @@ def check_and_send_new_items():
             time.sleep(1)
     else:
         logging.info("Новых нет")
+    return True
 
 def bot_worker():
     global is_paused
@@ -898,24 +896,30 @@ def bot_worker():
             time.sleep(2)
             continue
         try:
-            check_and_send_new_items()
-            wait = CHECK_INTERVAL + random.uniform(0, 12)   # CHECK_INTERVAL должен быть 60
-            logging.info(f"Следующая проверка через {wait:.0f} секунд.")
+            success = check_and_send_new_items()
+            if success:
+                # При успешной загрузке ждём случайное время от 60 до 72 секунд
+                wait = random.uniform(40, 52)
+                logging.info(f"✅ Успешная проверка. Следующая через {wait:.0f} секунд.")
+            else:
+                # При ошибке ждём короткую паузу (2–5 секунд) и продолжаем
+                wait = random.uniform(2, 5)
+                logging.info(f"⚠️ Ошибка при проверке. Повтор через {wait:.1f} секунд.")
             time.sleep(wait)
         except Exception as e:
             logging.error(f"Ошибка в основном цикле: {e}", exc_info=True)
-            time.sleep(120)
+            time.sleep(5)
 
 @app.route('/')
 def index():
-    return "eBay бот работает (итоговая сумма только для Buy It Now аукционов)"
+    return "eBay бот работает (динамическая пауза в зависимости от успеха)"
 
 @app.route('/health')
 def health():
     return "OK", 200
 
 if __name__ == "__main__":
-    send_telegram_message("🚀 Бот запущен (Великобритания, исправлено условие показа итоговой суммы). Интервал 60 сек, команды /stop /start")
+    send_telegram_message("🚀 Бот запущен (Великобритания, улучшена логика пауз при ошибках). Интервал 40-52 сек, команды /stop /start")
     threading.Thread(target=telegram_listener, daemon=True).start()
     worker_thread = threading.Thread(target=bot_worker, daemon=False)
     worker_thread.start()
