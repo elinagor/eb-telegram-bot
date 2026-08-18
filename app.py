@@ -30,13 +30,13 @@ load_dotenv()
 EBAY_SEARCH_URL = os.getenv("EBAY_SEARCH_URL")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "20"))  # базовый интервал, но теперь не используется
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "10"))  # базовый интервал, но теперь не используется
 DATABASE_URL = os.getenv("DATABASE_URL")
 PROXY_LIST_URL = os.getenv("PROXY_LIST")
 PROXY_REFRESH_INTERVAL = 5 * 60
 
 MAX_ITEMS = 20
-MAX_SEARCH_ATTEMPTS = 20
+MAX_SEARCH_ATTEMPTS = 25
 RETRY_DELAY = 2
 GBP_TO_UAH = 60
 EXTRA_DELIVERY_COST = 120
@@ -899,7 +899,7 @@ def bot_worker():
             success = check_and_send_new_items()
             if success:
                 # При успешной загрузке ждём случайное время от 60 до 72 секунд
-                wait = random.uniform(20, 32)
+                wait = random.uniform(10, 22)
                 logging.info(f"✅ Успешная проверка. Следующая через {wait:.0f} секунд.")
             else:
                 # При ошибке ждём короткую паузу (2–5 секунд) и продолжаем
@@ -919,7 +919,7 @@ def health():
     return "OK", 200
 
 if __name__ == "__main__":
-    send_telegram_message("🚀 Бот запущен (Великобритания, улучшена логика пауз при ошибках). Интервал 20-32 сек, команды /stop /start")
+    send_telegram_message("🚀 Бот запущен (Великобритания, улучшена логика пауз при ошибках). Интервал 10-22 сек, команды /stop /start")
     threading.Thread(target=telegram_listener, daemon=True).start()
     worker_thread = threading.Thread(target=bot_worker, daemon=False)
     worker_thread.start()
