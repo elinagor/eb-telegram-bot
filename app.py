@@ -36,7 +36,7 @@ PROXY_LIST_URL = os.getenv("PROXY_LIST")
 PROXY_REFRESH_INTERVAL = 5 * 60
 
 MAX_ITEMS = 20
-MAX_SEARCH_ATTEMPTS = 25
+MAX_SEARCH_ATTEMPTS = 50
 RETRY_DELAY = 2
 GBP_TO_UAH = 60
 EXTRA_DELIVERY_COST = 120
@@ -899,7 +899,7 @@ def bot_worker():
             success = check_and_send_new_items()
             if success:
                 # При успешной загрузке ждём случайное время от 60 до 72 секунд
-                wait = random.uniform(10, 22)
+                wait = random.uniform(40, 52)
                 logging.info(f"✅ Успешная проверка. Следующая через {wait:.0f} секунд.")
             else:
                 # При ошибке ждём короткую паузу (2–5 секунд) и продолжаем
