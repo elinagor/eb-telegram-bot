@@ -36,7 +36,7 @@ PROXY_LIST_URL = os.getenv("PROXY_LIST")
 PROXY_REFRESH_INTERVAL = 5 * 60
 
 MAX_ITEMS = 20
-MAX_SEARCH_ATTEMPTS = 50
+MAX_SEARCH_ATTEMPTS = 300
 RETRY_DELAY = 2
 GBP_TO_UAH = 60
 EXTRA_DELIVERY_COST = 120
@@ -63,7 +63,7 @@ BROWSER_PROFILES = [
         'name': 'Chrome153_Current',
         'ua': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36",
         'sec_ch_ua': None,  # curl_cffi сгенерирует правильный Sec-CH-UA автоматически
-        'impersonate': "chrome150",  # Нативный профиль, максимально согласован
+        'impersonate': "chrome",  # Нативный профиль, максимально согласован
         'disabled': False
     },
     # --- Chrome 152 Extended Stable ---
@@ -71,7 +71,7 @@ BROWSER_PROFILES = [
         'name': 'Chrome152_ExtendedStable',
         'ua': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36",
         'sec_ch_ua': None,
-        'impersonate': "chrome150",
+        'impersonate': "chrome",
         'disabled': False
     },
     # --- Firefox 155 (текущая стабильная версия) ---
