@@ -16,8 +16,7 @@ from dotenv import load_dotenv
 import psycopg2
 from psycopg2.extras import execute_values
 
-# Отключаем проверку SSL
-ssl._create_default_https_context = ssl._create_unverified_context
+# SSL-проверку глобально не отключаем. Ненадёжные MITM-прокси лучше исключать.
 
 try:
     from curl_cffi import requests as cffi_requests
@@ -34,13 +33,24 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "40"))
 DATABASE_URL = os.getenv("DATABASE_URL")
 PROXY_LIST_URL = os.getenv("PROXY_LIST")
-PROXY_REFRESH_INTERVAL = 5 * 60
-# Короткий cooldown: бесплатный proxy может временно не отвечать, а через минуту ожить.
-BAD_PROXY_COOLDOWN = 60
-PAIR_COOLDOWN = 60
+# ProxyScrape обновляет бесплатный список примерно раз в минуту.
+PROXY_REFRESH_INTERVAL = 60
 
+# Не возвращаем явно плохие IP в пул через 60 секунд: это вызывало повторный
+# перебор тех же dead/blocked proxy и длинные зависания.
+BAD_PROXY_COOLDOWN = 10 * 60          # transport/reset/timeout
+BLOCKED_PROXY_COOLDOWN = 30 * 60      # 403/429 от eBay
+HTTP_PROXY_COOLDOWN = 5 * 60          # прочий неожиданный HTTP
+
+# Разделяем connect/read timeout. Мёртвый proxy отсекается быстрее, но
+# медленному рабочему proxy остаётся время скачать большую страницу eBay.
+REQUEST_CONNECT_TIMEOUT = 8
+REQUEST_READ_TIMEOUT = 22
+
+# Один цикл поиска не должен висеть бесконечно.
+SEARCH_TIME_BUDGET = 150
 MAX_ITEMS = 20
-MAX_SEARCH_ATTEMPTS = 300
+MAX_SEARCH_ATTEMPTS = 80
 RETRY_DELAY = 2
 GBP_TO_UAH = 60
 EXTRA_DELIVERY_COST = 120
@@ -88,43 +98,31 @@ app = Flask(__name__)
 is_paused = False
 
 # ============ ПРОФИЛИ БРАУЗЕРОВ ============
-# ВАЖНО: используем только НАТИВНЫЕ профили curl_cffi.
-# Не подменяем UA на более новую версию, чем TLS/HTTP fingerprint:
-# это создаёт легко заметное несоответствие для антибота.
+# По свежему UK-логу именно Chrome150 дал HTTP 200 на IP, где Firefox147
+# перед этим получил 403. Поэтому Chrome150 используем как основной профиль.
+# Chrome146 — только технический fallback, если текущая сборка curl_cffi
+# вдруг не поддерживает Chrome150. На 403 профиль НЕ ротируем.
 BROWSER_PROFILES = [
     {
         'name': 'Chrome150_Native',
         'impersonate': 'chrome150',
-        'disabled': False
+        'disabled': False,
     },
     {
         'name': 'Chrome146_Native',
         'impersonate': 'chrome146',
-        'disabled': False
-    },
-    {
-        'name': 'Firefox147_Native',
-        'impersonate': 'firefox147',
-        'disabled': False
-    },
-    {
-        'name': 'Safari26.0.1_Native',
-        'impersonate': 'safari2601',
-        'disabled': False
-    },
-    {
-        'name': 'Safari26.0_iOS_Native',
-        'impersonate': 'safari260_ios',
-        'disabled': False
+        'disabled': False,
     },
 ]
 
-def get_random_profile():
-    active = [p for p in BROWSER_PROFILES if not p.get('disabled', False)]
-    if not active:
-        BROWSER_PROFILES[0]['disabled'] = False
-        active = [BROWSER_PROFILES[0]]
-    return random.choice(active)
+
+def get_preferred_profile():
+    for preferred in ('Chrome150_Native', 'Chrome146_Native'):
+        for p in BROWSER_PROFILES:
+            if p['name'] == preferred and not p.get('disabled', False):
+                return p
+    return None
+
 
 def disable_profile(profile_name):
     for p in BROWSER_PROFILES:
@@ -132,6 +130,7 @@ def disable_profile(profile_name):
             p['disabled'] = True
             logging.warning(f"Профиль {profile_name} отключён (не поддерживается curl_cffi)")
             break
+
 
 # ============ МЕНЕДЖЕР ПРОКСИ ============
 class ProxyManager:
@@ -143,53 +142,77 @@ class ProxyManager:
         self.last_refresh = 0
         self.refresh_interval = PROXY_REFRESH_INTERVAL
         self.bad_until = {}
+        self.last_used = {}
+        self.success_score = {}
+        self.fail_count = {}
 
     def _cleanup_bad_locked(self):
-        """Снимаем истёкший cooldown и сразу возвращаем proxy в рабочий пул."""
         now = time.time()
         expired = [p for p, until in self.bad_until.items() if until <= now]
         for p in expired:
             self.bad_until.pop(p, None)
 
-        # ВАЖНО: раньше proxy после истечения cooldown всё равно ждал следующего
-        # 5-минутного refresh. Теперь он реально возвращается примерно через минуту.
         if expired:
             current = set(self.proxies)
-            for p in self.all_proxies:
-                if p not in self.bad_until and p not in current:
+            all_set = set(self.all_proxies)
+            for p in expired:
+                if p in all_set and p not in current:
                     self.proxies.append(p)
                     current.add(p)
 
     def fetch_proxies_from_api(self):
         if not self.proxy_list_url:
             return []
+
         try:
             logging.info(f"Загрузка прокси из {self.proxy_list_url}")
-            resp = requests.get(self.proxy_list_url, timeout=20)
+            resp = requests.get(self.proxy_list_url, timeout=15)
             if resp.status_code != 200:
                 logging.error(f"Ошибка загрузки прокси: HTTP {resp.status_code}")
                 return []
 
             proxies = []
             seen = set()
-            for line in resp.text.splitlines():
-                line = line.strip()
+            scheme_counts = {'http': 0, 'https': 0, 'socks5': 0, 'skipped': 0}
+
+            for raw_line in resp.text.splitlines():
+                line = raw_line.strip()
                 if not line:
                     continue
+
                 if '://' not in line:
                     line = 'http://' + line
-                if line not in seen:
-                    seen.add(line)
-                    proxies.append(line)
 
-            logging.info(f"Загружено {len(proxies)} прокси")
+                scheme = line.split('://', 1)[0].lower()
+
+                # SOCKS4 в приложенном UK-логе только терял время на timeout/97.
+                # Для HTTPS eBay оставляем HTTP CONNECT/HTTPS и SOCKS5.
+                if scheme not in ('http', 'https', 'socks5'):
+                    scheme_counts['skipped'] += 1
+                    continue
+
+                if line in seen:
+                    continue
+
+                seen.add(line)
+                proxies.append(line)
+                scheme_counts[scheme] = scheme_counts.get(scheme, 0) + 1
+
+            random.shuffle(proxies)
+            logging.info(
+                f"Загружено {len(proxies)} пригодных proxy "
+                f"(http={scheme_counts.get('http', 0)}, "
+                f"https={scheme_counts.get('https', 0)}, "
+                f"socks5={scheme_counts.get('socks5', 0)}, "
+                f"пропущено={scheme_counts.get('skipped', 0)})"
+            )
             return proxies
+
         except Exception as e:
             logging.error(f"Ошибка при получении прокси: {e}")
             return []
 
     def refresh_proxies(self, force=False):
-        # Не держим lock во время внешнего HTTP-запроса.
         with self.lock:
             self._cleanup_bad_locked()
             now = time.time()
@@ -201,44 +224,85 @@ class ProxyManager:
         with self.lock:
             now = time.time()
             self._cleanup_bad_locked()
+
             if new_proxies:
                 self.all_proxies = new_proxies
-                self.proxies = [p for p in self.all_proxies if self.bad_until.get(p, 0) <= now]
+                self.proxies = [
+                    p for p in self.all_proxies
+                    if self.bad_until.get(p, 0) <= now
+                ]
                 self.last_refresh = now
+
+                # Чистим статистику адресов, которых больше нет в источнике.
+                alive = set(self.all_proxies)
+                self.last_used = {p: v for p, v in self.last_used.items() if p in alive}
+                self.success_score = {p: v for p, v in self.success_score.items() if p in alive}
+                self.fail_count = {p: v for p, v in self.fail_count.items() if p in alive}
+
                 logging.info(
-                    f"Пул прокси обновлён: {len(self.proxies)} доступно "
+                    f"Пул proxy обновлён: {len(self.proxies)} доступно "
                     f"(cooldown: {len(self.bad_until)})"
                 )
             elif not self.proxies:
-                logging.warning("Не удалось получить пригодные прокси")
+                logging.warning("Не удалось получить пригодные proxy")
             else:
-                logging.warning("Не удалось обновить прокси, продолжаем использовать старые")
+                logging.warning("Не удалось обновить proxy, продолжаем использовать старые")
 
-    def get_random_proxy(self):
+    def get_best_proxy(self):
         self.refresh_proxies()
-        with self.lock:
-            self._cleanup_bad_locked()
-            if self.proxies:
-                return random.choice(self.proxies)
 
-        # Если все временно выбыли, один раз принудительно обновляем API.
-        self.refresh_proxies(force=True)
         with self.lock:
             self._cleanup_bad_locked()
-            if not self.proxies:
-                return None
-            return random.choice(self.proxies)
+            candidates = list(self.proxies)
+
+        if not candidates:
+            self.refresh_proxies(force=True)
+            with self.lock:
+                self._cleanup_bad_locked()
+                candidates = list(self.proxies)
+
+        if not candidates:
+            return None
+
+        # До первого успеха перебираем адреса без повторов: самый давно
+        # не использованный идёт первым. Проверенные успешные IP имеют приоритет.
+        random.shuffle(candidates)
+        chosen = min(
+            candidates,
+            key=lambda p: (
+                -self.success_score.get(p, 0),
+                self.last_used.get(p, 0),
+            )
+        )
+
+        with self.lock:
+            self.last_used[chosen] = time.time()
+
+        return chosen
+
+    def mark_success(self, proxy):
+        if not proxy:
+            return
+        with self.lock:
+            self.success_score[proxy] = min(10, self.success_score.get(proxy, 0) + 1)
+            self.fail_count[proxy] = 0
+            self.bad_until.pop(proxy, None)
 
     def mark_bad_proxy(self, bad_proxy, cooldown=BAD_PROXY_COOLDOWN, reason='временная ошибка'):
         if not bad_proxy:
             return
+
         with self.lock:
+            self.fail_count[bad_proxy] = self.fail_count.get(bad_proxy, 0) + 1
+            self.success_score[bad_proxy] = max(0, self.success_score.get(bad_proxy, 0) - 2)
             self.bad_until[bad_proxy] = time.time() + cooldown
+
             if bad_proxy in self.proxies:
                 self.proxies.remove(bad_proxy)
+
             logging.info(
-                f"Прокси {bad_proxy} временно исключён на {cooldown} сек. "
-                f"Причина: {reason}. Осталось {len(self.proxies)} прокси"
+                f"Proxy {bad_proxy} исключён на {cooldown} сек. "
+                f"Причина: {reason}. Осталось {len(self.proxies)} proxy"
             )
 
 
@@ -248,36 +312,6 @@ proxy_manager = ProxyManager(PROXY_LIST_URL)
 fixed_proxy = None
 fixed_profile = None
 fixed_session = None
-
-# 403 может зависеть от сочетания IP + browser fingerprint.
-# Поэтому 403 не банит proxy сразу: на минуту исключаем только конкретную пару.
-pair_bad_until = {}
-pair_bad_lock = threading.Lock()
-
-
-def _cleanup_bad_pairs():
-    now = time.time()
-    with pair_bad_lock:
-        expired = [key for key, until in pair_bad_until.items() if until <= now]
-        for key in expired:
-            pair_bad_until.pop(key, None)
-
-
-def is_pair_available(proxy, profile_name):
-    _cleanup_bad_pairs()
-    with pair_bad_lock:
-        return pair_bad_until.get((proxy, profile_name), 0) <= time.time()
-
-
-def mark_bad_pair(proxy, profile_name, cooldown=PAIR_COOLDOWN, reason='403/защита'):
-    if not proxy:
-        return
-    with pair_bad_lock:
-        pair_bad_until[(proxy, profile_name)] = time.time() + cooldown
-    logging.info(
-        f"Пара {proxy} + {profile_name} исключена на {cooldown} сек. "
-        f"Причина: {reason}"
-    )
 
 
 def close_session(session):
@@ -401,14 +435,16 @@ def _looks_like_search_results(html):
 
 
 def _create_session(proxy, profile):
-    # Session сохраняет cookies и TCP/TLS соединение для уже найденной пары.
-    # Это ближе к обычному браузеру и уменьшает число новых handshakes.
+    # Session сохраняет cookies и TCP/TLS соединение уже найденного рабочего IP.
     kwargs = {
         'headers': {'Accept-Language': 'en-GB,en;q=0.9'},
         'impersonate': profile['impersonate'],
-        'verify': False,  # как было в вашем исходном рабочем коде
-        'timeout': 30,
+        'verify': True,
+        'timeout': (REQUEST_CONNECT_TIMEOUT, REQUEST_READ_TIMEOUT),
         'allow_redirects': True,
+        # Используем только proxy, который выбрали сами, и не наследуем
+        # случайные HTTP(S)_PROXY переменные окружения Render.
+        'trust_env': False,
     }
     if proxy:
         kwargs['proxy'] = proxy
@@ -515,38 +551,23 @@ def _make_request(proxy, profile, session=None):
         return 'proxy_error', None, None if own_session else session
 
 
-def _ordered_profiles_for_proxy(proxy):
-    """
-    Firefox147 ставим первым: именно этот native fingerprint уже дал
-    стабильные HTTP 200 в вашем свежем UK-логе. Остальные остаются резервом.
-    """
-    active = [p for p in BROWSER_PROFILES if not p.get('disabled', False)]
-    priority = {
-        'Firefox147_Native': 0,
-        'Chrome150_Native': 1,
-        'Chrome146_Native': 2,
-        'Safari26.0.1_Native': 3,
-        'Safari26.0_iOS_Native': 4,
-    }
-    active.sort(key=lambda p: priority.get(p['name'], 99))
-    return [p for p in active if is_pair_available(proxy, p['name'])]
-
-
 def fetch_ebay_html_with_fixed_pair():
     global fixed_proxy, fixed_profile, fixed_session
 
-    # 1) Сначала используем уже найденную рабочую пару и её session/cookies.
+    # 1) Сначала максимально долго держим одну реально рабочую session.
     if fixed_proxy is not None and fixed_profile is not None:
         logging.info(
             f"🔁 Используем зафиксированную пару: "
-            f"прокси {fixed_proxy}, профиль {fixed_profile['name']}"
+            f"proxy {fixed_proxy}, профиль {fixed_profile['name']}"
         )
+
         result, html, returned_session = _make_request(
             fixed_proxy, fixed_profile, session=fixed_session
         )
 
         if result == 'success':
             fixed_session = returned_session
+            proxy_manager.mark_success(fixed_proxy)
             return html
 
         old_proxy = fixed_proxy
@@ -556,86 +577,102 @@ def fetch_ebay_html_with_fixed_pair():
         fixed_proxy = None
         fixed_profile = None
 
-        # КРИТИЧНО: не повторяем второй раз подряд ту же упавшую пару.
-        if result == 'proxy_error':
+        if result == 'blocked':
+            # 403/429 — не перебираем fingerprints на том же IP.
             proxy_manager.mark_bad_proxy(
-                old_proxy, cooldown=BAD_PROXY_COOLDOWN, reason='ошибка соединения фиксированной пары'
+                old_proxy,
+                cooldown=BLOCKED_PROXY_COOLDOWN,
+                reason='eBay 403/429 на фиксированной сессии',
+            )
+        elif result == 'proxy_error':
+            proxy_manager.mark_bad_proxy(
+                old_proxy,
+                cooldown=BAD_PROXY_COOLDOWN,
+                reason='ошибка соединения фиксированной сессии',
+            )
+        elif result == 'profile_error':
+            # IP здесь ни при чём: просто выбираем поддерживаемый профиль.
+            logging.warning(
+                f"Профиль {old_profile['name']} недоступен; proxy {old_proxy} не баним"
             )
         else:
-            mark_bad_pair(old_proxy, old_profile['name'], reason=result)
+            proxy_manager.mark_bad_proxy(
+                old_proxy,
+                cooldown=HTTP_PROXY_COOLDOWN,
+                reason=f'неожиданный ответ фиксированной сессии: {result}',
+            )
 
-        logging.info("Сразу ищем новую рабочую пару без второй бесполезной попытки...")
+        logging.info("Ищем новую рабочую пару...")
 
-    # 2) Ищем новую пару. Один proxy не выбрасываем только из-за одного 403:
-    # пробуем другой native fingerprint.
+    # 2) Ищем новую пару, но не бесконечно и без мгновенного fingerprint rotation.
+    started = time.monotonic()
+
     for attempt in range(1, MAX_SEARCH_ATTEMPTS + 1):
-        proxy = proxy_manager.get_random_proxy()
+        if time.monotonic() - started >= SEARCH_TIME_BUDGET:
+            logging.warning(
+                f"⏱ Достигнут лимит поиска {SEARCH_TIME_BUDGET} сек.; "
+                "прерываем цикл и дадим пулу proxy обновиться"
+            )
+            break
 
+        proxy = proxy_manager.get_best_proxy()
         if PROXY_LIST_URL and not proxy:
-            logging.warning("Нет доступных прокси; короткая пауза перед обновлением...")
-            time.sleep(random.uniform(1.0, 2.0))
+            logging.warning("Нет доступных proxy; ждём обновления списка...")
+            time.sleep(random.uniform(2.0, 4.0))
             continue
 
-        profiles = _ordered_profiles_for_proxy(proxy)
-        if not profiles:
-            proxy_manager.mark_bad_proxy(
-                proxy, cooldown=BAD_PROXY_COOLDOWN, reason='все пары временно в cooldown'
-            )
-            continue
+        profile = get_preferred_profile()
+        if profile is None:
+            logging.error("Нет поддерживаемого browser-профиля curl_cffi")
+            return None
 
-        proxy_had_block = False
+        logging.info(
+            f"🔍 Поиск рабочей пары: попытка {attempt}/{MAX_SEARCH_ATTEMPTS}, "
+            f"proxy {proxy}, профиль {profile['name']}"
+        )
 
-        for profile_index, profile in enumerate(profiles, start=1):
+        result, html, session = _make_request(proxy, profile)
+
+        if result == 'success':
+            proxy_manager.mark_success(proxy)
+            fixed_proxy = proxy
+            fixed_profile = profile
+            fixed_session = session
             logging.info(
-                f"🔍 Поиск рабочей пары: proxy-попытка {attempt}/{MAX_SEARCH_ATTEMPTS}, "
-                f"профиль {profile_index}/{len(profiles)}, "
-                f"прокси {proxy}, профиль {profile['name']}"
+                f"✅ Найдена рабочая пара: proxy {proxy}, профиль {profile['name']}"
             )
+            return html
 
-            result, html, session = _make_request(proxy, profile)
+        close_session(session)
 
-            if result == 'success':
-                logging.info(
-                    f"✅ Найдена рабочая пара: прокси {proxy}, профиль {profile['name']}"
-                )
-                fixed_proxy = proxy
-                fixed_profile = profile
-                fixed_session = session
-                return html
+        if result == 'profile_error':
+            # Только здесь разрешён fallback Chrome150 -> Chrome146:
+            # это ошибка локальной поддержки curl_cffi, а не ответ eBay.
+            continue
 
-            close_session(session)
-
-            if result == 'proxy_error':
-                # Ошибка CONNECT/SOCKS/timeout относится к самому маршруту proxy.
-                proxy_manager.mark_bad_proxy(
-                    proxy, cooldown=BAD_PROXY_COOLDOWN, reason='CONNECT/SOCKS/timeout'
-                )
-                break
-
-            if result == 'profile_error':
-                continue
-
-            if result == 'blocked':
-                proxy_had_block = True
-                mark_bad_pair(proxy, profile['name'], reason='eBay 403/anti-bot')
-                # Дадим этому же IP один шанс с другим реальным browser fingerprint.
-                time.sleep(random.uniform(0.7, 1.4))
-                continue
-
-            # Прочий неожиданный HTTP: не баним IP надолго, только пару.
-            mark_bad_pair(proxy, profile['name'], reason='неожиданный HTTP')
-            time.sleep(random.uniform(0.5, 1.0))
-
-        # Если proxy физически жив, но все профили получили eBay block,
-        # убираем его всего на минуту, а не на 45 минут.
-        if proxy_had_block and proxy in proxy_manager.proxies:
+        if result == 'blocked':
             proxy_manager.mark_bad_proxy(
-                proxy, cooldown=BAD_PROXY_COOLDOWN, reason='eBay блок для всех проверенных профилей'
+                proxy,
+                cooldown=BLOCKED_PROXY_COOLDOWN,
+                reason='eBay 403/429',
+            )
+        elif result == 'proxy_error':
+            proxy_manager.mark_bad_proxy(
+                proxy,
+                cooldown=BAD_PROXY_COOLDOWN,
+                reason='CONNECT/SOCKS/reset/timeout',
+            )
+        else:
+            proxy_manager.mark_bad_proxy(
+                proxy,
+                cooldown=HTTP_PROXY_COOLDOWN,
+                reason=f'неожиданный HTTP: {result}',
             )
 
-        time.sleep(random.uniform(0.8, 1.8))
+        # Небольшая пауза предотвращает burst при большом количестве быстрых отказов.
+        time.sleep(random.uniform(0.7, 1.5))
 
-    logging.error("❌ Не удалось найти рабочую пару после всех попыток")
+    logging.error("❌ В этом цикле рабочий proxy не найден")
     return None
 
 
@@ -1173,7 +1210,9 @@ def bot_worker():
                 wait = random.uniform(40, 52)
                 logging.info(f"✅ Успешная проверка. Следующая через {wait:.0f} секунд.")
             else:
-                wait = random.uniform(2, 5)
+                # После неудачного поискового цикла не начинаем новый burst через 2 сек.
+                # За это время ProxyScrape успеет обновить часть бесплатного пула.
+                wait = random.uniform(25, 40)
                 logging.info(f"⚠️ Ошибка при проверке. Повтор через {wait:.1f} секунд.")
             time.sleep(wait)
         except Exception as e:
