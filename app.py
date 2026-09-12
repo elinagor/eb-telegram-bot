@@ -30,13 +30,13 @@ load_dotenv()
 EBAY_SEARCH_URL = os.getenv("EBAY_SEARCH_URL")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "10"))  # базовый интервал, но теперь не используется
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "40"))
 DATABASE_URL = os.getenv("DATABASE_URL")
 PROXY_LIST_URL = os.getenv("PROXY_LIST")
 PROXY_REFRESH_INTERVAL = 5 * 60
 
 MAX_ITEMS = 20
-MAX_SEARCH_ATTEMPTS = 300
+MAX_SEARCH_ATTEMPTS = 50
 RETRY_DELAY = 2
 GBP_TO_UAH = 60
 EXTRA_DELIVERY_COST = 120
@@ -55,55 +55,55 @@ app = Flask(__name__)
 
 is_paused = False
 
-# ============ ПРОФИЛИ БРАУЗЕРОВ ============
+# ============ ПРОФИЛИ БРАУЗЕРОВ (СЕНТЯБРЬ 2026) ============
+# ВАЖНО: Firefox и Safari НЕ отправляют Sec-CH-UA. Для них sec_ch_ua=None.
 BROWSER_PROFILES = [
+    # --- Chrome 153 (текущая стабильная версия) ---
     {
-        'name': 'Chrome146',
-        'ua': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-        'sec_ch_ua': '"Google Chrome";v="146", "Chromium";v="146", "Not_A Brand";v="99"',
-        'impersonate': "chrome146",
+        'name': 'Chrome153_Current',
+        'ua': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36",
+        'sec_ch_ua': None,  # curl_cffi сгенерирует правильный Sec-CH-UA автоматически
+        'impersonate': "chrome150",  # Нативный профиль, максимально согласован
         'disabled': False
     },
+    # --- Chrome 152 Extended Stable ---
     {
-        'name': 'Firefox147',
-        'ua': "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0",
-        'sec_ch_ua': '"Firefox";v="147", "Not_A Brand";v="99"',
+        'name': 'Chrome152_ExtendedStable',
+        'ua': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36",
+        'sec_ch_ua': None,
+        'impersonate': "chrome150",
+        'disabled': False
+    },
+    # --- Firefox 155 (текущая стабильная версия) ---
+    {
+        'name': 'Firefox155_Current',
+        'ua': "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:155.0) Gecko/20100101 Firefox/155.0",
+        'sec_ch_ua': None,  # Firefox НЕ отправляет Sec-CH-UA
+        'impersonate': "firefox147",  # Нативный профиль Firefox
+        'disabled': False
+    },
+    # --- Firefox 153 ESR ---
+    {
+        'name': 'Firefox153_ESR',
+        'ua': "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:153.0) Gecko/20100101 Firefox/153.0",
+        'sec_ch_ua': None,
         'impersonate': "firefox147",
         'disabled': False
     },
+    # --- Safari 26.6 (текущая стабильная версия) ---
     {
-        'name': 'Safari26.4',
-        'ua': "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.4 Safari/605.1.15",
-        'sec_ch_ua': '"Safari";v="26", "Not_A Brand";v="99"',
-        'impersonate': "safari260",
+        'name': 'Safari26.6_Current',
+        'ua': "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.6 Safari/605.1.15",
+        'sec_ch_ua': None,  # Safari НЕ отправляет Sec-CH-UA
+        'impersonate': "safari2601",  # Нативный профиль Safari
         'disabled': False
     },
+    # --- Safari iOS 26.6 (мобильный профиль) ---
     {
-        'name': 'Chrome_Universal',
-        'ua': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-        'sec_ch_ua': '"Google Chrome";v="146", "Chromium";v="146", "Not_A Brand";v="99"',
-        'impersonate': "chrome",
-        'disabled': False
-    },
-    {
-        'name': 'Firefox_Universal',
-        'ua': "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0",
-        'sec_ch_ua': '"Firefox";v="147", "Not_A Brand";v="99"',
-        'impersonate': "firefox",
-        'disabled': False
-    },
-    {
-        'name': 'Safari_Universal',
-        'ua': "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.4 Safari/605.1.15",
-        'sec_ch_ua': '"Safari";v="26", "Not_A Brand";v="99"',
-        'impersonate': "safari",
-        'disabled': False
-    },
-    {
-        'name': 'Chrome148_Custom',
-        'ua': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
-        'sec_ch_ua': '"Google Chrome";v="148", "Chromium";v="148", "Not_A Brand";v="99"',
-        'impersonate': "chrome",
+        'name': 'Safari26.6_iOS',
+        'ua': "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.6 Mobile/15E148 Safari/604.1",
+        'sec_ch_ua': None,
+        'impersonate': "safari260_ios",
         'disabled': False
     },
 ]
@@ -186,7 +186,7 @@ class ProxyManager:
 
 proxy_manager = ProxyManager(PROXY_LIST_URL)
 
-# ============ ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ДЛЯ ФИКСИРОВАННОЙ ПАРЫ ============
+# ============ ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ============
 fixed_proxy = None
 fixed_profile = None
 fixed_profile_failures = 0
@@ -263,7 +263,7 @@ def telegram_listener():
             logging.error(f"Ошибка в слушателе Telegram: {e}")
             time.sleep(5)
 
-# ============ ФУНКЦИЯ ЗАПРОСА С ФИКСАЦИЕЙ ============
+# ============ ЗАПРОС К EBAY ============
 def fetch_ebay_html_with_fixed_pair():
     global fixed_proxy, fixed_profile, fixed_profile_failures
 
@@ -284,10 +284,8 @@ def fetch_ebay_html_with_fixed_pair():
                 fixed_profile = None
                 fixed_profile_failures = 0
             else:
-                # Возвращаем None, но не делаем паузу — это будет обработано в основном цикле
                 return None
 
-    # Поиск новой рабочей пары
     for attempt in range(1, MAX_SEARCH_ATTEMPTS + 1):
         proxy = proxy_manager.get_random_proxy()
         profile = get_random_profile()
@@ -299,7 +297,6 @@ def fetch_ebay_html_with_fixed_pair():
             fixed_profile = profile
             fixed_profile_failures = 0
             return html
-        # если не успешно, продолжаем
 
     logging.error("❌ Не удалось найти рабочую пару после всех попыток")
     return None
@@ -318,10 +315,14 @@ def _make_request(proxy, profile, cookies):
         'Sec-Fetch-User': '?1',
         'Cache-Control': 'max-age=0',
         'X-EBay-Site-Id': '3',
-        'Sec-Ch-Ua': profile['sec_ch_ua'],
         'Sec-Ch-Ua-Mobile': '?0',
         'Sec-Ch-Ua-Platform': '"Windows"' if 'Windows' in profile['ua'] else '"macOS"',
     }
+    
+    # Добавляем Sec-CH-UA только если он задан в профиле (только для Chrome)
+    if profile.get('sec_ch_ua'):
+        headers['Sec-Ch-Ua'] = profile['sec_ch_ua']
+    
     proxies_dict = {'http': proxy, 'https': proxy} if proxy else None
 
     try:
@@ -830,7 +831,6 @@ def calculate_total_price(price_str, shipping_str, buy_it_now_price_str=None, is
     return total_uah
 
 def check_and_send_new_items():
-    """Возвращает True, если страница успешно загружена и обработана, иначе False."""
     seen = get_seen_ids()
     logging.info(f"В базе {len(seen)} товаров")
     html = fetch_ebay_html_with_retry()
@@ -898,11 +898,9 @@ def bot_worker():
         try:
             success = check_and_send_new_items()
             if success:
-                # При успешной загрузке ждём случайное время от 60 до 72 секунд
                 wait = random.uniform(40, 52)
                 logging.info(f"✅ Успешная проверка. Следующая через {wait:.0f} секунд.")
             else:
-                # При ошибке ждём короткую паузу (2–5 секунд) и продолжаем
                 wait = random.uniform(2, 5)
                 logging.info(f"⚠️ Ошибка при проверке. Повтор через {wait:.1f} секунд.")
             time.sleep(wait)
@@ -912,14 +910,14 @@ def bot_worker():
 
 @app.route('/')
 def index():
-    return "eBay бот работает (динамическая пауза в зависимости от успеха)"
+    return "eBay бот работает (Великобритания, обновлённые профили)"
 
 @app.route('/health')
 def health():
     return "OK", 200
 
 if __name__ == "__main__":
-    send_telegram_message("🚀 Бот запущен (Великобритания, улучшена логика пауз при ошибках). Интервал 10-22 сек, команды /stop /start")
+    send_telegram_message("🚀 Бот запущен (Великобритания, профили Chrome 153 / Firefox 155 / Safari 26.6). Команды /stop /start")
     threading.Thread(target=telegram_listener, daemon=True).start()
     worker_thread = threading.Thread(target=bot_worker, daemon=False)
     worker_thread.start()
