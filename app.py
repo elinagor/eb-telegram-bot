@@ -41,7 +41,19 @@ PROXY_REFRESH_INTERVAL = 60
 # компромисс для Render: поиск ускоряется, но мы не создаём агрессивный burst.
 PROBE_CONCURRENCY = max(1, min(int(os.getenv("PROBE_CONCURRENCY", "3")), 4))
 PROBE_CONNECT_TIMEOUT = float(os.getenv("PROBE_CONNECT_TIMEOUT", "3.5"))
-PROBE_READ_TIMEOUT = float(os.getenv("PROBE_READ_TIMEOUT", "15"))
+# Быстрый discovery не должен зависать на proxy, который начал отдавать большой HTML,
+# но не способен закончить ответ. В свежем логе такой адрес держал batch 18.5 сек.
+PROBE_READ_TIMEOUT = float(os.getenv("PROBE_READ_TIMEOUT", "8"))
+# Во второй половине discovery слегка расширяем окно, чтобы не отбрасывать
+# абсолютно все медленные, но потенциально рабочие бесплатные proxy.
+PROBE_FALLBACK_CONNECT_TIMEOUT = float(os.getenv("PROBE_FALLBACK_CONNECT_TIMEOUT", "4.5"))
+PROBE_FALLBACK_READ_TIMEOUT = float(os.getenv("PROBE_FALLBACK_READ_TIMEOUT", "12"))
+PROBE_FALLBACK_AFTER = float(os.getenv("PROBE_FALLBACK_AFTER", "45"))
+
+# Если eBay UK не дал ни одного успешного ответа более 10 минут, один раз
+# уведомляем в Telegram. После следующего успеха аварийный флаг сбрасывается.
+CONNECTION_ALERT_AFTER = max(60, int(os.getenv("CONNECTION_ALERT_AFTER", "600")))
+CONNECTION_WATCHDOG_INTERVAL = max(10, int(os.getenv("CONNECTION_WATCHDOG_INTERVAL", "15")))
 
 # Для уже найденной рабочей пары таймауты мягче: её не надо выбрасывать
 # только потому, что один ответ оказался чуть медленнее.
@@ -102,6 +114,44 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 app = Flask(__name__)
 
 is_paused = False
+
+# ============ КОНТРОЛЬ ДОСТУПНОСТИ EBAY ============
+# Используем monotonic(): системные часы Render могут корректироваться, а интервал
+# "10 минут без успешного подключения" должен оставаться точным.
+connection_state_lock = threading.Lock()
+connection_watch_started_at = time.monotonic()
+last_ebay_success_at = None
+connection_alert_sent = False
+
+
+def record_ebay_success():
+    """Фиксирует успешный HTTP 200 с валидной выдачей и сбрасывает outage alert."""
+    global last_ebay_success_at, connection_alert_sent
+    now = time.monotonic()
+    with connection_state_lock:
+        was_alerted = connection_alert_sent
+        last_ebay_success_at = now
+        connection_alert_sent = False
+    if was_alerted:
+        logging.info("✅ Связь с eBay восстановлена; 10-минутный alert снова разрешён для будущего сбоя")
+
+
+def reset_connection_watch_after_manual_resume():
+    """После /start даём новые 10 минут, чтобы ручная пауза не считалась аварией."""
+    global connection_watch_started_at, last_ebay_success_at, connection_alert_sent
+    with connection_state_lock:
+        connection_watch_started_at = time.monotonic()
+        last_ebay_success_at = None
+        connection_alert_sent = False
+
+
+def _connection_outage_snapshot():
+    now = time.monotonic()
+    with connection_state_lock:
+        reference = last_ebay_success_at if last_ebay_success_at is not None else connection_watch_started_at
+        elapsed = max(0.0, now - reference)
+        return elapsed, connection_alert_sent, (last_ebay_success_at is not None)
+
 
 # ============ ПРОФИЛИ БРАУЗЕРОВ ============
 # По свежему UK-логу именно Chrome150 дал HTTP 200 на IP, где Firefox147
@@ -399,6 +449,16 @@ class ProxyManager:
                 else:
                     cooldown = [300, 600, 1200, 1800][min(streak - 1, 3)]
                 host_cooldown = cooldown
+            elif result == 'proxy_rejected':
+                # CONNECT 400/405/500/aborted у никогда не работавшего endpoint обычно
+                # означает, что он не умеет нормально туннелировать HTTPS к eBay.
+                # Не тратим на него следующий discovery через 1-2 минуты. Для ранее
+                # успешного proxy сохраняем мягкое отношение — сбой мог быть временным.
+                if known_good:
+                    cooldown = [20, 45, 120, 300][min(streak - 1, 3)]
+                else:
+                    cooldown = [600, 900, 1200, 1800][min(streak - 1, 3)]
+                host_cooldown = 0
             elif result == 'proxy_timeout':
                 if known_good:
                     cooldown = [20, 45, 120, 300][min(streak - 1, 3)]
@@ -488,8 +548,62 @@ def send_telegram_message(message, parse_mode='HTML'):
         r = requests.post(url, json=payload, timeout=10)
         if r.status_code != 200:
             logging.error(f"Ошибка Telegram: {r.text}")
+            return False
+        return True
     except Exception as e:
         logging.error(f"Не удалось отправить в Telegram: {e}")
+        return False
+
+
+def connection_watchdog():
+    """Шлёт ровно одно предупреждение на один непрерывный outage >= 10 минут."""
+    global connection_alert_sent
+    logging.info(
+        f"🩺 Watchdog eBay запущен: предупреждение после {CONNECTION_ALERT_AFTER // 60} мин без успеха"
+    )
+    while True:
+        try:
+            if not is_paused:
+                elapsed, already_sent, had_success = _connection_outage_snapshot()
+                if elapsed >= CONNECTION_ALERT_AFTER and not already_sent:
+                    # Ставим флаг ДО Telegram-запроса, чтобы два прохода watchdog
+                    # никогда не отправили дубль. Если Telegram не принял сообщение,
+                    # флаг вернём назад и попробуем снова на следующем проходе.
+                    should_send = False
+                    with connection_state_lock:
+                        if not connection_alert_sent:
+                            connection_alert_sent = True
+                            should_send = True
+                    if not should_send:
+                        time.sleep(CONNECTION_WATCHDOG_INTERVAL)
+                        continue
+
+                    minutes = max(10, int(elapsed // 60))
+                    if had_success:
+                        status_line = f"⏱ Уже <b>{minutes} мин.</b> нет успешного подключения к eBay UK."
+                    else:
+                        status_line = f"⏱ Уже <b>{minutes} мин.</b> после запуска нет успешного подключения к eBay UK."
+
+                    message = (
+                        "⚠️ <b>eBay UK — проверьте подключение</b> 🇬🇧\n\n"
+                        f"{status_line}\n"
+                        "🤖 Бот продолжает работать и автоматически искать рабочий proxy.\n\n"
+                        "👉 <b>Пожалуйста, проверьте сайт/подключение вручную.</b>\n\n"
+                        "Следующее такое предупреждение будет отправлено только если связь "
+                        "сначала восстановится, а затем снова пропадёт более чем на 10 минут."
+                    )
+                    if send_telegram_message(message):
+                        logging.warning(
+                            f"📨 Отправлено Telegram-предупреждение: eBay недоступен {elapsed:.0f} сек."
+                        )
+                    else:
+                        with connection_state_lock:
+                            connection_alert_sent = False
+            time.sleep(CONNECTION_WATCHDOG_INTERVAL)
+        except Exception as e:
+            logging.error(f"Ошибка connection watchdog: {e}", exc_info=True)
+            time.sleep(CONNECTION_WATCHDOG_INTERVAL)
+
 
 def telegram_listener():
     global is_paused
@@ -513,8 +627,9 @@ def telegram_listener():
                             logging.info("Команда /stop - пауза")
                         elif text == '/start':
                             is_paused = False
+                            reset_connection_watch_after_manual_resume()
                             send_telegram_message("▶ Бот продолжает работу")
-                            logging.info("Команда /start - продолжение")
+                            logging.info("Команда /start - продолжение; watchdog-таймер перезапущен")
             time.sleep(1)
         except Exception as e:
             logging.error(f"Ошибка в слушателе Telegram: {e}")
@@ -584,9 +699,10 @@ def _make_request(proxy, profile, session=None, timeout=None):
       success       - нормальная выдача eBay
       blocked       - HTTP 403 / anti-bot
       rate_limited  - HTTP 429
-      proxy_timeout - connect/read timeout
-      proxy_ssl     - SSL certificate / MITM proxy
-      proxy_error   - CONNECT/SOCKS/reset/прочая transport ошибка
+      proxy_timeout  - connect/read timeout
+      proxy_ssl      - SSL certificate / MITM proxy
+      proxy_rejected - CONNECT tunnel 400/405/500/aborted: endpoint не годится для HTTPS
+      proxy_error    - SOCKS/reset/прочая transport ошибка
       profile_error - неподдерживаемый fingerprint
       http_error    - прочий HTTP/неожиданный ответ
     """
@@ -685,17 +801,43 @@ def _make_request(proxy, profile, session=None, timeout=None):
             return 'proxy_timeout', None, None if own_session else session
         if 'curl: (60)' in low or 'certificate' in low or 'self signed' in low:
             return 'proxy_ssl', None, None if own_session else session
+        if (
+            'connect tunnel failed' in low or
+            'proxy connect aborted' in low or
+            re.search(r'connect[^\n]*(?:response )?(?:400|405|500|501|502|503)', low)
+        ):
+            return 'proxy_rejected', None, None if own_session else session
         return 'proxy_error', None, None if own_session else session
 
 
-def _probe_proxy(proxy, profile):
+def _probe_proxy(proxy, profile, timeout):
     """Одна discovery-проверка. У каждой задачи своя Session — thread-safe."""
     return _make_request(
         proxy,
         profile,
         session=None,
-        timeout=(PROBE_CONNECT_TIMEOUT, PROBE_READ_TIMEOUT),
+        timeout=timeout,
     )
+
+
+def _cleanup_late_probe_future(future, proxy):
+    """Закрывает/учитывает probe, который уже был в полёте, когда другой proxy победил."""
+    if future.cancelled():
+        return
+    try:
+        result, _, session = future.result()
+    except Exception as e:
+        logging.debug(f"Фоновый probe {proxy} завершился исключением: {e}")
+        return
+
+    try:
+        if result == 'success':
+            proxy_manager.mark_success(proxy)
+            logging.info(f"🟢 Запомнен запасной успешный proxy {proxy} (late probe)")
+        elif result != 'profile_error':
+            proxy_manager.mark_failure(proxy, result, reason=f'{result} (late probe)')
+    finally:
+        close_session(session)
 
 
 def fetch_ebay_html_with_fixed_pair():
@@ -720,6 +862,7 @@ def fetch_ebay_html_with_fixed_pair():
         if result == 'success':
             fixed_session = returned_session
             proxy_manager.mark_success(old_proxy)
+            record_ebay_success()
             return html
 
         # Частая реальная ситуация: умерло только старое TCP/TLS соединение Session,
@@ -745,6 +888,7 @@ def fetch_ebay_html_with_fixed_pair():
                 fixed_profile = old_profile
                 fixed_session = retry_session
                 proxy_manager.mark_success(old_proxy)
+                record_ebay_success()
                 logging.info("✅ Proxy восстановился после пересоздания session")
                 return retry_html
 
@@ -816,50 +960,74 @@ def fetch_ebay_html_with_fixed_pair():
                 f"профиль {profile['name']}"
             )
 
-        results = []
-        # Ждём весь маленький batch. Даже если один ответил раньше, максимум ещё
-        # ~3.5 сек на connect timeout остальных, зато не оставляем фоновые Session.
-        with ThreadPoolExecutor(max_workers=len(batch), thread_name_prefix='proxy-probe') as executor:
-            future_to_proxy = {
-                executor.submit(_probe_proxy, proxy, profile): proxy
-                for proxy in batch
-            }
-            for future in as_completed(future_to_proxy):
-                proxy = future_to_proxy[future]
-                try:
-                    result, html, session = future.result()
-                except Exception as e:
-                    logging.error(f"Ошибка probe worker для {proxy}: {e}")
-                    result, html, session = 'proxy_error', None, None
-                results.append((proxy, result, html, session))
+        # Первая половина discovery — строгий fast lane. Если за ~45 сек победителя
+        # нет, немного расширяем timeout: это лучше, чем сразу держать каждый плохой
+        # batch по 18+ секунд из-за одного медленно отдающего HTML proxy.
+        elapsed_now = time.monotonic() - started
+        if elapsed_now < PROBE_FALLBACK_AFTER:
+            probe_timeout = (PROBE_CONNECT_TIMEOUT, PROBE_READ_TIMEOUT)
+        else:
+            probe_timeout = (PROBE_FALLBACK_CONNECT_TIMEOUT, PROBE_FALLBACK_READ_TIMEOUT)
 
-        successes = []
-        for proxy, result, html, session in results:
+        # Первый успешный ответ выигрывает сразу. Раньше мы ждали весь batch и
+        # могли потерять ещё 8-15 сек из-за соседнего "полуживого" proxy, хотя
+        # рабочий HTTP 200 уже был получен. Уже стартовавшие 1-2 probe не бросаем:
+        # они тихо завершаются, Session закрываются callback'ом, а их результат
+        # попадает в health-score как backup/ошибка.
+        executor = ThreadPoolExecutor(max_workers=len(batch), thread_name_prefix='proxy-probe')
+        future_to_proxy = {
+            executor.submit(_probe_proxy, proxy, profile, probe_timeout): proxy
+            for proxy in batch
+        }
+        processed = set()
+        winner = None
+
+        for future in as_completed(future_to_proxy):
+            proxy = future_to_proxy[future]
+            processed.add(future)
+            try:
+                result, html, session = future.result()
+            except Exception as e:
+                logging.error(f"Ошибка probe worker для {proxy}: {e}")
+                result, html, session = 'proxy_error', None, None
+
             if result == 'success':
                 proxy_manager.mark_success(proxy)
-                successes.append((proxy, html, session))
+                winner = (proxy, html, session)
+                break
             elif result == 'profile_error':
                 close_session(session)
             else:
                 close_session(session)
                 proxy_manager.mark_failure(proxy, result, reason=result)
 
-        if successes:
-            # as_completed() сохранил приблизительный порядок скорости ответа —
-            # берём первый успешный; остальные успехи запоминаем как warm backup.
-            winner_proxy, winner_html, winner_session = successes[0]
-            for backup_proxy, _, backup_session in successes[1:]:
-                logging.info(f"🟢 Запомнен запасной успешный proxy {backup_proxy}")
-                close_session(backup_session)
+        if winner is not None:
+            # Не ждём медленных соседей победителя. Те, что уже работают, получат
+            # callback; ещё не стартовавшие (редко при batch<=workers) отменяем.
+            for future, proxy in future_to_proxy.items():
+                if future in processed:
+                    continue
+                if future.done():
+                    _cleanup_late_probe_future(future, proxy)
+                elif not future.cancel():
+                    future.add_done_callback(
+                        lambda f, p=proxy: _cleanup_late_probe_future(f, p)
+                    )
+            executor.shutdown(wait=False, cancel_futures=True)
 
+            winner_proxy, winner_html, winner_session = winner
             fixed_proxy = winner_proxy
             fixed_profile = profile
             fixed_session = winner_session
+            record_ebay_success()
             logging.info(
                 f"✅ Найдена рабочая пара: proxy {winner_proxy}, профиль {profile['name']}; "
                 f"проверено {attempts} proxy за {time.monotonic() - started:.1f} сек."
             )
             return winner_html
+
+        # Победителя нет — все futures уже завершились через as_completed().
+        executor.shutdown(wait=True)
 
         # Не устраиваем серию мгновенных batch после быстрых 403/CONNECT 400.
         time.sleep(random.uniform(0.45, 0.9))
@@ -1416,15 +1584,16 @@ def bot_worker():
 
 @app.route('/')
 def index():
-    return "eBay бот работает (Великобритания, adaptive parallel UK mode)"
+    return "eBay бот работает (Великобритания, adaptive parallel UK v3)"
 
 @app.route('/health')
 def health():
     return "OK", 200
 
 if __name__ == "__main__":
-    send_telegram_message("🚀 Бот запущен (Великобритания, adaptive parallel UK mode). Команды /stop /start")
+    send_telegram_message("🚀 Бот запущен (Великобритания, adaptive parallel UK v3). Команды /stop /start")
     threading.Thread(target=telegram_listener, daemon=True).start()
+    threading.Thread(target=connection_watchdog, daemon=True).start()
     worker_thread = threading.Thread(target=bot_worker, daemon=False)
     worker_thread.start()
     port = int(os.environ.get("PORT", 5000))
