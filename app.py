@@ -34,6 +34,7 @@ CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "40"))
 DATABASE_URL = os.getenv("DATABASE_URL")
 PROXY_LIST_URL = os.getenv("PROXY_LIST")
 PROXY_REFRESH_INTERVAL = 5 * 60
+BAD_PROXY_COOLDOWN = 30 * 60  # не возвращать плохой прокси 30 минут
 
 MAX_ITEMS = 20
 MAX_SEARCH_ATTEMPTS = 300
@@ -55,55 +56,34 @@ app = Flask(__name__)
 
 is_paused = False
 
-# ============ ПРОФИЛИ БРАУЗЕРОВ (СЕНТЯБРЬ 2026) ============
-# ВАЖНО: Firefox и Safari НЕ отправляют Sec-CH-UA. Для них sec_ch_ua=None.
+# ============ ПРОФИЛИ БРАУЗЕРОВ ============
+# ВАЖНО: используем только НАТИВНЫЕ профили curl_cffi.
+# Не подменяем UA на более новую версию, чем TLS/HTTP fingerprint:
+# это создаёт легко заметное несоответствие для антибота.
 BROWSER_PROFILES = [
-    # --- Chrome 153 (текущая стабильная версия) ---
     {
-        'name': 'Chrome153_Current',
-        'ua': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36",
-        'sec_ch_ua': None,  # curl_cffi сгенерирует правильный Sec-CH-UA автоматически
-        'impersonate': "chrome",  # Нативный профиль, максимально согласован
+        'name': 'Chrome150_Native',
+        'impersonate': 'chrome150',
         'disabled': False
     },
-    # --- Chrome 152 Extended Stable ---
     {
-        'name': 'Chrome152_ExtendedStable',
-        'ua': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36",
-        'sec_ch_ua': None,
-        'impersonate': "chrome",
+        'name': 'Chrome146_Native',
+        'impersonate': 'chrome146',
         'disabled': False
     },
-    # --- Firefox 155 (текущая стабильная версия) ---
     {
-        'name': 'Firefox155_Current',
-        'ua': "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:155.0) Gecko/20100101 Firefox/155.0",
-        'sec_ch_ua': None,  # Firefox НЕ отправляет Sec-CH-UA
-        'impersonate': "firefox147",  # Нативный профиль Firefox
+        'name': 'Firefox147_Native',
+        'impersonate': 'firefox147',
         'disabled': False
     },
-    # --- Firefox 153 ESR ---
     {
-        'name': 'Firefox153_ESR',
-        'ua': "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:153.0) Gecko/20100101 Firefox/153.0",
-        'sec_ch_ua': None,
-        'impersonate': "firefox147",
+        'name': 'Safari26.0.1_Native',
+        'impersonate': 'safari2601',
         'disabled': False
     },
-    # --- Safari 26.6 (текущая стабильная версия) ---
     {
-        'name': 'Safari26.6_Current',
-        'ua': "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.6 Safari/605.1.15",
-        'sec_ch_ua': None,  # Safari НЕ отправляет Sec-CH-UA
-        'impersonate': "safari2601",  # Нативный профиль Safari
-        'disabled': False
-    },
-    # --- Safari iOS 26.6 (мобильный профиль) ---
-    {
-        'name': 'Safari26.6_iOS',
-        'ua': "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.6 Mobile/15E148 Safari/604.1",
-        'sec_ch_ua': None,
-        'impersonate': "safari260_ios",
+        'name': 'Safari26.0_iOS_Native',
+        'impersonate': 'safari260_ios',
         'disabled': False
     },
 ]
@@ -130,6 +110,15 @@ class ProxyManager:
         self.lock = threading.Lock()
         self.last_refresh = 0
         self.refresh_interval = PROXY_REFRESH_INTERVAL
+        # ВАЖНО: старый код забывал плохие прокси после каждого refresh,
+        # поэтому уже удалённый прокси через 5 минут возвращался снова.
+        self.bad_until = {}
+
+    def _cleanup_bad(self):
+        now = time.time()
+        expired = [p for p, until in self.bad_until.items() if until <= now]
+        for p in expired:
+            self.bad_until.pop(p, None)
 
     def fetch_proxies_from_api(self):
         if not self.proxy_list_url:
@@ -140,15 +129,19 @@ class ProxyManager:
             if resp.status_code != 200:
                 logging.error(f"Ошибка загрузки прокси: HTTP {resp.status_code}")
                 return []
-            text = resp.text.strip()
+
             proxies = []
-            for line in text.splitlines():
+            seen = set()
+            for line in resp.text.splitlines():
                 line = line.strip()
                 if not line:
                     continue
                 if '://' not in line:
                     line = 'http://' + line
-                proxies.append(line)
+                if line not in seen:
+                    seen.add(line)
+                    proxies.append(line)
+
             logging.info(f"Загружено {len(proxies)} прокси")
             return proxies
         except Exception as e:
@@ -158,31 +151,51 @@ class ProxyManager:
     def refresh_proxies(self):
         with self.lock:
             now = time.time()
+            self._cleanup_bad()
+
             if self.proxies and (now - self.last_refresh) < self.refresh_interval:
                 return
+
             new_proxies = self.fetch_proxies_from_api()
             if new_proxies:
+                new_proxies = [
+                    p for p in new_proxies
+                    if self.bad_until.get(p, 0) <= now
+                ]
                 self.proxies = new_proxies
                 self.last_refresh = now
-                logging.info(f"Пул прокси обновлён: {len(self.proxies)} доступно")
+                logging.info(
+                    f"Пул прокси обновлён: {len(self.proxies)} доступно "
+                    f"(в cooldown: {len(self.bad_until)})"
+                )
+            elif not self.proxies:
+                logging.warning("Не удалось получить пригодные прокси")
             else:
-                if not self.proxies:
-                    logging.warning("Не удалось загрузить прокси, работаем без прокси")
-                else:
-                    logging.warning("Не удалось обновить прокси, продолжаем использовать старые")
+                logging.warning("Не удалось обновить прокси, продолжаем использовать старые")
 
     def get_random_proxy(self):
         self.refresh_proxies()
         with self.lock:
+            self._cleanup_bad()
+            self.proxies = [
+                p for p in self.proxies
+                if self.bad_until.get(p, 0) <= time.time()
+            ]
             if not self.proxies:
                 return None
             return random.choice(self.proxies)
 
-    def mark_bad_proxy(self, bad_proxy):
+    def mark_bad_proxy(self, bad_proxy, cooldown=BAD_PROXY_COOLDOWN):
+        if not bad_proxy:
+            return
         with self.lock:
+            self.bad_until[bad_proxy] = time.time() + cooldown
             if bad_proxy in self.proxies:
                 self.proxies.remove(bad_proxy)
-                logging.info(f"Прокси {bad_proxy} удалён (нерабочий/заблокирован). Осталось {len(self.proxies)} прокси")
+            logging.info(
+                f"Прокси {bad_proxy} отправлен в cooldown на {cooldown // 60} мин. "
+                f"Осталось {len(self.proxies)} прокси"
+            )
 
 proxy_manager = ProxyManager(PROXY_LIST_URL)
 
@@ -264,108 +277,194 @@ def telegram_listener():
             time.sleep(5)
 
 # ============ ЗАПРОС К EBAY ============
+
+def _response_title(html):
+    if not html:
+        return ""
+    match = re.search(r'<title[^>]*>(.*?)</title>', html, re.I | re.S)
+    if not match:
+        return ""
+    return re.sub(r'\s+', ' ', match.group(1)).strip()[:160]
+
+
+def _is_ebay_block_page(response):
+    """
+    Определяем именно страницу защиты eBay.
+    КРИТИЧНО: слово "robot" само по себе НЕ является признаком блокировки.
+    Оно может встретиться в обычном HTML/JS/товаре/robots-метаданных.
+    """
+    text_lower = (response.text or "").lower()
+    title_lower = _response_title(response.text).lower()
+    final_url = str(getattr(response, 'url', '') or '').lower()
+
+    if 'pardon our interruption' in text_lower:
+        return True, 'pardon our interruption'
+
+    if 'something about your browser made us think you were a bot' in text_lower:
+        return True, 'browser made us think you were a bot'
+
+    if 'access denied' in title_lower:
+        return True, 'title: access denied'
+
+    # Если eBay отправил на явную challenge/captcha/splash страницу.
+    if ('captcha' in final_url or 'challenge' in final_url) and 'ebay' in final_url:
+        return True, f'challenge url: {final_url[:120]}'
+
+    return False, None
+
+
 def fetch_ebay_html_with_fixed_pair():
     global fixed_proxy, fixed_profile, fixed_profile_failures
 
-    cookies = {'ebay': '%2F', 'm': 'GB', 's': 'UK', 'siteid': '3'}
-
     if fixed_proxy is not None and fixed_profile is not None:
-        logging.info(f"🔁 Используем зафиксированную пару: прокси {fixed_proxy}, профиль {fixed_profile['name']}")
-        success, html = _make_request(fixed_proxy, fixed_profile, cookies)
+        logging.info(
+            f"🔁 Используем зафиксированную пару: "
+            f"прокси {fixed_proxy}, профиль {fixed_profile['name']}"
+        )
+        success, html = _make_request(fixed_proxy, fixed_profile)
+
         if success:
             fixed_profile_failures = 0
             return html
+
+        fixed_profile_failures += 1
+        logging.warning(
+            f"Зафиксированная пара не сработала "
+            f"(ошибка {fixed_profile_failures}/{MAX_FIXED_FAILURES})"
+        )
+
+        if fixed_profile_failures >= MAX_FIXED_FAILURES:
+            logging.info("Сбрасываем зафиксированную пару, ищем новую...")
+            fixed_proxy = None
+            fixed_profile = None
+            fixed_profile_failures = 0
         else:
-            fixed_profile_failures += 1
-            logging.warning(f"Зафиксированная пара не сработала (ошибка {fixed_profile_failures}/{MAX_FIXED_FAILURES})")
-            if fixed_profile_failures >= MAX_FIXED_FAILURES:
-                logging.info("Сбрасываем зафиксированную пару, ищем новую...")
-                fixed_proxy = None
-                fixed_profile = None
-                fixed_profile_failures = 0
-            else:
-                return None
+            return None
 
     for attempt in range(1, MAX_SEARCH_ATTEMPTS + 1):
         proxy = proxy_manager.get_random_proxy()
+
+        # Если настроен пул прокси, никогда молча не переходим на IP Render.
+        if PROXY_LIST_URL and not proxy:
+            logging.warning("Нет доступных прокси в текущем пуле; обновляем список...")
+            time.sleep(random.uniform(2.0, 4.0))
+            continue
+
         profile = get_random_profile()
-        logging.info(f"🔍 Поиск рабочей пары: попытка {attempt}/{MAX_SEARCH_ATTEMPTS}, прокси {proxy}, профиль {profile['name']}")
-        success, html = _make_request(proxy, profile, cookies)
+        logging.info(
+            f"🔍 Поиск рабочей пары: попытка {attempt}/{MAX_SEARCH_ATTEMPTS}, "
+            f"прокси {proxy}, профиль {profile['name']}"
+        )
+
+        success, html = _make_request(proxy, profile)
         if success:
-            logging.info(f"✅ Найдена рабочая пара: прокси {proxy}, профиль {profile['name']}")
+            logging.info(
+                f"✅ Найдена рабочая пара: прокси {proxy}, профиль {profile['name']}"
+            )
             fixed_proxy = proxy
             fixed_profile = profile
             fixed_profile_failures = 0
             return html
 
+        # В старом коде попытки шли почти непрерывным потоком.
+        # Небольшой jitter снижает "машинный" паттерн и нагрузку.
+        time.sleep(random.uniform(1.3, 3.2))
+
     logging.error("❌ Не удалось найти рабочую пару после всех попыток")
     return None
 
-def _make_request(proxy, profile, cookies):
+
+def _make_request(proxy, profile):
+    # Не смешиваем вручную UA / Sec-CH-UA / Sec-Fetch с fingerprint другой версии.
+    # curl_cffi сам формирует согласованный набор browser headers для impersonate.
     headers = {
-        'User-Agent': profile['ua'],
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
         'Accept-Language': 'en-GB,en;q=0.9',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Referer': 'https://www.ebay.co.uk/',
-        'Upgrade-Insecure-Requests': '1',
-        'Sec-Fetch-Dest': 'document',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Site': 'none',
-        'Sec-Fetch-User': '?1',
-        'Cache-Control': 'max-age=0',
-        'X-EBay-Site-Id': '3',
-        'Sec-Ch-Ua-Mobile': '?0',
-        'Sec-Ch-Ua-Platform': '"Windows"' if 'Windows' in profile['ua'] else '"macOS"',
     }
-    
-    # Добавляем Sec-CH-UA только если он задан в профиле (только для Chrome)
-    if profile.get('sec_ch_ua'):
-        headers['Sec-Ch-Ua'] = profile['sec_ch_ua']
-    
-    proxies_dict = {'http': proxy, 'https': proxy} if proxy else None
 
     try:
+        request_kwargs = {
+            'headers': headers,
+            'impersonate': profile['impersonate'],
+            'timeout': 30,
+            'allow_redirects': True,
+        }
+
+        if proxy:
+            # Один proxy применяется к запросу целиком.
+            request_kwargs['proxy'] = proxy
+
         response = cffi_requests.get(
             EBAY_SEARCH_URL,
-            headers=headers,
-            cookies=cookies,
-            impersonate=profile['impersonate'],
-            proxies=proxies_dict,
-            verify=False,
-            timeout=30,
-            allow_redirects=True
+            **request_kwargs
+        )
+
+        title = _response_title(response.text)
+        final_url = str(getattr(response, 'url', '') or '')
+        body_len = len(response.content or b'')
+
+        logging.info(
+            f"🌐 eBay ответ: HTTP {response.status_code}, bytes={body_len}, "
+            f"title={title!r}, final_url={final_url[:180]}"
         )
 
         if response.status_code == 200:
-            text_lower = response.text.lower()
-            if 'pardon our interruption' in text_lower or 'access denied' in text_lower or 'robot' in text_lower:
-                logging.warning(f"🚫 БЛОКИРОВКА (страница защиты) для прокси {proxy}, профиль {profile['name']}")
-                if proxy:
-                    proxy_manager.mark_bad_proxy(proxy)
+            blocked, reason = _is_ebay_block_page(response)
+
+            if blocked:
+                logging.warning(
+                    f"🚫 ПОДТВЕРЖДЁННАЯ защита eBay ({reason}) "
+                    f"для прокси {proxy}, профиль {profile['name']}"
+                )
+                proxy_manager.mark_bad_proxy(proxy, cooldown=45 * 60)
                 return False, None
-            else:
-                logging.info(f"✅ УСПЕШНО c прокси {proxy}, профиль {profile['name']}")
-                return True, response.text
-        elif response.status_code == 403:
-            logging.warning(f"🚫 БЛОКИРОВКА (HTTP 403) для прокси {proxy}, профиль {profile['name']}")
-            if proxy:
-                proxy_manager.mark_bad_proxy(proxy)
+
+            # Диагностика главной ошибки старой версии:
+            if 'robot' in (response.text or '').lower():
+                logging.info(
+                    "ℹ️ В обычном HTTP 200 HTML встречается слово 'robot', "
+                    "но оно больше НЕ считается блокировкой само по себе."
+                )
+
+            logging.info(
+                f"✅ УСПЕШНО c прокси {proxy}, профиль {profile['name']}"
+            )
+            return True, response.text
+
+        if response.status_code in (403, 429):
+            logging.warning(
+                f"🚫 eBay HTTP {response.status_code} для прокси {proxy}, "
+                f"профиль {profile['name']}"
+            )
+            proxy_manager.mark_bad_proxy(proxy, cooldown=45 * 60)
             return False, None
-        else:
-            logging.warning(f"⚠️ НЕУДАЧА: HTTP {response.status_code} для прокси {proxy}, профиль {profile['name']}")
-            if proxy:
-                proxy_manager.mark_bad_proxy(proxy)
+
+        if response.status_code == 407:
+            logging.warning(f"🔐 Прокси требует авторизацию: {proxy}")
+            proxy_manager.mark_bad_proxy(proxy, cooldown=60 * 60)
             return False, None
+
+        logging.warning(
+            f"⚠️ НЕУДАЧА: HTTP {response.status_code} "
+            f"для прокси {proxy}, профиль {profile['name']}"
+        )
+        proxy_manager.mark_bad_proxy(proxy)
+        return False, None
 
     except Exception as e:
         error_msg = str(e)
-        logging.error(f"❌ ОШИБКА для прокси {proxy}, профиль {profile['name']}: {error_msg}")
-        if 'not supported' in error_msg:
+        logging.error(
+            f"❌ ОШИБКА для прокси {proxy}, "
+            f"профиль {profile['name']}: {error_msg}"
+        )
+
+        if 'not supported' in error_msg.lower():
             disable_profile(profile['name'])
-        if proxy:
-            proxy_manager.mark_bad_proxy(proxy)
+
+        # Ошибки 7/28/56/97 из ваших логов относятся к сети/прокси.
+        # Не даём такому адресу мгновенно вернуться после refresh списка.
+        proxy_manager.mark_bad_proxy(proxy)
         return False, None
+
 
 def fetch_ebay_html_with_retry():
     return fetch_ebay_html_with_fixed_pair()
@@ -910,14 +1009,14 @@ def bot_worker():
 
 @app.route('/')
 def index():
-    return "eBay бот работает (Великобритания, обновлённые профили)"
+    return "eBay бот работает (Великобритания, согласованные native fingerprints)"
 
 @app.route('/health')
 def health():
     return "OK", 200
 
 if __name__ == "__main__":
-    send_telegram_message("🚀 Бот запущен (Великобритания, профили Chrome 153 / Firefox 155 / Safari 26.6). Команды /stop /start")
+    send_telegram_message("🚀 Бот запущен (Великобритания, native curl_cffi fingerprints). Команды /stop /start")
     threading.Thread(target=telegram_listener, daemon=True).start()
     worker_thread = threading.Thread(target=bot_worker, daemon=False)
     worker_thread.start()
