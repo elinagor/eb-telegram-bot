@@ -36,9 +36,10 @@ EBAY_SEARCH_URL = os.getenv("EBAY_SEARCH_URL")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 # Успешные проверки: нижняя граница берётся из Render.
-# При CHECK_INTERVAL=20 фактическая пауза будет 20-32 сек.
-# Ниже 20 сек. код не позволяет опускаться, чтобы не делать слишком частые запросы к eBay.
-CHECK_INTERVAL = max(20, int(os.getenv("CHECK_INTERVAL", "40")))
+# При CHECK_INTERVAL=15 фактическая пауза будет 15-27 сек.
+# Ниже 15 сек. код не позволяет опускаться: это новый безопасный нижний предел,
+# а случайный jitter +12 сек. сохраняет непостоянный ритм запросов к eBay.
+CHECK_INTERVAL = max(15, int(os.getenv("CHECK_INTERVAL", "40")))
 DATABASE_URL = os.getenv("DATABASE_URL")
 PROXY_LIST_URL = os.getenv("PROXY_LIST")
 # ProxyScrape обновляет бесплатный список примерно раз в минуту.
@@ -187,6 +188,12 @@ auction_reminder_wakeup_event = threading.Event()
 auction_status_wakeup_event = threading.Event()
 db_ready_event = threading.Event()
 leader_active_event = threading.Event()
+
+# Счётчик seen_items загружается из PostgreSQL один раз при старте leader-копии,
+# а затем увеличивается только на реально вставленное число новых item_id.
+# Так в логах снова видно общее количество товаров без SELECT COUNT(*) каждые 15-27 сек.
+seen_count_lock = threading.Lock()
+seen_count_cache = None
 
 def wake_auction_workers():
     # Раздельные Event исключают редкую гонку, когда один worker очищает общий сигнал,
@@ -412,7 +419,8 @@ class ProxyManager:
             return self._is_recent_good_locked(proxy)
 
     def _candidate_score_locked(self, proxy, now):
-        # Недавно успешные адреса всегда впереди, как только их короткий cooldown закончился.
+        # Недавно успешные адреса остаются приоритетными, но proxy с накопившейся
+        # серией 3+ ошибок больше не должен бесконечно вытеснять свежие кандидаты.
         last_ok = self.last_success_at.get(proxy, 0)
         age_ok = now - last_ok if last_ok else 10**9
         recent_bonus = 0.0
@@ -423,18 +431,26 @@ class ProxyManager:
         elif age_ok <= GOOD_PROXY_MEMORY:
             recent_bonus = 30.0
 
+        streak = self.fail_streak.get(proxy, 0)
         success_bonus = self.success_score.get(proxy, 0) * 8.0
-        fail_penalty = self.fail_streak.get(proxy, 0) * 4.0
+        fail_penalty = streak * 4.0
 
-        # По двум свежим UK-логам реальные победители были HTTP. Это лишь мягкий
-        # приоритет, SOCKS5 по-прежнему участвует в поиске.
+        # После 3-й подряд ошибки мягко снижаем исторический бонус. Proxy не банится
+        # и не исчезает из пула, но свежие адреса получают реальный шанс провериться.
+        unstable_penalty = max(0, streak - 2) * 20.0
+
+        # По UK-логам реальные победители чаще HTTP. Это лишь мягкий приоритет,
+        # SOCKS5 по-прежнему участвует в поиске.
         scheme_bonus = 1.2 if _proxy_scheme(proxy) in ('http', 'https') else 0.0
 
         # Давно не пробовавшиеся адреса немного выше только что проверенных.
         idle = now - self.last_used.get(proxy, 0)
         idle_bonus = min(4.0, idle / 60.0) if idle < 10**8 else 4.0
 
-        return recent_bonus + success_bonus + scheme_bonus + idle_bonus - fail_penalty + random.uniform(0, 2.0)
+        return (
+            recent_bonus + success_bonus + scheme_bonus + idle_bonus
+            - fail_penalty - unstable_penalty + random.uniform(0, 2.0)
+        )
 
     def get_candidate_batch(self, batch_size, tried_hosts=None, preferred_scheme=None):
         """Выдаёт несколько proxy с уникальными IP и разумным mix HTTP/SOCKS5.
@@ -487,9 +503,12 @@ class ProxyManager:
                 self.last_used[p] = now
                 return True
 
-            # 1) Любой недавно доказавший работоспособность proxy важнее protocol mix.
+            # 1) Стабильный недавно успешный proxy важнее protocol mix.
+            # Но после 3+ подряд ошибок он теряет абсолютный приоритет и дальше
+            # конкурирует с остальными по score — это не даёт старой плохой истории
+            # занимать все worker-слоты в тяжёлом discovery.
             for p in usable:
-                if self._is_recent_good_locked(p, now):
+                if self._is_recent_good_locked(p, now) and self.fail_streak.get(p, 0) <= 2:
                     add_candidate(p)
                     if len(batch) >= batch_size:
                         return batch
@@ -537,6 +556,55 @@ class ProxyManager:
                         break
 
             return batch
+
+    def get_due_reprobe_candidate(self, tried_proxies, reprobed_proxies, inflight_hosts=None):
+        """Возвращает один недавно успешный proxy для повторной проверки в ТОМ ЖЕ discovery.
+
+        Это решает сценарий из реального лога: хороший proxy временно упал, получил
+        короткий cooldown, был проверен в начале 75-секундного discovery, затем успел
+        восстановиться, но старый tried_hosts уже не позволял попробовать его снова.
+
+        Ограничения безопасности:
+        - только proxy, который реально был успешным в последний час;
+        - только если он уже пробовался в этом discovery и после этого успел выйти из cooldown;
+        - максимум ОДИН re-probe для конкретного proxy за discovery;
+        - только при fail_streak 1-2 (нестабильные 3+ не получают быстрый повтор);
+        - не запускаем второй запрос на тот же host, пока первый ещё in-flight.
+        """
+        tried_proxies = set(tried_proxies or ())
+        reprobed_proxies = set(reprobed_proxies or ())
+        inflight_hosts = set(inflight_hosts or ())
+        if not tried_proxies:
+            return None
+
+        now = time.time()
+        with self.lock:
+            self._cleanup_bad_locked()
+            candidates = []
+            for p in tried_proxies:
+                if p in reprobed_proxies:
+                    continue
+                if not self._is_recent_good_locked(p, now):
+                    continue
+                streak = self.fail_streak.get(p, 0)
+                if streak < 1 or streak > 2:
+                    continue
+                if self.bad_until.get(p, 0) > now:
+                    continue
+                host = _proxy_host(p)
+                if not host or host in inflight_hosts:
+                    continue
+                if self.host_bad_until.get(host, 0) > now:
+                    continue
+                candidates.append(p)
+
+            if not candidates:
+                return None
+
+            candidates.sort(key=lambda p: self._candidate_score_locked(p, now), reverse=True)
+            proxy = candidates[0]
+            self.last_used[proxy] = now
+            return proxy
 
     def mark_success(self, proxy):
         if not proxy:
@@ -724,6 +792,43 @@ def set_bot_state(key, value):
         conn.commit()
 
 
+def initialize_seen_count_cache():
+    """Один раз получает точное количество seen_items при старте leader-копии."""
+    global seen_count_cache
+    try:
+        with get_db_connection('ebay_uk_seen_count_init') as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM seen_items")
+                count = int(cur.fetchone()[0])
+        with seen_count_lock:
+            seen_count_cache = count
+        logging.info(f"📚 В базе seen_items: {count} товаров")
+        return count
+    except Exception as e:
+        # Сбой счётчика не должен останавливать мониторинг. Все основные операции БД
+        # продолжают работать как раньше; просто временно не показываем число.
+        logging.warning(f"Не удалось получить количество seen_items: {e}")
+        with seen_count_lock:
+            seen_count_cache = None
+        return None
+
+
+def get_seen_count_cached():
+    with seen_count_lock:
+        return seen_count_cache
+
+
+def _increment_seen_count_cache(delta):
+    global seen_count_cache
+    if not delta:
+        return get_seen_count_cached()
+    with seen_count_lock:
+        if seen_count_cache is None:
+            return None
+        seen_count_cache += int(delta)
+        return seen_count_cache
+
+
 def claim_new_seen_ids(item_ids):
     """Атомарно резервирует только действительно новые eBay item_id.
 
@@ -744,7 +849,11 @@ def claim_new_seen_ids(item_ids):
                 fetch=True,
             )
         conn.commit()
-    return {row[0] for row in returned}
+    claimed = {row[0] for row in returned}
+    total = _increment_seen_count_cache(len(claimed))
+    if claimed and total is not None:
+        logging.info(f"📚 В базе seen_items: {total} товаров (+{len(claimed)})")
+    return claimed
 
 
 def add_seen_ids_batch(item_ids):
@@ -753,6 +862,9 @@ def add_seen_ids_batch(item_ids):
 
 
 def is_db_empty():
+    cached = get_seen_count_cached()
+    if cached is not None:
+        return cached == 0
     with get_db_connection('ebay_uk_db_empty') as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT NOT EXISTS (SELECT 1 FROM seen_items LIMIT 1)")
@@ -2276,6 +2388,8 @@ def fetch_ebay_html_with_fixed_pair():
     # в группе, пока остальные worker-ы простаивают.
     started = time.monotonic()
     tried_hosts = set()
+    tried_proxies = set()
+    reprobed_proxies = set()
     attempts = 0
     refreshed_after_exhaustion = False
     profile = get_preferred_profile()
@@ -2319,11 +2433,34 @@ def fetch_ebay_html_with_fixed_pair():
             if _proxy_scheme(p) == 'socks5'
         )
         preferred_scheme = 'socks5' if desired >= 3 and inflight_socks == 0 else None
-        batch = proxy_manager.get_candidate_batch(
-            need,
-            tried_hosts=tried_hosts,
-            preferred_scheme=preferred_scheme,
+
+        batch = []
+
+        # Один контролируемый re-probe недавно успешного proxy после окончания его
+        # короткого cooldown прямо внутри текущего длинного discovery. Это не увеличивает
+        # concurrency: re-probe занимает только уже свободный worker-слот.
+        inflight_hosts = {_proxy_host(p) for p in future_to_proxy.values()}
+        reprobe = proxy_manager.get_due_reprobe_candidate(
+            tried_proxies=tried_proxies,
+            reprobed_proxies=reprobed_proxies,
+            inflight_hosts=inflight_hosts,
         )
+        if reprobe is not None and need > 0:
+            reprobed_proxies.add(reprobe)
+            batch.append(reprobe)
+            logging.info(
+                f"♻️ Re-probe недавно успешного proxy после cooldown: {reprobe}"
+            )
+
+        remaining_need = need - len(batch)
+        if remaining_need > 0:
+            batch.extend(
+                proxy_manager.get_candidate_batch(
+                    remaining_need,
+                    tried_hosts=tried_hosts,
+                    preferred_scheme=preferred_scheme,
+                )
+            )
 
         if not batch and not future_to_proxy and not refreshed_after_exhaustion:
             # Если реально закончились ещё не пробованные доступные IP, один раз берём
@@ -2331,7 +2468,9 @@ def fetch_ebay_html_with_fixed_pair():
             logging.info("♻️ Доступные уникальные IP исчерпаны; обновляем ProxyScrape и продолжаем")
             proxy_manager.refresh_proxies(force=True)
             refreshed_after_exhaustion = True
-            tried_hosts.clear()
+            # Старые hosts не очищаем: свежий ProxyScrape может добавить новые IP,
+            # и именно их нужно попробовать. Уже проверенные адреса не должны идти
+            # по третьему кругу; для recently-good существует отдельный one-shot re-probe.
             batch = proxy_manager.get_candidate_batch(
                 need,
                 tried_hosts=tried_hosts,
@@ -2345,9 +2484,11 @@ def fetch_ebay_html_with_fixed_pair():
             if attempts >= MAX_SEARCH_ATTEMPTS:
                 break
             tried_hosts.add(_proxy_host(proxy))
+            tried_proxies.add(proxy)
             attempts += 1
+            probe_kind = "Re-probe" if proxy in reprobed_proxies else "Probe"
             logging.info(
-                f"🔍 Probe {attempts}/{MAX_SEARCH_ATTEMPTS}: proxy {proxy}, "
+                f"🔍 {probe_kind} {attempts}/{MAX_SEARCH_ATTEMPTS}: proxy {proxy}, "
                 f"профиль {profile['name']}"
             )
             future = executor.submit(
@@ -3132,9 +3273,12 @@ def bot_worker():
     else:
         startup_line = "✅ Бот запущен / перезапущен"
 
+    seen_total = get_seen_count_cached()
+    seen_line = f"\n📚 В базе: {seen_total} товаров." if seen_total is not None else ""
     send_telegram_message(
         startup_line +
-        "\n🇬🇧 eBay UK monitor v6.4 работает."
+        "\n🇬🇧 eBay UK monitor v6.5 работает." +
+        seen_line +
         "\nКоманды: /stop /start /list (/auctions) /delauction НОМЕР_ЛОТА"
         "\nМожно отправить ссылку на eBay-аукцион — сохраню точное время и напомню заранее.",
         reply_markup=auction_list_only_keyboard(),
@@ -3169,6 +3313,7 @@ def bot_worker():
 def start_leader_workers():
     """Инициализирует БД и запускает фоновые задачи только в leader-instance."""
     init_db()
+    initialize_seen_count_cache()
     db_ready_event.set()
     leader_active_event.set()
     logging.info("👑 Эта Render-копия стала leader; запускаем фоновые worker-ы")
@@ -3216,7 +3361,7 @@ def leader_supervisor():
 @app.route('/')
 def index():
     role = "leader" if leader_active_event.is_set() else "standby"
-    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.4, {role})"
+    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.5, {role})"
 
 
 @app.route('/health')
