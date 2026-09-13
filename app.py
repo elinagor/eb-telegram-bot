@@ -35,7 +35,10 @@ load_dotenv()
 EBAY_SEARCH_URL = os.getenv("EBAY_SEARCH_URL")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-CHECK_INTERVAL = max(30, int(os.getenv("CHECK_INTERVAL", "40")))
+# Успешные проверки: нижняя граница берётся из Render.
+# При CHECK_INTERVAL=20 фактическая пауза будет 20-32 сек.
+# Ниже 20 сек. код не позволяет опускаться, чтобы не делать слишком частые запросы к eBay.
+CHECK_INTERVAL = max(20, int(os.getenv("CHECK_INTERVAL", "40")))
 DATABASE_URL = os.getenv("DATABASE_URL")
 PROXY_LIST_URL = os.getenv("PROXY_LIST")
 # ProxyScrape обновляет бесплатный список примерно раз в минуту.
@@ -119,7 +122,9 @@ MAX_SEARCH_ATTEMPTS = int(os.getenv("MAX_SEARCH_ATTEMPTS", "90"))
 GOOD_PROXY_MEMORY = 60 * 60
 SSL_PROXY_COOLDOWN = 60 * 60
 
-MAX_ITEMS = 20
+# Страница eBay запрашивается с _ipg=60; обрабатываем все 60 результатов первой страницы.
+# Это снижает риск пропустить товар при всплеске новых объявлений между проверками.
+MAX_ITEMS = 60
 RETRY_DELAY = 2
 GBP_TO_UAH = 60
 EXTRA_DELIVERY_COST = 120
@@ -128,7 +133,7 @@ def normalize_ebay_search_url(raw_url):
     """
     Убираем конфликтующие/дублированные параметры из URL Render.
     Для ebay.co.uk: LH_PrefLoc=1 = UK Only.
-    _ipg=60 достаточно: код всё равно анализирует только MAX_ITEMS=20,
+    _ipg=60 достаточно: код анализирует всю первую страницу (до MAX_ITEMS=60),
     зато ответ заметно меньше и устойчивее через proxy.
     """
     if not raw_url:
@@ -2755,7 +2760,7 @@ def perform_initial_snapshot():
     html = fetch_ebay_html_with_retry()
     if not html:
         return False
-    items = parse_ebay_listings(html, max_items=50)
+    items = parse_ebay_listings(html, max_items=MAX_ITEMS)
     if not items:
         return False
     add_seen_ids_batch(list(items.keys()))
@@ -2873,7 +2878,7 @@ def bot_worker():
 
     send_telegram_message(
         startup_line +
-        "\n🇬🇧 eBay UK monitor v6 работает."
+        "\n🇬🇧 eBay UK monitor v6.1 работает."
         "\nКоманды: /stop /start /list (/auctions) /delauction НОМЕР_ЛОТА"
         "\nМожно отправить ссылку на eBay-аукцион — сохраню точное время и напомню заранее.",
         reply_markup=auction_list_only_keyboard(),
@@ -2947,7 +2952,7 @@ def leader_supervisor():
 @app.route('/')
 def index():
     role = "leader" if leader_active_event.is_set() else "standby"
-    return f"eBay бот работает (Великобритания, adaptive parallel UK v6, {role})"
+    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.1, {role})"
 
 
 @app.route('/health')
