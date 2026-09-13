@@ -7,9 +7,12 @@ import re
 import json
 import threading
 import logging
+import queue
+import html as html_lib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 from bs4 import BeautifulSoup
 from flask import Flask
@@ -55,10 +58,37 @@ PROBE_FALLBACK_AFTER = float(os.getenv("PROBE_FALLBACK_AFTER", "45"))
 CONNECTION_ALERT_AFTER = max(60, int(os.getenv("CONNECTION_ALERT_AFTER", "600")))
 CONNECTION_WATCHDOG_INTERVAL = max(10, int(os.getenv("CONNECTION_WATCHDOG_INTERVAL", "15")))
 
+# ============ НАПОМИНАНИЯ ОБ АУКЦИОНАХ ============
+# Храним расписание в PostgreSQL (Aiven), поэтому рестарт/deploy Render не стирает его.
+# Планировщик не опрашивает БД каждые несколько секунд: он спит до ближайшего
+# события (не дольше минуты) и мгновенно просыпается при добавлении новой ссылки.
+AUCTION_REMINDER_MINUTES = (60, 30, 10, 5)
+AUCTION_SCHEDULER_MAX_SLEEP = max(15, int(os.getenv("AUCTION_SCHEDULER_MAX_SLEEP", "60")))
+AUCTION_FETCH_MAX_PROXIES = max(1, min(int(os.getenv("AUCTION_FETCH_MAX_PROXIES", "4")), 6))
+AUCTION_FETCH_CONNECT_TIMEOUT = float(os.getenv("AUCTION_FETCH_CONNECT_TIMEOUT", "5"))
+AUCTION_FETCH_READ_TIMEOUT = float(os.getenv("AUCTION_FETCH_READ_TIMEOUT", "14"))
+# Лёгкая проверка сохранённых аукционов: максимум два лота за проход. Это позволяет
+# заметить досрочное завершение/изменение end time, не создавая burst на eBay/Render.
+AUCTION_STATUS_BATCH = max(1, min(int(os.getenv("AUCTION_STATUS_BATCH", "1")), 2))
+AUCTION_STATUS_TICK = max(30, int(os.getenv("AUCTION_STATUS_TICK", "60")))
+AUCTION_STATUS_CONNECT_TIMEOUT = float(os.getenv("AUCTION_STATUS_CONNECT_TIMEOUT", "4"))
+AUCTION_STATUS_READ_TIMEOUT = float(os.getenv("AUCTION_STATUS_READ_TIMEOUT", "8"))
+# Не удаляем запись мгновенно в сохранённую секунду окончания: eBay официально
+# тестирует extended bidding в некоторых категориях. Grace даёт время увидеть
+# продление, даже если Render/proxy временно недоступны возле самого конца.
+AUCTION_END_GRACE = max(300, int(os.getenv("AUCTION_END_GRACE", "1800")))
+
+KYIV_TZ = ZoneInfo("Europe/Kyiv")
+LONDON_TZ = ZoneInfo("Europe/London")
+
 # Для уже найденной рабочей пары таймауты мягче: её не надо выбрасывать
 # только потому, что один ответ оказался чуть медленнее.
-FIXED_CONNECT_TIMEOUT = float(os.getenv("FIXED_CONNECT_TIMEOUT", "8"))
-FIXED_READ_TIMEOUT = float(os.getenv("FIXED_READ_TIMEOUT", "25"))
+FIXED_CONNECT_TIMEOUT = float(os.getenv("FIXED_CONNECT_TIMEOUT", "6"))
+FIXED_READ_TIMEOUT = float(os.getenv("FIXED_READ_TIMEOUT", "18"))
+# Если уже хороший proxy сорвался, даём ему ОДИН короткий шанс с новой Session.
+# Максимум около 12 сек., затем сразу начинаем discovery по другим proxy.
+FIXED_RECOVERY_CONNECT_TIMEOUT = float(os.getenv("FIXED_RECOVERY_CONNECT_TIMEOUT", "4"))
+FIXED_RECOVERY_READ_TIMEOUT = float(os.getenv("FIXED_RECOVERY_READ_TIMEOUT", "8"))
 
 # Один цикл discovery не должен зависать на минуты.
 SEARCH_TIME_BUDGET = int(os.getenv("SEARCH_TIME_BUDGET", "90"))
@@ -114,6 +144,13 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 app = Flask(__name__)
 
 is_paused = False
+
+# Telegram listener только кладёт ссылку в очередь и сразу возвращается к getUpdates.
+# Тяжёлое получение страницы eBay выполняется отдельным ОДНИМ worker'ом, чтобы
+# пользовательские ссылки не создавали параллельный burst и не мешали основному monitor.
+auction_add_queue = queue.Queue(maxsize=100)
+auction_wakeup_event = threading.Event()
+db_ready_event = threading.Event()
 
 # ============ КОНТРОЛЬ ДОСТУПНОСТИ EBAY ============
 # Используем monotonic(): системные часы Render могут корректироваться, а интервал
@@ -517,6 +554,32 @@ def init_db():
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute("CREATE TABLE IF NOT EXISTS seen_items (item_id TEXT PRIMARY KEY, first_seen TIMESTAMP)")
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS auction_reminders (
+                    item_id TEXT PRIMARY KEY,
+                    url TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    end_time_utc TIMESTAMPTZ NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    reminder_60_sent BOOLEAN NOT NULL DEFAULT FALSE,
+                    reminder_30_sent BOOLEAN NOT NULL DEFAULT FALSE,
+                    reminder_10_sent BOOLEAN NOT NULL DEFAULT FALSE,
+                    reminder_5_sent BOOLEAN NOT NULL DEFAULT FALSE,
+                    last_status_check TIMESTAMPTZ NULL
+                )
+                """
+            )
+            # Миграция для баз, созданных предыдущими версиями.
+            cur.execute(
+                "ALTER TABLE auction_reminders "
+                "ADD COLUMN IF NOT EXISTS last_status_check TIMESTAMPTZ NULL"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_auction_reminders_end_time "
+                "ON auction_reminders (end_time_utc)"
+            )
         conn.commit()
 
 def get_seen_ids():
@@ -540,10 +603,253 @@ def is_db_empty():
             cur.execute("SELECT NOT EXISTS (SELECT 1 FROM seen_items)")
             return cur.fetchone()[0]
 
+
+# ============ АУКЦИОНЫ: БД И ВРЕМЯ ============
+def _ensure_aware_utc(dt):
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def format_kyiv_datetime(dt):
+    dt = _ensure_aware_utc(dt).astimezone(KYIV_TZ)
+    return dt.strftime("%d.%m.%Y в %H:%M:%S")
+
+
+def format_remaining(seconds, with_seconds=True):
+    seconds = max(0, int(seconds))
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    parts = []
+    if days:
+        parts.append(f"{days} дн.")
+    if hours or days:
+        parts.append(f"{hours} ч.")
+    parts.append(f"{minutes} мин.")
+    if with_seconds and not days:
+        parts.append(f"{secs} сек.")
+    return " ".join(parts)
+
+
+def _initial_reminder_flags(end_time_utc):
+    remaining = (_ensure_aware_utc(end_time_utc) - datetime.now(timezone.utc)).total_seconds()
+    # Уже прошедшие пороги помечаем отправленными: если пользователь добавил лот
+    # за 22 минуты до конца, мы не шлём сразу "за час" и "за 30 минут".
+    return {
+        60: remaining <= 60 * 60,
+        30: remaining <= 30 * 60,
+        10: remaining <= 10 * 60,
+        5: remaining <= 5 * 60,
+    }
+
+
+def save_auction_reminder(item_id, url, title, end_time_utc):
+    end_time_utc = _ensure_aware_utc(end_time_utc)
+    flags = _initial_reminder_flags(end_time_utc)
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO auction_reminders (
+                    item_id, url, title, end_time_utc,
+                    reminder_60_sent, reminder_30_sent, reminder_10_sent, reminder_5_sent
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (item_id) DO UPDATE SET
+                    url = EXCLUDED.url,
+                    title = EXCLUDED.title,
+                    end_time_utc = EXCLUDED.end_time_utc,
+                    updated_at = NOW(),
+                    reminder_60_sent = CASE
+                        WHEN auction_reminders.end_time_utc = EXCLUDED.end_time_utc
+                        THEN auction_reminders.reminder_60_sent
+                        ELSE EXCLUDED.reminder_60_sent END,
+                    reminder_30_sent = CASE
+                        WHEN auction_reminders.end_time_utc = EXCLUDED.end_time_utc
+                        THEN auction_reminders.reminder_30_sent
+                        ELSE EXCLUDED.reminder_30_sent END,
+                    reminder_10_sent = CASE
+                        WHEN auction_reminders.end_time_utc = EXCLUDED.end_time_utc
+                        THEN auction_reminders.reminder_10_sent
+                        ELSE EXCLUDED.reminder_10_sent END,
+                    reminder_5_sent = CASE
+                        WHEN auction_reminders.end_time_utc = EXCLUDED.end_time_utc
+                        THEN auction_reminders.reminder_5_sent
+                        ELSE EXCLUDED.reminder_5_sent END
+                """,
+                (
+                    item_id, url, title, end_time_utc,
+                    flags[60], flags[30], flags[10], flags[5],
+                ),
+            )
+        conn.commit()
+    auction_wakeup_event.set()
+
+
+def list_active_auctions(limit=20):
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT item_id, url, title, end_time_utc
+                FROM auction_reminders
+                WHERE end_time_utc > NOW()
+                ORDER BY end_time_utc ASC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            return cur.fetchall()
+
+
+def delete_auction_reminder(item_id):
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM auction_reminders WHERE item_id = %s RETURNING item_id", (item_id,))
+            deleted = cur.fetchone() is not None
+        conn.commit()
+    auction_wakeup_event.set()
+    return deleted
+
+
+def mark_auction_status_checked(item_id):
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE auction_reminders SET last_status_check = NOW(), updated_at = NOW() WHERE item_id = %s",
+                (item_id,),
+            )
+        conn.commit()
+
+
+def update_verified_auction(item_id, title, new_end_time_utc):
+    """Обновляет title/end time и возвращает (exists, changed, old_end, new_end).
+
+    Если eBay сдвинул окончание, заново активируем только те reminders, чей новый
+    порог ещё впереди. Уже прошедшие пороги не шлём задним числом.
+    """
+    new_end_time_utc = _ensure_aware_utc(new_end_time_utc)
+    now = datetime.now(timezone.utc)
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT end_time_utc, reminder_60_sent, reminder_30_sent,
+                       reminder_10_sent, reminder_5_sent
+                FROM auction_reminders WHERE item_id = %s FOR UPDATE
+                """,
+                (item_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return False, False, None, new_end_time_utc
+            old_end, s60, s30, s10, s5 = row
+            old_end = _ensure_aware_utc(old_end)
+            changed = abs((old_end - new_end_time_utc).total_seconds()) > 5
+            if changed:
+                sent = {60: s60, 30: s30, 10: s10, 5: s5}
+                for mins in sent:
+                    if (new_end_time_utc - now).total_seconds() > mins * 60:
+                        sent[mins] = False
+                cur.execute(
+                    """
+                    UPDATE auction_reminders
+                    SET title=%s, end_time_utc=%s, last_status_check=NOW(), updated_at=NOW(),
+                        reminder_60_sent=%s, reminder_30_sent=%s,
+                        reminder_10_sent=%s, reminder_5_sent=%s
+                    WHERE item_id=%s
+                    """,
+                    (title, new_end_time_utc, sent[60], sent[30], sent[10], sent[5], item_id),
+                )
+            else:
+                cur.execute(
+                    "UPDATE auction_reminders SET title=%s, last_status_check=NOW(), updated_at=NOW() WHERE item_id=%s",
+                    (title, item_id),
+                )
+        conn.commit()
+    if changed:
+        auction_wakeup_event.set()
+    return True, changed, old_end, new_end_time_utc
+
+
+def get_auctions_for_status_check(limit=100):
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT item_id, url, title, end_time_utc, last_status_check
+                FROM auction_reminders
+                WHERE end_time_utc > NOW() - (%s * INTERVAL '1 second')
+                ORDER BY COALESCE(last_status_check, TIMESTAMPTZ '1970-01-01') ASC,
+                         end_time_utc ASC
+                LIMIT %s
+                """,
+                (AUCTION_END_GRACE, limit),
+            )
+            return cur.fetchall()
+
+
+def _status_check_interval_seconds(remaining):
+    # Возле самого конца проверяем чаще: если eBay продлит торги после ставки
+    # в последние 60 секунд, новое end time попадёт в БД до очистки записи.
+    if remaining <= 120:
+        return 30
+    if remaining <= 10 * 60:
+        return 60
+    if remaining > 24 * 3600:
+        return 3600
+    if remaining > 6 * 3600:
+        return 1800
+    if remaining > 3600:
+        return 900
+    return 300
+
+
+def _reminder_column(minutes):
+    mapping = {
+        60: 'reminder_60_sent',
+        30: 'reminder_30_sent',
+        10: 'reminder_10_sent',
+        5: 'reminder_5_sent',
+    }
+    return mapping[minutes]
+
+
+def _mark_reminder_sent(conn, item_id, minutes):
+    column = _reminder_column(minutes)
+    # column приходит только из жёсткого mapping выше, пользовательского SQL здесь нет.
+    with conn.cursor() as cur:
+        cur.execute(
+            f"UPDATE auction_reminders SET {column} = TRUE, updated_at = NOW() WHERE item_id = %s",
+            (item_id,),
+        )
+    conn.commit()
+
+
+def _delete_expired_auctions(conn, now_utc):
+    cutoff = now_utc - timedelta(seconds=AUCTION_END_GRACE)
+    with conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM auction_reminders WHERE end_time_utc <= %s RETURNING item_id",
+            (cutoff,),
+        )
+        deleted = cur.fetchall()
+    conn.commit()
+    if deleted:
+        logging.info(f"🧹 Удалено завершённых аукционов из reminders: {len(deleted)}")
+
+
 # ============ TELEGRAM ============
-def send_telegram_message(message, parse_mode='HTML'):
+def send_telegram_message(message, parse_mode='HTML', reply_markup=None, disable_preview=False):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': message, 'parse_mode': parse_mode, 'disable_web_page_preview': False}
+    payload = {
+        'chat_id': TELEGRAM_CHAT_ID,
+        'text': message,
+        'parse_mode': parse_mode,
+        'disable_web_page_preview': disable_preview,
+    }
+    if reply_markup is not None:
+        payload['reply_markup'] = reply_markup
     try:
         r = requests.post(url, json=payload, timeout=10)
         if r.status_code != 200:
@@ -554,6 +860,50 @@ def send_telegram_message(message, parse_mode='HTML'):
         logging.error(f"Не удалось отправить в Telegram: {e}")
         return False
 
+
+def answer_callback_query(callback_query_id, text=None, show_alert=False):
+    if not callback_query_id:
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery"
+    payload = {'callback_query_id': callback_query_id, 'show_alert': bool(show_alert)}
+    if text:
+        payload['text'] = str(text)[:200]
+    try:
+        r = requests.post(url, json=payload, timeout=8)
+        return r.status_code == 200
+    except Exception as e:
+        logging.error(f"Не удалось ответить на callback Telegram: {e}")
+        return False
+
+
+def edit_message_reply_markup(message_id, reply_markup=None):
+    if not message_id:
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageReplyMarkup"
+    payload = {
+        'chat_id': TELEGRAM_CHAT_ID,
+        'message_id': message_id,
+        'reply_markup': reply_markup or {'inline_keyboard': []},
+    }
+    try:
+        r = requests.post(url, json=payload, timeout=8)
+        return r.status_code == 200
+    except Exception as e:
+        logging.error(f"Не удалось обновить кнопки Telegram: {e}")
+        return False
+
+
+def auction_message_keyboard(item_id, url, include_list=True):
+    rows = [[{'text': '🔗 Открыть eBay', 'url': url}]]
+    bottom = [{'text': '🗑 Удалить', 'callback_data': f'aucdel:{item_id}'}]
+    if include_list:
+        bottom.append({'text': '📋 Все аукционы', 'callback_data': 'auclist'})
+    rows.append(bottom)
+    return {'inline_keyboard': rows}
+
+
+def auction_list_only_keyboard():
+    return {'inline_keyboard': [[{'text': '📋 Все аукционы', 'callback_data': 'auclist'}]]}
 
 def connection_watchdog():
     """Шлёт ровно одно предупреждение на один непрерывный outage >= 10 минут."""
@@ -605,6 +955,659 @@ def connection_watchdog():
             time.sleep(CONNECTION_WATCHDOG_INTERVAL)
 
 
+
+# ============ TELEGRAM -> EBAY AUCTION REMINDERS ============
+def _is_allowed_ebay_url(url):
+    try:
+        host = (urlsplit(url).hostname or '').lower().rstrip('.')
+    except Exception:
+        return False
+    allowed = ('ebay.co.uk', 'ebay.com', 'ebay.us')
+    return any(host == suffix or host.endswith('.' + suffix) for suffix in allowed)
+
+
+def extract_ebay_urls(text):
+    urls = []
+    for raw in re.findall(r'https?://[^\s<>]+', text or '', flags=re.I):
+        url = raw.rstrip(').,;]>}\"\'')
+        if _is_allowed_ebay_url(url) and url not in urls:
+            urls.append(url)
+    return urls
+
+
+def extract_ebay_item_id_any(url, html=None):
+    for source in (url or '', html or ''):
+        patterns = (
+            r'/itm/(?:[^/?#]+/)?(\d{9,15})(?:[/?#]|$)',
+            r'[?&](?:item|itemid|item_id)=(\d{9,15})(?:&|$)',
+            r'eBay\s+item\s+number\s*:?\s*(\d{9,15})',
+            r'"itemId"\s*:\s*"?(\d{9,15})"?',
+        )
+        for pattern in patterns:
+            m = re.search(pattern, source, re.I)
+            if m:
+                return m.group(1)
+    return None
+
+
+def _request_auction_page_once(url, proxy, profile, connect_timeout=None, read_timeout=None):
+    session = None
+    connect_timeout = AUCTION_FETCH_CONNECT_TIMEOUT if connect_timeout is None else connect_timeout
+    read_timeout = AUCTION_FETCH_READ_TIMEOUT if read_timeout is None else read_timeout
+    try:
+        session = _create_session(proxy, profile, timeout=(connect_timeout, read_timeout))
+        response = session.get(
+            url,
+            timeout=(connect_timeout, read_timeout),
+            allow_redirects=True,
+        )
+        final_url = str(getattr(response, 'url', '') or '')
+        if response.status_code not in (200, 404, 410):
+            return None, final_url
+        blocked, _ = _is_ebay_block_page(response)
+        if blocked:
+            return None, final_url
+        if final_url and not _is_allowed_ebay_url(final_url):
+            return None, final_url
+        return response.text, final_url
+    except Exception as e:
+        logging.info(f"Auction page через {proxy} не получена: {e}")
+        return None, ''
+    finally:
+        close_session(session)
+
+
+def fetch_auction_page(url, max_reserve_proxies=None, connect_timeout=None, read_timeout=None):
+    """Редкая операция: fixed proxy первым, затем небольшой резерв без burst."""
+    if not _is_allowed_ebay_url(url):
+        return None, None, None
+
+    profile = get_preferred_profile()
+    if profile is None:
+        return None, None, None
+
+    if max_reserve_proxies is None:
+        max_reserve_proxies = AUCTION_FETCH_MAX_PROXIES
+    max_reserve_proxies = max(0, min(int(max_reserve_proxies), 6))
+
+    candidates = []
+    current_fixed = fixed_proxy
+    if current_fixed:
+        candidates.append(current_fixed)
+
+    tried_hosts = {_proxy_host(p) for p in candidates if p}
+    if max_reserve_proxies:
+        for p in proxy_manager.get_candidate_batch(max_reserve_proxies, tried_hosts=tried_hosts):
+            if p not in candidates:
+                candidates.append(p)
+
+    for proxy in candidates[:1 + max_reserve_proxies]:
+        html, final_url = _request_auction_page_once(
+            url, proxy, profile,
+            connect_timeout=connect_timeout,
+            read_timeout=read_timeout,
+        )
+        if html:
+            return html, final_url or url, proxy
+    return None, None, None
+
+def _parse_iso_datetime(value):
+    if not value:
+        return None
+    try:
+        normalized = value.strip().replace('Z', '+00:00')
+        dt = datetime.fromisoformat(normalized)
+        return _ensure_aware_utc(dt)
+    except Exception:
+        return None
+
+
+def parse_auction_page(html, final_url):
+    """Возвращает item_id, title, exact end_time_utc, source, status.
+
+    status: active | ended | not_auction | no_item_id | no_exact_end_time | time_conflict
+    В fixed-price листинге один itemEndDate НЕ считается доказательством аукциона.
+    """
+    if not html:
+        return None, None, None, 'empty', 'unknown'
+
+    soup = BeautifulSoup(html, 'html.parser')
+    visible = re.sub(r'\s+', ' ', soup.get_text(' ', strip=True))
+    item_id = extract_ebay_item_id_any(final_url, html)
+
+    title = ''
+    h1 = soup.find('h1')
+    if h1:
+        title = re.sub(r'\s+', ' ', h1.get_text(' ', strip=True)).strip()
+    if not title:
+        title = _response_title(html)
+        title = re.sub(r'\s*\|\s*eBay(?:\s+UK)?\s*$', '', title, flags=re.I).strip()
+    title = title[:300] or f'eBay item {item_id or ""}'.strip()
+
+    # 1) Точное время, которое eBay показывает пользователю. Учитываем явный BST/GMT,
+    # а не предполагаем смещение: BST=UTC+1, GMT=UTC+0.
+    visible_end_utc = None
+    visible_kind = None
+    m = re.search(
+        r'\b(Ends|Ended)\s*:?\s*'
+        r'(\d{1,2}\s+[A-Za-z]{3},\s+\d{4}\s+\d{1,2}:\d{2}:\d{2})'
+        r'\s*(BST|GMT)\b',
+        visible,
+        re.I,
+    )
+    if m:
+        try:
+            naive = datetime.strptime(m.group(2), '%d %b, %Y %H:%M:%S')
+            offset = timedelta(hours=1 if m.group(3).upper() == 'BST' else 0)
+            visible_end_utc = naive.replace(tzinfo=timezone(offset)).astimezone(timezone.utc)
+            visible_kind = m.group(1).lower()
+        except ValueError:
+            pass
+
+    # 2) Независимый UTC timestamp из данных страницы — используем как fallback
+    # и как перекрёстную проверку, когда доступны оба источника.
+    iso_end_utc = None
+    patterns = (
+        r'"itemEndDate"\s*:\s*"([^"\\]+)"',
+        r'\\"itemEndDate\\"\s*:\s*\\"([^"\\]+)\\"',
+    )
+    # В большой eBay-странице есть recommendation-карточки с чужими end dates.
+    # Поэтому сначала ищем timestamp только рядом с ID текущего лота.
+    windows = []
+    if item_id:
+        for mm in re.finditer(re.escape(item_id), html):
+            windows.append(html[mm.start(): min(len(html), mm.end()+9000)])
+            if len(windows) >= 8:
+                break
+    for window in windows:
+        for pattern in patterns:
+            m2 = re.search(pattern, window, re.I)
+            if m2:
+                iso_end_utc = _parse_iso_datetime(m2.group(1))
+                if iso_end_utc:
+                    break
+        if iso_end_utc:
+            break
+    # Если рядом с item_id ключа нет, используем его только когда на всей странице
+    # найден ровно один уникальный itemEndDate — так не перепутаем с рекомендациями.
+    if iso_end_utc is None:
+        raw_values = []
+        for pattern in patterns:
+            raw_values.extend(re.findall(pattern, html, re.I))
+        unique_values = list(dict.fromkeys(raw_values))
+        if len(unique_values) == 1:
+            iso_end_utc = _parse_iso_datetime(unique_values[0])
+
+    if visible_end_utc and iso_end_utc:
+        if abs((visible_end_utc - iso_end_utc).total_seconds()) > 5:
+            return item_id, title, None, 'visible_vs_itemEndDate_conflict', 'time_conflict'
+        end_time_utc = visible_end_utc
+        source = 'visible_exact_uk_time+itemEndDate'
+    elif visible_end_utc:
+        end_time_utc = visible_end_utc
+        source = 'visible_exact_uk_time'
+    elif iso_end_utc:
+        end_time_utc = iso_end_utc
+        source = 'itemEndDate'
+    else:
+        end_time_utc = None
+        source = 'none'
+
+    # Положительное подтверждение аукциона. Не доверяем словам из recommendation-карточек:
+    # структурный AUCTION ищем рядом с item_id, а видимые признаки — характерные для bid box.
+    bid_box_marker = bool(
+        re.search(r'\bplace\s+bid\b', visible, re.I)
+        or re.search(r'\bcurrent\s+bid\b', visible, re.I)
+        or re.search(r'\bstarting\s+bid\b', visible, re.I)
+    )
+    structured_auction = False
+    if item_id:
+        for mm in re.finditer(re.escape(item_id), html):
+            window = html[mm.start(): min(len(html), mm.end()+7000)]
+            if (re.search(r'"buyingOptions"\s*:\s*\[[^\]]*"AUCTION"', window, re.I)
+                    or re.search(r'\\"buyingOptions\\"\s*:\s*\[[^\]]*\\"AUCTION\\"', window, re.I)
+                    or re.search(r'"listingType"\s*:\s*"Auction"', window, re.I)
+                    or re.search(r'"format"\s*:\s*"AUCTION"', window, re.I)):
+                structured_auction = True
+                break
+
+    explicit_closed = bool(
+        visible_kind == 'ended'
+        or re.search(r'\bthis\s+listing\s+(?:has\s+)?ended\b', visible, re.I)
+        or re.search(r'\bthis\s+listing\s+was\s+ended\b', visible, re.I)
+        or re.search(r'\bthis\s+item\s+is\s+no\s+longer\s+available\b', visible, re.I)
+        or re.search(r'\bthe\s+listing\s+you(?:’|\'|\s)?re\s+looking\s+for\s+has\s+ended\b', visible, re.I)
+        or re.search(r'\bwe\s+looked\s+everywhere.*looks\s+like\s+this\s+page\s+is\s+missing\b', visible, re.I)
+    )
+
+    if not item_id:
+        return None, title, end_time_utc, source, 'no_item_id'
+    if explicit_closed:
+        return item_id, title, end_time_utc, source, 'ended'
+    if not end_time_utc:
+        return item_id, title, None, source, 'no_exact_end_time'
+    if not (bid_box_marker or structured_auction):
+        return item_id, title, end_time_utc, source, 'not_auction'
+    return item_id, title, end_time_utc, source, 'active'
+
+def _future_reminder_labels(end_time_utc):
+    remaining = (_ensure_aware_utc(end_time_utc) - datetime.now(timezone.utc)).total_seconds()
+    labels = []
+    for mins, label in ((60, '1 час'), (30, '30 минут'), (10, '10 минут'), (5, '5 минут')):
+        if remaining > mins * 60:
+            labels.append(label)
+    return labels
+
+
+def process_auction_link(url):
+    if not _is_allowed_ebay_url(url):
+        return
+
+    html, final_url, proxy_used = fetch_auction_page(url)
+    if not html:
+        send_telegram_message(
+            "❌ <b>Не удалось проверить аукцион</b>\n\n"
+            "eBay сейчас не дал открыть страницу через доступные proxy. "
+            "Основной мониторинг продолжает работать. Попробуйте отправить ссылку ещё раз немного позже."
+        )
+        return
+
+    parse_url = final_url if extract_ebay_item_id_any(final_url or '') else url
+    item_id, title, end_time_utc, parse_source, auction_status = parse_auction_page(html, parse_url)
+    if proxy_used and item_id:
+        proxy_manager.mark_success(proxy_used)
+
+    if not item_id:
+        send_telegram_message("❌ Не удалось определить номер лота eBay по этой ссылке.")
+        return
+    if auction_status == 'time_conflict':
+        send_telegram_message(
+            "⚠️ <b>eBay показал противоречивое время окончания.</b>\n\n"
+            "Я специально не сохраняю такой лот автоматически, чтобы не дать неверное напоминание. "
+            "Попробуйте отправить ссылку ещё раз через минуту."
+        )
+        return
+    if auction_status == 'ended':
+        line = f"\n🕒 Окончание по Киеву: <b>{format_kyiv_datetime(end_time_utc)}</b>" if end_time_utc else ''
+        send_telegram_message("⌛ <b>Этот аукцион уже завершён.</b>" + line)
+        return
+    if auction_status == 'not_auction':
+        send_telegram_message(
+            "ℹ️ <b>Это не активный аукцион со ставками.</b>\n\n"
+            "Обычные товары Buy It Now / Best Offer без режима торгов в список напоминаний не сохраняются."
+        )
+        return
+    if auction_status != 'active' or not end_time_utc:
+        send_telegram_message(
+            "❌ <b>Не удалось точно подтвердить активный аукцион и время его окончания.</b>\n\n"
+            "Я не сохраняю приблизительное время, чтобы вы не пропустили ставку из-за неверного расчёта."
+        )
+        return
+
+    end_time_utc = _ensure_aware_utc(end_time_utc)
+    remaining = (end_time_utc - datetime.now(timezone.utc)).total_seconds()
+    if remaining <= 0:
+        send_telegram_message(
+            "⌛ <b>Этот аукцион уже завершён.</b>\n\n"
+            f"🕒 Окончание по Киеву: <b>{format_kyiv_datetime(end_time_utc)}</b>"
+        )
+        return
+
+    canonical_url = f"https://www.ebay.co.uk/itm/{item_id}"
+    save_auction_reminder(item_id, canonical_url, title, end_time_utc)
+    mark_auction_status_checked(item_id)
+
+    safe_title = html_lib.escape(title)
+    labels = _future_reminder_labels(end_time_utc)
+    if labels:
+        reminder_line = "🔔 Напомню: <b>" + ", ".join(labels) + "</b> до окончания."
+    else:
+        reminder_line = "⚠️ До конца меньше 5 минут — плановые напоминания уже прошли."
+
+    message = (
+        "✅ <b>Аукцион сохранён</b> 🇬🇧\n\n"
+        f"📦 <b>{safe_title}</b>\n\n"
+        f"🕒 Окончание по Киеву: <b>{format_kyiv_datetime(end_time_utc)}</b>\n"
+        f"⏳ Осталось: <b>{format_remaining(remaining)}</b>\n"
+        f"{reminder_line}\n\n"
+        "✅ Время подтверждено по странице eBay и сохранено в PostgreSQL."
+    )
+    send_telegram_message(
+        message,
+        reply_markup=auction_message_keyboard(item_id, canonical_url),
+        disable_preview=True,
+    )
+    logging.info(
+        f"⏰ Auction reminder сохранён: item={item_id}, end_utc={end_time_utc.isoformat()}, source={parse_source}"
+    )
+
+def auction_link_worker():
+    logging.info("🔗 Worker ссылок на eBay-аукционы запущен")
+    db_ready_event.wait()
+    while True:
+        url = auction_add_queue.get()
+        try:
+            process_auction_link(url)
+        except Exception as e:
+            logging.error(f"Ошибка обработки auction URL {url}: {e}", exc_info=True)
+            send_telegram_message(
+                "❌ Не удалось обработать ссылку на аукцион из-за временной внутренней ошибки. "
+                "Основной мониторинг продолжает работать."
+            )
+        finally:
+            auction_add_queue.task_done()
+
+
+def send_auction_list():
+    try:
+        rows = list_active_auctions(limit=20)
+    except Exception as e:
+        logging.error(f"Не удалось получить список аукционов: {e}")
+        send_telegram_message("❌ Не удалось сейчас прочитать список аукционов из базы.")
+        return
+
+    if not rows:
+        send_telegram_message("📭 <b>Активных аукционов для напоминаний сейчас нет.</b>")
+        return
+
+    now = datetime.now(timezone.utc)
+    parts = ["⏰ <b>Мои аукционы eBay UK</b> 🇬🇧\n"]
+    keyboard = []
+    for idx, (item_id, url, title, end_time) in enumerate(rows, 1):
+        end_time = _ensure_aware_utc(end_time)
+        remaining = max(0, (end_time - now).total_seconds())
+        short_title = title if len(title) <= 70 else title[:67] + '…'
+        parts.append(
+            f"\n<b>{idx}.</b> {html_lib.escape(short_title)}\n"
+            f"🕒 <b>{format_kyiv_datetime(end_time)}</b>\n"
+            f"⏳ {format_remaining(remaining, with_seconds=False)}"
+        )
+        keyboard.append([
+            {'text': f'🔗 Открыть #{idx}', 'url': url},
+            {'text': f'🗑 Удалить #{idx}', 'callback_data': f'aucdel:{item_id}'},
+        ])
+
+    parts.append("\n\nНажмите 🗑 возле нужного аукциона — номер вводить вручную не нужно.")
+    send_telegram_message(
+        ''.join(parts),
+        reply_markup={'inline_keyboard': keyboard},
+        disable_preview=True,
+    )
+
+
+def _notify_auction_closed_early(item_id, url, title, expected_end, detected_end=None):
+    # DELETE ... RETURNING делает уведомление однократным даже если два worker'а
+    # почти одновременно обнаружили закрытие.
+    if not delete_auction_reminder(item_id):
+        return False
+    safe_title = html_lib.escape(title)
+    msg = (
+        "🚫 <b>Аукцион eBay завершён раньше времени</b> 🇬🇧\n\n"
+        f"📦 <b>{safe_title}</b>\n\n"
+        f"🗓 Было сохранено окончание: <b>{format_kyiv_datetime(expected_end)}</b>\n"
+    )
+    if detected_end:
+        msg += f"🕒 eBay показывает завершение: <b>{format_kyiv_datetime(detected_end)}</b>\n"
+    msg += (
+        "\nЛот больше не является активным аукционом, поэтому я автоматически удалил его "
+        "из списка напоминаний."
+    )
+    send_telegram_message(
+        msg,
+        reply_markup={'inline_keyboard': [[
+            {'text': '🔗 Открыть eBay', 'url': url},
+            {'text': '📋 Все аукционы', 'callback_data': 'auclist'},
+        ]]},
+        disable_preview=True,
+    )
+    return True
+
+
+def verify_saved_auction(item_id, url, title, expected_end, max_reserve_proxies=1, notify_time_change=True):
+    """Проверяет сохранённый лот. Никогда не удаляет запись из-за network/proxy ошибки."""
+    html, final_url, proxy_used = fetch_auction_page(
+        url,
+        max_reserve_proxies=max_reserve_proxies,
+        connect_timeout=AUCTION_STATUS_CONNECT_TIMEOUT,
+        read_timeout=AUCTION_STATUS_READ_TIMEOUT,
+    )
+    if not html:
+        return 'unverified'
+
+    parse_url = final_url if extract_ebay_item_id_any(final_url or '') else url
+    parsed_id, parsed_title, parsed_end, source, status = parse_auction_page(html, parse_url)
+    if proxy_used and parsed_id:
+        proxy_manager.mark_success(proxy_used)
+    if parsed_id and parsed_id != item_id:
+        logging.warning(f"Auction status mismatch: expected {item_id}, page {parsed_id}")
+        return 'unverified'
+
+    now = datetime.now(timezone.utc)
+    expected_end = _ensure_aware_utc(expected_end)
+
+    if status == 'ended':
+        # Сообщаем именно о досрочном закрытии. Если подошло обычное время конца,
+        # scheduler просто удалит запись как завершённую.
+        if now < expected_end - timedelta(seconds=30):
+            _notify_auction_closed_early(item_id, url, title, expected_end, parsed_end)
+            return 'closed'
+        delete_auction_reminder(item_id)
+        return 'ended_normally'
+
+    if status == 'active' and parsed_end:
+        exists, changed, old_end, new_end = update_verified_auction(
+            item_id, parsed_title or title, parsed_end
+        )
+        if not exists:
+            return 'missing'
+        if changed:
+            if notify_time_change:
+                delta = int((new_end - old_end).total_seconds())
+                direction = 'позже' if delta > 0 else 'раньше'
+                send_telegram_message(
+                    "🔄 <b>eBay изменил время окончания аукциона</b>\n\n"
+                    f"📦 <b>{html_lib.escape(parsed_title or title)}</b>\n"
+                    f"🕒 Новое время по Киеву: <b>{format_kyiv_datetime(new_end)}</b>\n"
+                    f"↔️ Изменение: <b>{abs(delta)} сек. {direction}</b>\n\n"
+                    "Расписание напоминаний автоматически пересчитано.",
+                    reply_markup=auction_message_keyboard(item_id, url),
+                    disable_preview=True,
+                )
+            logging.info(
+                f"🔄 Auction {item_id}: end time changed {old_end.isoformat()} -> {new_end.isoformat()} ({source})"
+            )
+            return 'time_changed'
+        return 'active'
+
+    # Страница получена, но нет достаточного положительного подтверждения закрытия —
+    # НЕ удаляем лот. Это защищает от временной смены HTML eBay.
+    mark_auction_status_checked(item_id)
+    return status
+
+
+def auction_status_worker():
+    """Низкочастотная проверка досрочно закрытых лотов и сдвига времени eBay."""
+    logging.info("🛰 Worker контроля сохранённых аукционов запущен")
+    db_ready_event.wait()
+    while True:
+        try:
+            # Не создаём дополнительный трафик, когда основной монитор сам сейчас
+            # испытывает проблемы с доступом к eBay.
+            elapsed, _, had_success = _connection_outage_snapshot()
+            healthy = is_paused or (had_success and elapsed < 180)
+            if healthy:
+                rows = get_auctions_for_status_check(limit=100)
+                now = datetime.now(timezone.utc)
+                due = []
+                for item_id, url, title, end_time, last_check in rows:
+                    end_time = _ensure_aware_utc(end_time)
+                    remaining = (end_time - now).total_seconds()
+                    interval = _status_check_interval_seconds(remaining)
+                    if last_check is None or (now - _ensure_aware_utc(last_check)).total_seconds() >= interval:
+                        due.append((item_id, url, title, end_time))
+                    if len(due) >= AUCTION_STATUS_BATCH:
+                        break
+
+                for item_id, url, title, end_time in due:
+                    verify_saved_auction(
+                        item_id, url, title, end_time,
+                        max_reserve_proxies=1,
+                        notify_time_change=True,
+                    )
+                    time.sleep(random.uniform(1.0, 2.0))
+        except Exception as e:
+            logging.error(f"Ошибка auction status worker: {e}", exc_info=True)
+        auction_wakeup_event.wait(timeout=AUCTION_STATUS_TICK)
+        auction_wakeup_event.clear()
+
+
+def handle_telegram_callback(callback):
+    callback_id = callback.get('id')
+    data = str(callback.get('data') or '')
+    message = callback.get('message') or {}
+    chat_id = str((message.get('chat') or {}).get('id') or '')
+    if chat_id != str(TELEGRAM_CHAT_ID):
+        answer_callback_query(callback_id, "Недоступно", show_alert=False)
+        return
+
+    if data == 'auclist':
+        answer_callback_query(callback_id, "Открываю список…")
+        send_auction_list()
+        return
+
+    m = re.fullmatch(r'aucdel:(\d{9,15})', data)
+    if m:
+        item_id = m.group(1)
+        if delete_auction_reminder(item_id):
+            answer_callback_query(callback_id, "Аукцион удалён ✅")
+            edit_message_reply_markup(message.get('message_id'), auction_list_only_keyboard())
+        else:
+            answer_callback_query(callback_id, "Уже удалён или завершён")
+        return
+
+    answer_callback_query(callback_id)
+
+
+def auction_reminder_worker():
+    """Точный scheduler: PostgreSQL хранит sent-флаги и переживает deploy/restart."""
+    logging.info("⏰ Планировщик auction reminders запущен")
+    db_ready_event.wait()
+    conn = None
+    while True:
+        next_sleep = AUCTION_SCHEDULER_MAX_SLEEP
+        try:
+            if conn is None or conn.closed:
+                conn = get_db_connection()
+
+            now = datetime.now(timezone.utc)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT item_id, url, title, end_time_utc,
+                           reminder_60_sent, reminder_30_sent, reminder_10_sent, reminder_5_sent,
+                           last_status_check
+                    FROM auction_reminders
+                    WHERE end_time_utc > %s
+                    ORDER BY end_time_utc ASC
+                    LIMIT 200
+                    """,
+                    (now,),
+                )
+                rows = cur.fetchall()
+
+            for row in rows:
+                item_id, url, title, end_time, sent60, sent30, sent10, sent5, last_check = row
+                end_time = _ensure_aware_utc(end_time)
+                remaining = (end_time - now).total_seconds()
+                sent_map = {60: sent60, 30: sent30, 10: sent10, 5: sent5}
+
+                for minutes in AUCTION_REMINDER_MINUTES:
+                    if sent_map[minutes]:
+                        continue
+                    trigger_time = end_time - timedelta(minutes=minutes)
+                    seconds_to_trigger = (trigger_time - now).total_seconds()
+
+                    if seconds_to_trigger <= 0 < remaining:
+                        # Перед важным reminder стараемся подтвердить, что лот ещё активен.
+                        # Если сеть/proxy не дали проверить — НЕ задерживаем и НЕ пропускаем reminder.
+                        check_is_stale = (
+                            last_check is None
+                            or (now - _ensure_aware_utc(last_check)).total_seconds() > 180
+                        )
+                        if check_is_stale:
+                            verification = verify_saved_auction(
+                                item_id, url, title, end_time,
+                                max_reserve_proxies=1,
+                                notify_time_change=True,
+                            )
+                            if verification in ('closed', 'ended_normally', 'missing'):
+                                break
+                            if verification == 'time_changed':
+                                # Новое end time уже в БД — этот старый trigger не отправляем.
+                                break
+
+                        # Запись могла быть удалена/изменена verification worker'ом.
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                "SELECT end_time_utc, " + _reminder_column(minutes) +
+                                " FROM auction_reminders WHERE item_id=%s",
+                                (item_id,),
+                            )
+                            current = cur.fetchone()
+                        if not current:
+                            break
+                        current_end, already_sent = current
+                        current_end = _ensure_aware_utc(current_end)
+                        if already_sent:
+                            sent_map[minutes] = True
+                            continue
+                        if abs((current_end - end_time).total_seconds()) > 5:
+                            break
+
+                        now_send = datetime.now(timezone.utc)
+                        remaining_send = max(0, (current_end - now_send).total_seconds())
+                        if remaining_send <= 0:
+                            break
+
+                        safe_title = html_lib.escape(title)
+                        label = '1 час' if minutes == 60 else f'{minutes} минут'
+                        msg = (
+                            "⏰ <b>Напоминание об аукционе eBay UK</b> 🇬🇧\n\n"
+                            f"🔔 Плановое напоминание: <b>за {label}</b>\n"
+                            f"📦 <b>{safe_title}</b>\n\n"
+                            f"⏳ До окончания сейчас: <b>{format_remaining(remaining_send)}</b>\n"
+                            f"🕒 Окончание по Киеву: <b>{format_kyiv_datetime(current_end)}</b>"
+                        )
+                        if send_telegram_message(
+                            msg,
+                            reply_markup=auction_message_keyboard(item_id, url),
+                            disable_preview=True,
+                        ):
+                            _mark_reminder_sent(conn, item_id, minutes)
+                            sent_map[minutes] = True
+                            logging.info(f"📨 Auction {item_id}: отправлено reminder {minutes} мин")
+                    elif seconds_to_trigger > 0:
+                        next_sleep = min(next_sleep, max(1.0, seconds_to_trigger))
+
+                next_sleep = min(next_sleep, max(1.0, remaining))
+
+            _delete_expired_auctions(conn, datetime.now(timezone.utc))
+
+        except Exception as e:
+            logging.error(f"Ошибка auction reminder scheduler: {e}", exc_info=True)
+            try:
+                if conn is not None:
+                    conn.rollback()
+                    conn.close()
+            except Exception:
+                pass
+            conn = None
+            next_sleep = 15
+
+        auction_wakeup_event.wait(timeout=max(1.0, min(float(next_sleep), AUCTION_SCHEDULER_MAX_SLEEP)))
+        auction_wakeup_event.clear()
+
+
 def telegram_listener():
     global is_paused
     logging.info("🔁 Поток слушателя команд Telegram запущен")
@@ -618,22 +1621,58 @@ def telegram_listener():
                 updates = r.json().get('result', [])
                 for update in updates:
                     last_update_id = update['update_id']
+
+                    callback = update.get('callback_query')
+                    if callback:
+                        handle_telegram_callback(callback)
+                        continue
+
                     message = update.get('message')
                     if message and str(message.get('chat', {}).get('id')) == TELEGRAM_CHAT_ID:
                         text = message.get('text', '').strip()
                         if text == '/stop':
                             is_paused = True
-                            send_telegram_message("⏸ Бот приостановлен. Для возобновления отправьте /start")
-                            logging.info("Команда /stop - пауза")
+                            send_telegram_message("⏸ Основной мониторинг новых товаров приостановлен. Напоминания об уже сохранённых аукционах продолжают работать. Для возобновления отправьте /start")
+                            logging.info("Команда /stop - пауза основного мониторинга")
                         elif text == '/start':
                             is_paused = False
                             reset_connection_watch_after_manual_resume()
-                            send_telegram_message("▶ Бот продолжает работу")
+                            send_telegram_message("▶ Основной мониторинг продолжает работу")
                             logging.info("Команда /start - продолжение; watchdog-таймер перезапущен")
+                        elif text in ('/auctions', '/list'):
+                            send_auction_list()
+                        elif text.startswith('/delauction'):
+                            parts = text.split(maxsplit=1)
+                            if len(parts) != 2 or not re.fullmatch(r'\d{9,15}', parts[1].strip()):
+                                send_telegram_message("Использование: <code>/delauction НОМЕР_ЛОТА</code>")
+                            else:
+                                item_id = parts[1].strip()
+                                if delete_auction_reminder(item_id):
+                                    send_telegram_message(f"🗑 Напоминание для лота <b>{item_id}</b> удалено.")
+                                else:
+                                    send_telegram_message(f"ℹ️ Активный лот <b>{item_id}</b> в списке не найден.")
+                        else:
+                            ebay_urls = extract_ebay_urls(text)
+                            if ebay_urls:
+                                accepted = 0
+                                for ebay_url in ebay_urls[:20]:
+                                    try:
+                                        auction_add_queue.put_nowait(ebay_url)
+                                        accepted += 1
+                                    except queue.Full:
+                                        break
+                                if accepted:
+                                    send_telegram_message(
+                                        f"🔎 Проверяю {'ссылку' if accepted == 1 else f'{accepted} ссылок'} на активный аукцион eBay UK…\n"
+                                        "Сохраню только подтверждённые торги с точным временем окончания."
+                                    )
+                                if accepted < len(ebay_urls[:20]):
+                                    send_telegram_message("⚠️ Очередь ссылок заполнена. Остальные ссылки отправьте немного позже.")
             time.sleep(1)
         except Exception as e:
             logging.error(f"Ошибка в слушателе Telegram: {e}")
             time.sleep(5)
+
 
 # ============ ЗАПРОС К EBAY ============
 
@@ -881,7 +1920,7 @@ def fetch_ebay_html_with_fixed_pair():
                 old_proxy,
                 old_profile,
                 session=None,
-                timeout=(min(FIXED_CONNECT_TIMEOUT, 5.0), FIXED_READ_TIMEOUT),
+                timeout=(FIXED_RECOVERY_CONNECT_TIMEOUT, FIXED_RECOVERY_READ_TIMEOUT),
             )
             if retry_result == 'success':
                 fixed_proxy = old_proxy
@@ -1556,6 +2595,7 @@ def bot_worker():
     global is_paused
     logging.info("🤖 Бот-воркер запущен")
     init_db()
+    db_ready_event.set()
     if is_db_empty():
         if not perform_initial_snapshot():
             send_telegram_message("❌ Ошибка инициализации")
@@ -1584,16 +2624,24 @@ def bot_worker():
 
 @app.route('/')
 def index():
-    return "eBay бот работает (Великобритания, adaptive parallel UK v3)"
+    return "eBay бот работает (Великобритания, adaptive parallel UK v5)"
 
 @app.route('/health')
 def health():
     return "OK", 200
 
 if __name__ == "__main__":
-    send_telegram_message("🚀 Бот запущен (Великобритания, adaptive parallel UK v3). Команды /stop /start")
+    send_telegram_message(
+        "🚀 Бот запущен (Великобритания, adaptive parallel UK v5).\n"
+        "Команды: /stop /start /list (/auctions) /delauction НОМЕР_ЛОТА\n"
+        "Можно просто отправить ссылку на eBay-аукцион — бот сохранит точное время и напомнит заранее.",
+        reply_markup=auction_list_only_keyboard(),
+    )
     threading.Thread(target=telegram_listener, daemon=True).start()
     threading.Thread(target=connection_watchdog, daemon=True).start()
+    threading.Thread(target=auction_link_worker, daemon=True).start()
+    threading.Thread(target=auction_reminder_worker, daemon=True).start()
+    threading.Thread(target=auction_status_worker, daemon=True).start()
     worker_thread = threading.Thread(target=bot_worker, daemon=False)
     worker_thread.start()
     port = int(os.environ.get("PORT", 5000))
