@@ -15,7 +15,7 @@ import requests
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 from flask import Flask
 from dotenv import load_dotenv
 import psycopg2
@@ -498,10 +498,13 @@ class ProxyManager:
             # in-flight набор остался без SOCKS5, preferred_scheme='socks5' не даёт
             # HTTP-бонусу снова вытеснить весь SOCKS5-пул.
             if preferred_scheme and len(batch) < batch_size:
+                # ВАЖНО: preferred_scheme означает "зарезервировать ОДИН слот",
+                # а не заполнить им весь batch. В v6.3 этот цикл мог набрать сразу
+                # 3 SOCKS5, что видно по логам и ухудшало поиск из-за множества
+                # SSL/MITM-ошибок бесплатных SOCKS5.
                 for p in usable:
                     if _proxy_scheme(p) == preferred_scheme and add_candidate(p):
-                        if len(batch) >= batch_size:
-                            break
+                        break
 
             # 3) Для новых адресов используем примерно 3:1 HTTP:SOCKS5 (2:1 при batch=3).
             # Это сохраняет приоритет HTTP по реальным UK-логам, но не оставляет 150-200
@@ -2471,12 +2474,17 @@ def fetch_ebay_html_with_retry():
 
 # ============ ПАРСИНГ ============
 def extract_item_id(url):
+    """Извлекает публичный numeric eBay item id из старого и нового URL.
+
+    Поддерживает оба варианта:
+      /itm/123456789012
+      /itm/some-title/123456789012
+    Не принимает текстовый slug за item_id.
+    """
     if not url or '/itm/' not in url:
         return None
-    try:
-        return url.split('/itm/')[1].split('?')[0]
-    except IndexError:
-        return None
+    m = re.search(r'/itm/(?:[^/?#]+/)?(\d{8,15})(?:[/?#]|$)', str(url), re.I)
+    return m.group(1) if m else None
 
 def clean_title(title):
     if not title: return ""
@@ -2789,14 +2797,13 @@ def extract_buy_it_now_info(card):
 def _main_search_result_cards(soup):
     """Возвращает только карточки ОСНОВНОЙ поисковой выдачи eBay.
 
-    Важно: MAX_ITEMS — это верхний предел, а не цель "добрать" до 60.
-    Если на странице 27 настоящих карточек, возвращаем только 27.
+    eBay сейчас A/B-тестирует несколько DOM-разметок. На разных proxy один и тот же
+    поиск может прийти как старый ``li.s-item`` либо как новый ``li.s-card`` /
+    ``div.su-card-container``. Поэтому нельзя считать отсутствие ``s-item`` ошибкой.
 
-    Не сканируем весь HTML по /itm/: на странице могут быть карусели,
-    рекомендации и блок "results matching fewer words" со старыми/менее
-    релевантными объявлениями. Если структура основной выдачи eBay не
-    распознана, безопаснее пропустить цикл и повторить позже, чем отправить
-    ложный "новый товар".
+    При этом мы по-прежнему НЕ сканируем всю страницу по всем ``/itm/`` ссылкам:
+    поиск ограничен основным SRP-контейнером, чтобы не захватывать рекомендации,
+    карусели и посторонние блоки. MAX_ITEMS остаётся только верхним пределом.
     """
     root = (
         soup.select_one('#srp-river-results')
@@ -2806,33 +2813,99 @@ def _main_search_result_cards(soup):
     if root is None:
         logging.warning(
             "⚠️ Основной контейнер поисковой выдачи eBay не найден; "
-            "широкий fallback по всем /itm/ ссылкам отключён для защиты от рекомендаций"
+            "глобальный fallback по всем /itm/ ссылкам отключён"
         )
         return None
 
     cards = []
-
-    # eBay иногда после точных результатов вставляет служебную строку
-    # srp-river-answer--REWRITE_START и затем показывает результаты по более
-    # широкому/исправленному запросу. Всё после этой границы не считаем частью
-    # нашей исходной выдачи Newly listed.
+    seen_nodes = set()
     rewrite_boundary_seen = False
-    for node in root.find_all('li'):
+    layout_counts = {'s-item': 0, 's-card': 0, 'su-card-container': 0, 'data-viewport': 0}
+
+    def add_card(node, layout):
+        key = id(node)
+        if key in seen_nodes:
+            return
+        # Карточка должна содержать реальную ссылку на item. Это отсекает служебные
+        # placeholders, заголовки и пустые контейнеры с похожими CSS-классами.
+        if not node.select_one('a[href*="/itm/"]'):
+            return
+        seen_nodes.add(key)
+        cards.append(node)
+        layout_counts[layout] = layout_counts.get(layout, 0) + 1
+
+    # Идём в DOM-порядке, чтобы остановиться ДО блока расширенных результатов.
+    for node in root.descendants:
+        if not isinstance(node, Tag):
+            continue
         classes = set(node.get('class') or [])
         if 'srp-river-answer--REWRITE_START' in classes:
             rewrite_boundary_seen = True
             break
-        if 's-item' in classes:
-            cards.append(node)
 
-    # В некоторых вариантах DOM li.s-item вложены глубже и find_all('li') всё
-    # равно их видит. Если eBay поменял разметку настолько, что карточок нет,
-    # не переходим к глобальному поиску по странице: это могло бы захватить
-    # блоки "Sponsored/Recommended/Similar items".
+        if 's-item' in classes:
+            add_card(node, 's-item')
+        elif 's-card' in classes:
+            add_card(node, 's-card')
+        elif 'su-card-container' in classes:
+            add_card(node, 'su-card-container')
+        elif node.name == 'li' and node.has_attr('data-viewport'):
+            # Дополнительный безопасный layout-fallback, который встречается в A/B DOM.
+            add_card(node, 'data-viewport')
+
+    # Если eBay снова поменял имена card-классов, используем ТОЛЬКО ссылки внутри
+    # основного root и поднимаемся к ближайшему небольшому контейнеру с ценой/заголовком.
+    # Это намного безопаснее старого fallback по всем /itm/ ссылкам всей страницы.
+    if not cards:
+        fallback_seen_ids = set()
+        for node in root.descendants:
+            if not isinstance(node, Tag):
+                continue
+            classes = set(node.get('class') or [])
+            if 'srp-river-answer--REWRITE_START' in classes:
+                rewrite_boundary_seen = True
+                break
+            if node.name != 'a':
+                continue
+            href = node.get('href') or ''
+            item_id = extract_item_id(href)
+            if not item_id or item_id in fallback_seen_ids:
+                continue
+
+            parent = node
+            chosen = None
+            for _ in range(8):
+                parent = parent.parent
+                if parent is None or parent is root:
+                    break
+                if not isinstance(parent, Tag):
+                    continue
+                text = parent.get_text(' ', strip=True)
+                has_price = bool(
+                    parent.select_one('.s-card__price, .s-item__price, [class*="price"]')
+                    or re.search(r'£\s*[\d,.]+', text)
+                )
+                has_title = bool(
+                    parent.select_one('.s-card__title, .s-item__title, [role="heading"]')
+                    or len(node.get_text(' ', strip=True)) >= 4
+                )
+                if has_price and has_title:
+                    chosen = parent
+                    break
+            if chosen is not None:
+                cards.append(chosen)
+                fallback_seen_ids.add(item_id)
+
+        if cards:
+            logging.warning(
+                f"⚠️ eBay использует неизвестный card-layout; безопасный fallback "
+                f"внутри основного контейнера распознал {len(cards)} карточек"
+            )
+
     if not cards:
         logging.warning(
-            "⚠️ Контейнер eBay найден, но карточки основной выдачи li.s-item не распознаны; "
-            "цикл будет пропущен без добавления item_id в seen_items"
+            "⚠️ Основной контейнер eBay найден, но карточки выдачи не распознаны "
+            "ни как s-item, ни как s-card/su-card-container; БД не изменяем"
         )
         return None
 
@@ -2842,7 +2915,26 @@ def _main_search_result_cards(soup):
             f"учитываем только {len(cards)} карточек до неё"
         )
 
+    active_layouts = ', '.join(f'{k}={v}' for k, v in layout_counts.items() if v)
+    if active_layouts:
+        logging.info(f"🧩 Разметка eBay: {active_layouts}; карточек-кандидатов {len(cards)}")
+
     return cards
+
+
+def _listing_link(card):
+    """Ссылка item для старой и новой SRP-разметки eBay."""
+    selectors = (
+        'a.s-card__link[href*="/itm/"]',
+        'a.s-item__link[href*="/itm/"]',
+        'a.su-link[href*="/itm/"]',
+        'a[href*="/itm/"]',
+    )
+    for selector in selectors:
+        link = card.select_one(selector)
+        if link and extract_item_id(link.get('href') or ''):
+            return link
+    return None
 
 
 def parse_ebay_listings(html, max_items=MAX_ITEMS):
@@ -2854,29 +2946,38 @@ def parse_ebay_listings(html, max_items=MAX_ITEMS):
         return None
 
     items = {}
-    processed = 0
     for card in cards:
-        if processed >= max_items:
+        if len(items) >= max_items:
             break
-        link = card.select_one('a.s-item__link')
+
+        link = _listing_link(card)
         if not link:
             continue
         url = link.get('href')
-        if not url or '/itm/' not in url:
+        if not url:
             continue
         if url.startswith('/'):
             url = 'https://www.ebay.co.uk' + url
         item_id = extract_item_id(url)
-        if not item_id:
+        if not item_id or item_id in items:
             continue
-        title_elem = (card.select_one('div.s-item__title span[role="heading"]') or
-                      card.select_one('span[role="heading"]') or
-                      card.select_one('div.s-item__title') or link)
-        title = clean_title(title_elem.get_text(strip=True) if title_elem else '')
+
+        title_elem = (
+            card.select_one('div.s-card__title')
+            or card.select_one('.s-card__title')
+            or card.select_one('div.s-item__title span[role="heading"]')
+            or card.select_one('div.s-item__title')
+            or card.select_one('[role="heading"]')
+            or link
+        )
+        title = clean_title(title_elem.get_text(' ', strip=True) if title_elem else '')
         if not title:
-            title = clean_title(link.get_text(strip=True))
-            if not title:
-                continue
+            title = clean_title(link.get_text(' ', strip=True))
+        if not title:
+            continue
+        if title.strip().lower() in {'shop on ebay', 'opens in a new window or tab'}:
+            continue
+
         price = extract_price_jsonld(card, url, soup) or extract_price_css(card)
         range_prices = []
         if price and ' до ' in price:
@@ -2885,10 +2986,12 @@ def parse_ebay_listings(html, max_items=MAX_ITEMS):
                 range_prices = [parts[0].strip(), parts[1].strip()]
         if price and not is_gbp_price(price):
             price = None
+
         shipping = extract_shipping(card, item_price=price, range_prices=range_prices)
         best_offer = extract_best_offer(card)
         auction = extract_auction(card)
         has_bin, bin_price = extract_buy_it_now_info(card)
+
         items[item_id] = {
             'url': url,
             'title': title,
@@ -2897,14 +3000,10 @@ def parse_ebay_listings(html, max_items=MAX_ITEMS):
             'best_offer': best_offer,
             'auction': auction,
             'has_buy_it_now': has_bin,
-            'buy_it_now_price': bin_price
+            'buy_it_now_price': bin_price,
         }
-        processed += 1
 
-    logging.info(
-        f"Обработано товаров основной выдачи: {len(items)} "
-        f"(найдено карточек: {len(cards)}, лимит: {max_items})"
-    )
+    logging.info(f"Обработано товаров основной выдачи: {len(items)}")
     return items
 
 def perform_initial_snapshot():
@@ -2949,15 +3048,17 @@ def check_and_send_new_items():
     html = fetch_ebay_html_with_retry()
     if not html:
         logging.warning("Не удалось загрузить страницу, проверка пропущена")
-        return False
+        return 'fetch_error'
 
     current = parse_ebay_listings(html)
     if current is None:
         logging.warning("Структура основной выдачи eBay не распознана; проверка пропущена без изменений БД")
-        return False
+        # Это НЕ означает, что proxy плохой: HTTP 200 уже мог быть успешным.
+        # Не запускаем из-за DOM-ошибки ускоренный proxy-discovery каждые 6-10 сек.
+        return 'parse_error'
     if not current:
         logging.info("Основная выдача eBay распознана, но подходящих карточек нет")
-        return True
+        return 'ok'
 
     # ВАЖНО: вместо скачивания всех ~18k seen_items атомарно пробуем вставить только
     # текущие item_id основной выдачи (до 60). PRIMARY KEY + ON CONFLICT гарантирует, что старый товар
@@ -3016,7 +3117,7 @@ def check_and_send_new_items():
             time.sleep(1)
     else:
         logging.info("Новых нет")
-    return True
+    return 'ok'
 
 
 def bot_worker():
@@ -3033,7 +3134,7 @@ def bot_worker():
 
     send_telegram_message(
         startup_line +
-        "\n🇬🇧 eBay UK monitor v6.3 работает."
+        "\n🇬🇧 eBay UK monitor v6.4 работает."
         "\nКоманды: /stop /start /list (/auctions) /delauction НОМЕР_ЛОТА"
         "\nМожно отправить ссылку на eBay-аукцион — сохраню точное время и напомню заранее.",
         reply_markup=auction_list_only_keyboard(),
@@ -3043,15 +3144,21 @@ def bot_worker():
             time.sleep(2)
             continue
         try:
-            success = check_and_send_new_items()
-            if success:
+            result = check_and_send_new_items()
+            if result == 'ok':
                 wait = random.uniform(CHECK_INTERVAL, CHECK_INTERVAL + 12)
                 logging.info(f"✅ Успешная проверка. Следующая через {wait:.0f} секунд.")
+            elif result == 'parse_error':
+                # Сеть/eBay были доступны, проблема только в DOM-разметке. Нельзя
+                # ошибочно объявлять рабочий proxy плохим и запускать частый discovery.
+                wait = random.uniform(CHECK_INTERVAL, CHECK_INTERVAL + 12)
+                logging.warning(
+                    f"⚠️ eBay доступен, но разметка не распознана. "
+                    f"Повтор обычной проверки через {wait:.0f} секунд без смены proxy."
+                )
             else:
-                # Discovery уже активно искал proxy десятки секунд. Дополнительные 25-40
-                # секунд бездействия только увеличивали окно без проверки товаров.
-                # Делаем короткий безопасный jitter: pool уже принудительно обновлён, а
-                # плохие endpoints остаются в cooldown и не начинают крутиться по кругу.
+                # Реальная проблема загрузки/proxy: после активного discovery оставляем
+                # короткий jitter, чтобы быстро вернуться к поиску, но не крутить busy-loop.
                 wait = random.uniform(FAILED_SEARCH_RETRY_MIN, FAILED_SEARCH_RETRY_MAX)
                 logging.info(f"⚠️ Рабочий proxy пока не найден. Новый цикл через {wait:.1f} секунд.")
             time.sleep(wait)
@@ -3109,7 +3216,7 @@ def leader_supervisor():
 @app.route('/')
 def index():
     role = "leader" if leader_active_event.is_set() else "standby"
-    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.3, {role})"
+    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.4, {role})"
 
 
 @app.route('/health')
