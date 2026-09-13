@@ -10,7 +10,7 @@ import logging
 import queue
 import html as html_lib
 import hashlib
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 import requests
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
@@ -60,18 +60,22 @@ LEADER_LOCK_KEY = int.from_bytes(
 LEADER_RETRY_INTERVAL = max(2, int(os.getenv("LEADER_RETRY_INTERVAL", "5")))
 LEADER_HEALTH_INTERVAL = max(5, int(os.getenv("LEADER_HEALTH_INTERVAL", "10")))
 
-# Discovery: проверяем несколько РАЗНЫХ IP параллельно. Три потока — хороший
-# компромисс для Render: поиск ускоряется, но мы не создаём агрессивный burst.
+# Discovery запускается только когда уже нет рабочей fixed-session. Сначала оставляем
+# привычные 3 параллельные проверки; если за короткое время победителя нет, повышаем
+# только до 4. Это заметно ускоряет аварийный поиск, не превращая его в агрессивный burst.
 PROBE_CONCURRENCY = max(1, min(int(os.getenv("PROBE_CONCURRENCY", "3")), 4))
+PROBE_ESCALATED_CONCURRENCY = max(
+    PROBE_CONCURRENCY,
+    min(int(os.getenv("PROBE_ESCALATED_CONCURRENCY", "4")), 4),
+)
+PROBE_ESCALATE_AFTER = max(5.0, float(os.getenv("PROBE_ESCALATE_AFTER", "15")))
 PROBE_CONNECT_TIMEOUT = float(os.getenv("PROBE_CONNECT_TIMEOUT", "3.5"))
-# Быстрый discovery не должен зависать на proxy, который начал отдавать большой HTML,
-# но не способен закончить ответ. В свежем логе такой адрес держал batch 18.5 сек.
+# В старой версии после 45 сек. timeout искусственно увеличивался до 4.5/12 и один
+# полуживой proxy мог держать целый batch 11+ секунд. При сотнях кандидатов выгоднее
+# продолжать быстро перебирать пул тем же строгим timeout и не тормозить вторую половину.
 PROBE_READ_TIMEOUT = float(os.getenv("PROBE_READ_TIMEOUT", "8"))
-# Во второй половине discovery слегка расширяем окно, чтобы не отбрасывать
-# абсолютно все медленные, но потенциально рабочие бесплатные proxy.
-PROBE_FALLBACK_CONNECT_TIMEOUT = float(os.getenv("PROBE_FALLBACK_CONNECT_TIMEOUT", "4.5"))
-PROBE_FALLBACK_READ_TIMEOUT = float(os.getenv("PROBE_FALLBACK_READ_TIMEOUT", "12"))
-PROBE_FALLBACK_AFTER = float(os.getenv("PROBE_FALLBACK_AFTER", "45"))
+PROBE_BATCH_PAUSE_MIN = max(0.10, float(os.getenv("PROBE_BATCH_PAUSE_MIN", "0.25")))
+PROBE_BATCH_PAUSE_MAX = max(PROBE_BATCH_PAUSE_MIN, float(os.getenv("PROBE_BATCH_PAUSE_MAX", "0.55")))
 
 # Если eBay UK не дал ни одного успешного ответа более 10 минут, один раз
 # уведомляем в Telegram. После следующего успеха аварийный флаг сбрасывается.
@@ -114,9 +118,13 @@ FIXED_READ_TIMEOUT = float(os.getenv("FIXED_READ_TIMEOUT", "18"))
 FIXED_RECOVERY_CONNECT_TIMEOUT = float(os.getenv("FIXED_RECOVERY_CONNECT_TIMEOUT", "4"))
 FIXED_RECOVERY_READ_TIMEOUT = float(os.getenv("FIXED_RECOVERY_READ_TIMEOUT", "8"))
 
-# Один цикл discovery не должен зависать на минуты.
-SEARCH_TIME_BUDGET = int(os.getenv("SEARCH_TIME_BUDGET", "90"))
-MAX_SEARCH_ATTEMPTS = int(os.getenv("MAX_SEARCH_ATTEMPTS", "90"))
+# Один аварийный discovery-цикл не должен держать монитор без свежего pool слишком долго.
+# За 75 сек. с adaptive 3->4 workers успеваем проверить значительно больше адресов,
+# затем делаем лишь короткую паузу, обновляем ProxyScrape и продолжаем поиск.
+SEARCH_TIME_BUDGET = max(45, int(os.getenv("SEARCH_TIME_BUDGET", "75")))
+MAX_SEARCH_ATTEMPTS = max(60, int(os.getenv("MAX_SEARCH_ATTEMPTS", "120")))
+FAILED_SEARCH_RETRY_MIN = max(3.0, float(os.getenv("FAILED_SEARCH_RETRY_MIN", "6")))
+FAILED_SEARCH_RETRY_MAX = max(FAILED_SEARCH_RETRY_MIN, float(os.getenv("FAILED_SEARCH_RETRY_MAX", "10")))
 
 # Успешные proxy запоминаем и относим к ним мягче после единичного сбоя.
 GOOD_PROXY_MEMORY = 60 * 60
@@ -428,8 +436,15 @@ class ProxyManager:
 
         return recent_bonus + success_bonus + scheme_bonus + idle_bonus - fail_penalty + random.uniform(0, 2.0)
 
-    def get_candidate_batch(self, batch_size, tried_hosts=None):
-        """Выдаёт несколько proxy с уникальными IP для параллельной проверки."""
+    def get_candidate_batch(self, batch_size, tried_hosts=None, preferred_scheme=None):
+        """Выдаёт несколько proxy с уникальными IP и разумным mix HTTP/SOCKS5.
+
+        Раньше небольшой bonus HTTP приводил к тому, что при большом пуле первые десятки
+        probe могли почти целиком состоять из HTTP, хотя в ProxyScrape SOCKS5 было больше.
+        Теперь недавно успешные proxy всё равно имеют абсолютный приоритет, а среди новых
+        кандидатов в batch>=3 резервируем один слот под SOCKS5, если он доступен.
+        Так мы реально используем весь большой пул, не повышая число одновременных запросов.
+        """
         tried_hosts = tried_hosts or set()
         self.refresh_proxies()
         now = time.time()
@@ -460,15 +475,63 @@ class ProxyManager:
 
             batch = []
             batch_hosts = set()
-            for p in usable:
+
+            def add_candidate(p):
+                if len(batch) >= batch_size:
+                    return False
                 host = _proxy_host(p)
-                if host in batch_hosts:
-                    continue
+                if not host or host in batch_hosts:
+                    return False
                 batch.append(p)
                 batch_hosts.add(host)
                 self.last_used[p] = now
-                if len(batch) >= batch_size:
-                    break
+                return True
+
+            # 1) Любой недавно доказавший работоспособность proxy важнее protocol mix.
+            for p in usable:
+                if self._is_recent_good_locked(p, now):
+                    add_candidate(p)
+                    if len(batch) >= batch_size:
+                        return batch
+
+            # 2) Rolling-discovery иногда просит всего один новый слот. Если текущий
+            # in-flight набор остался без SOCKS5, preferred_scheme='socks5' не даёт
+            # HTTP-бонусу снова вытеснить весь SOCKS5-пул.
+            if preferred_scheme and len(batch) < batch_size:
+                for p in usable:
+                    if _proxy_scheme(p) == preferred_scheme and add_candidate(p):
+                        if len(batch) >= batch_size:
+                            break
+
+            # 3) Для новых адресов используем примерно 3:1 HTTP:SOCKS5 (2:1 при batch=3).
+            # Это сохраняет приоритет HTTP по реальным UK-логам, но не оставляет 150-200
+            # SOCKS5 вообще непроверенными до истечения discovery budget.
+            remaining = batch_size - len(batch)
+            if remaining > 0:
+                selected_socks = sum(1 for p in batch if _proxy_scheme(p) == 'socks5')
+                want_socks_total = 1 if batch_size >= 3 else 0
+                need_socks = max(0, want_socks_total - selected_socks)
+
+                if need_socks:
+                    for p in usable:
+                        if _proxy_scheme(p) == 'socks5' and add_candidate(p):
+                            need_socks -= 1
+                            if need_socks <= 0 or len(batch) >= batch_size:
+                                break
+
+            # 4) Остальные слоты в первую очередь HTTP/HTTPS, затем любой protocol.
+            if len(batch) < batch_size:
+                for p in usable:
+                    if _proxy_scheme(p) in ('http', 'https'):
+                        add_candidate(p)
+                        if len(batch) >= batch_size:
+                            break
+
+            if len(batch) < batch_size:
+                for p in usable:
+                    add_candidate(p)
+                    if len(batch) >= batch_size:
+                        break
 
             return batch
 
@@ -2204,129 +2267,202 @@ def fetch_ebay_html_with_fixed_pair():
 
         logging.info("Ищем новую рабочую пару...")
 
-    # 2) Discovery: 3 уникальных IP параллельно. Это главное ускорение.
+    # 2) Rolling discovery: сначала 3, затем максимум 4 уникальных IP параллельно.
+    # Главное отличие от batch-модели: как только один плохой proxy завершился, его слот
+    # немедленно получает следующий кандидат. Мы больше не ждём самый медленный proxy
+    # в группе, пока остальные worker-ы простаивают.
     started = time.monotonic()
     tried_hosts = set()
     attempts = 0
+    refreshed_after_exhaustion = False
+    profile = get_preferred_profile()
+    if profile is None:
+        logging.error("Нет поддерживаемого browser-профиля curl_cffi")
+        return None
 
-    while attempts < MAX_SEARCH_ATTEMPTS:
-        elapsed = time.monotonic() - started
-        if elapsed >= SEARCH_TIME_BUDGET:
-            logging.warning(
-                f"⏱ Достигнут лимит discovery {SEARCH_TIME_BUDGET} сек.; "
-                "останавливаем этот цикл"
+    executor = ThreadPoolExecutor(
+        max_workers=PROBE_ESCALATED_CONCURRENCY,
+        thread_name_prefix='proxy-probe',
+    )
+    future_to_proxy = {}
+
+    def desired_concurrency():
+        elapsed_now = time.monotonic() - started
+        return (
+            PROBE_ESCALATED_CONCURRENCY
+            if elapsed_now >= PROBE_ESCALATE_AFTER
+            else PROBE_CONCURRENCY
+        )
+
+    def submit_more():
+        """Поддерживает нужное число in-flight probe без превышения concurrency."""
+        nonlocal attempts, refreshed_after_exhaustion
+
+        if attempts >= MAX_SEARCH_ATTEMPTS:
+            return False
+        elapsed_now = time.monotonic() - started
+        if elapsed_now >= SEARCH_TIME_BUDGET:
+            return False
+
+        desired = desired_concurrency()
+        need = max(0, min(desired - len(future_to_proxy), MAX_SEARCH_ATTEMPTS - attempts))
+        if need <= 0:
+            return True
+
+        # В rolling-режиме после завершения SOCKS5 часто освобождается один слот.
+        # Поддерживаем хотя бы один SOCKS5 in-flight при concurrency>=3, если он доступен.
+        inflight_socks = sum(
+            1 for p in future_to_proxy.values()
+            if _proxy_scheme(p) == 'socks5'
+        )
+        preferred_scheme = 'socks5' if desired >= 3 and inflight_socks == 0 else None
+        batch = proxy_manager.get_candidate_batch(
+            need,
+            tried_hosts=tried_hosts,
+            preferred_scheme=preferred_scheme,
+        )
+
+        if not batch and not future_to_proxy and not refreshed_after_exhaustion:
+            # Если реально закончились ещё не пробованные доступные IP, один раз берём
+            # свежий снимок ProxyScrape. Cooldown плохих endpoints при этом сохраняется.
+            logging.info("♻️ Доступные уникальные IP исчерпаны; обновляем ProxyScrape и продолжаем")
+            proxy_manager.refresh_proxies(force=True)
+            refreshed_after_exhaustion = True
+            tried_hosts.clear()
+            batch = proxy_manager.get_candidate_batch(
+                need,
+                tried_hosts=tried_hosts,
+                preferred_scheme=preferred_scheme,
             )
-            break
-
-        profile = get_preferred_profile()
-        if profile is None:
-            logging.error("Нет поддерживаемого browser-профиля curl_cffi")
-            return None
-
-        remaining = MAX_SEARCH_ATTEMPTS - attempts
-        batch_size = min(PROBE_CONCURRENCY, remaining)
-        batch = proxy_manager.get_candidate_batch(batch_size, tried_hosts=tried_hosts)
 
         if not batch:
-            # Возможно, истёк короткий cooldown у старого good proxy или ProxyScrape
-            # уже обновил пул. Один раз очищаем только per-cycle запрет повторных IP,
-            # но не реальные cooldown.
-            if tried_hosts:
-                logging.info("♻️ Новых уникальных IP сейчас нет; обновляем pool и пересчитываем кандидатов")
-                proxy_manager.refresh_proxies(force=True)
-                tried_hosts.clear()
-                time.sleep(random.uniform(0.8, 1.4))
-                batch = proxy_manager.get_candidate_batch(batch_size, tried_hosts=tried_hosts)
-
-            if not batch:
-                logging.warning("Нет доступных proxy; короткая пауза")
-                time.sleep(random.uniform(2.0, 3.0))
-                continue
+            return False
 
         for proxy in batch:
+            if attempts >= MAX_SEARCH_ATTEMPTS:
+                break
             tried_hosts.add(_proxy_host(proxy))
             attempts += 1
             logging.info(
                 f"🔍 Probe {attempts}/{MAX_SEARCH_ATTEMPTS}: proxy {proxy}, "
                 f"профиль {profile['name']}"
             )
-
-        # Первая половина discovery — строгий fast lane. Если за ~45 сек победителя
-        # нет, немного расширяем timeout: это лучше, чем сразу держать каждый плохой
-        # batch по 18+ секунд из-за одного медленно отдающего HTML proxy.
-        elapsed_now = time.monotonic() - started
-        if elapsed_now < PROBE_FALLBACK_AFTER:
-            probe_timeout = (PROBE_CONNECT_TIMEOUT, PROBE_READ_TIMEOUT)
-        else:
-            probe_timeout = (PROBE_FALLBACK_CONNECT_TIMEOUT, PROBE_FALLBACK_READ_TIMEOUT)
-
-        # Первый успешный ответ выигрывает сразу. Раньше мы ждали весь batch и
-        # могли потерять ещё 8-15 сек из-за соседнего "полуживого" proxy, хотя
-        # рабочий HTTP 200 уже был получен. Уже стартовавшие 1-2 probe не бросаем:
-        # они тихо завершаются, Session закрываются callback'ом, а их результат
-        # попадает в health-score как backup/ошибка.
-        executor = ThreadPoolExecutor(max_workers=len(batch), thread_name_prefix='proxy-probe')
-        future_to_proxy = {
-            executor.submit(_probe_proxy, proxy, profile, probe_timeout): proxy
-            for proxy in batch
-        }
-        processed = set()
-        winner = None
-
-        for future in as_completed(future_to_proxy):
-            proxy = future_to_proxy[future]
-            processed.add(future)
-            try:
-                result, html, session = future.result()
-            except Exception as e:
-                logging.error(f"Ошибка probe worker для {proxy}: {e}")
-                result, html, session = 'proxy_error', None, None
-
-            if result == 'success':
-                proxy_manager.mark_success(proxy)
-                winner = (proxy, html, session)
-                break
-            elif result == 'profile_error':
-                close_session(session)
-            else:
-                close_session(session)
-                proxy_manager.mark_failure(proxy, result, reason=result)
-
-        if winner is not None:
-            # Не ждём медленных соседей победителя. Те, что уже работают, получат
-            # callback; ещё не стартовавшие (редко при batch<=workers) отменяем.
-            for future, proxy in future_to_proxy.items():
-                if future in processed:
-                    continue
-                if future.done():
-                    _cleanup_late_probe_future(future, proxy)
-                elif not future.cancel():
-                    future.add_done_callback(
-                        lambda f, p=proxy: _cleanup_late_probe_future(f, p)
-                    )
-            executor.shutdown(wait=False, cancel_futures=True)
-
-            winner_proxy, winner_html, winner_session = winner
-            fixed_proxy = winner_proxy
-            fixed_profile = profile
-            fixed_session = winner_session
-            record_ebay_success()
-            logging.info(
-                f"✅ Найдена рабочая пара: proxy {winner_proxy}, профиль {profile['name']}; "
-                f"проверено {attempts} proxy за {time.monotonic() - started:.1f} сек."
+            future = executor.submit(
+                _probe_proxy,
+                proxy,
+                profile,
+                (PROBE_CONNECT_TIMEOUT, PROBE_READ_TIMEOUT),
             )
-            return winner_html
+            future_to_proxy[future] = proxy
+        return bool(batch)
 
-        # Победителя нет — все futures уже завершились через as_completed().
-        executor.shutdown(wait=True)
+    submit_more()
 
-        # Не устраиваем серию мгновенных batch после быстрых 403/CONNECT 400.
-        time.sleep(random.uniform(0.45, 0.9))
+    try:
+        while future_to_proxy or attempts < MAX_SEARCH_ATTEMPTS:
+            elapsed = time.monotonic() - started
+            if elapsed >= SEARCH_TIME_BUDGET:
+                logging.warning(
+                    f"⏱ Достигнут лимит discovery {SEARCH_TIME_BUDGET} сек.; "
+                    "завершаем текущий активный поиск"
+                )
+                break
+
+            # Через 15 сек. разрешается 4-й worker. Если сейчас свободен слот — заполняем.
+            submit_more()
+
+            if not future_to_proxy:
+                # Нет ни одного доступного кандидата прямо сейчас. Не крутим CPU и не
+                # штурмуем ProxyScrape; через короткий jitter попробуем снова.
+                time.sleep(random.uniform(0.8, 1.3))
+                if not submit_more():
+                    break
+                continue
+
+            remaining_budget = max(0.05, SEARCH_TIME_BUDGET - (time.monotonic() - started))
+            done, _ = wait(
+                tuple(future_to_proxy.keys()),
+                timeout=min(1.0, remaining_budget),
+                return_when=FIRST_COMPLETED,
+            )
+            if not done:
+                continue
+
+            winner = None
+            completed_results = []
+            for future in done:
+                proxy = future_to_proxy.pop(future, None)
+                if proxy is None:
+                    continue
+                try:
+                    result, html, session = future.result()
+                except Exception as e:
+                    logging.error(f"Ошибка probe worker для {proxy}: {e}")
+                    result, html, session = 'proxy_error', None, None
+
+                completed_results.append(result)
+                if result == 'success' and winner is None:
+                    proxy_manager.mark_success(proxy)
+                    winner = (proxy, html, session)
+                elif result == 'profile_error':
+                    close_session(session)
+                    fallback_profile = get_preferred_profile()
+                    if fallback_profile is not None:
+                        profile = fallback_profile
+                else:
+                    close_session(session)
+                    proxy_manager.mark_failure(proxy, result, reason=result)
+
+            if winner is not None:
+                # Остальные 1-3 probe уже запущены. Не ждём их: они завершатся в фоне,
+                # закроют Session и могут запомниться как резервный успешный proxy.
+                for future, proxy in list(future_to_proxy.items()):
+                    if future.done():
+                        _cleanup_late_probe_future(future, proxy)
+                    elif not future.cancel():
+                        future.add_done_callback(
+                            lambda f, p=proxy: _cleanup_late_probe_future(f, p)
+                        )
+                future_to_proxy.clear()
+                executor.shutdown(wait=False, cancel_futures=True)
+
+                winner_proxy, winner_html, winner_session = winner
+                fixed_proxy = winner_proxy
+                fixed_profile = profile
+                fixed_session = winner_session
+                record_ebay_success()
+                logging.info(
+                    f"✅ Найдена рабочая пара: proxy {winner_proxy}, профиль {profile['name']}; "
+                    f"проверено {attempts} proxy за {time.monotonic() - started:.1f} сек."
+                )
+                return winner_html
+
+            # Даже если 2-3 proxy упали почти одновременно, не запускаем замену абсолютно
+            # мгновенно. Небольшой jitter сохраняет безопасный ритм, но не блокирует все
+            # worker-ы до завершения самого медленного соседа, как делал старый batch.
+            if completed_results:
+                time.sleep(random.uniform(PROBE_BATCH_PAUSE_MIN, PROBE_BATCH_PAUSE_MAX))
+            submit_more()
+
+    finally:
+        # При исчерпании budget не ждём до 8 сек. оставшиеся плохие соединения.
+        # Уже работающие futures получают cleanup callback; новые больше не запускаются.
+        for future, proxy in list(future_to_proxy.items()):
+            if future.done():
+                _cleanup_late_probe_future(future, proxy)
+            elif not future.cancel():
+                future.add_done_callback(
+                    lambda f, p=proxy: _cleanup_late_probe_future(f, p)
+                )
+        executor.shutdown(wait=False, cancel_futures=True)
 
     logging.error(
         f"❌ В этом цикле рабочий proxy не найден: "
         f"проверено {attempts}, время {time.monotonic() - started:.1f} сек."
     )
+    # Перед коротким следующим циклом берём максимально свежий снимок ProxyScrape.
+    # Реальные cooldown сохраняются, поэтому только что плохие proxy не пойдут по кругу.
+    proxy_manager.refresh_proxies(force=True)
     return None
 
 
@@ -2650,15 +2786,73 @@ def extract_buy_it_now_info(card):
                 return True, price_text
     return True, None
 
+def _main_search_result_cards(soup):
+    """Возвращает только карточки ОСНОВНОЙ поисковой выдачи eBay.
+
+    Важно: MAX_ITEMS — это верхний предел, а не цель "добрать" до 60.
+    Если на странице 27 настоящих карточек, возвращаем только 27.
+
+    Не сканируем весь HTML по /itm/: на странице могут быть карусели,
+    рекомендации и блок "results matching fewer words" со старыми/менее
+    релевантными объявлениями. Если структура основной выдачи eBay не
+    распознана, безопаснее пропустить цикл и повторить позже, чем отправить
+    ложный "новый товар".
+    """
+    root = (
+        soup.select_one('#srp-river-results')
+        or soup.select_one('.srp-river-results')
+        or soup.select_one('ul.srp-results')
+    )
+    if root is None:
+        logging.warning(
+            "⚠️ Основной контейнер поисковой выдачи eBay не найден; "
+            "широкий fallback по всем /itm/ ссылкам отключён для защиты от рекомендаций"
+        )
+        return None
+
+    cards = []
+
+    # eBay иногда после точных результатов вставляет служебную строку
+    # srp-river-answer--REWRITE_START и затем показывает результаты по более
+    # широкому/исправленному запросу. Всё после этой границы не считаем частью
+    # нашей исходной выдачи Newly listed.
+    rewrite_boundary_seen = False
+    for node in root.find_all('li'):
+        classes = set(node.get('class') or [])
+        if 'srp-river-answer--REWRITE_START' in classes:
+            rewrite_boundary_seen = True
+            break
+        if 's-item' in classes:
+            cards.append(node)
+
+    # В некоторых вариантах DOM li.s-item вложены глубже и find_all('li') всё
+    # равно их видит. Если eBay поменял разметку настолько, что карточок нет,
+    # не переходим к глобальному поиску по странице: это могло бы захватить
+    # блоки "Sponsored/Recommended/Similar items".
+    if not cards:
+        logging.warning(
+            "⚠️ Контейнер eBay найден, но карточки основной выдачи li.s-item не распознаны; "
+            "цикл будет пропущен без добавления item_id в seen_items"
+        )
+        return None
+
+    if rewrite_boundary_seen:
+        logging.info(
+            f"🛡 Обнаружена граница расширенных результатов eBay; "
+            f"учитываем только {len(cards)} карточек до неё"
+        )
+
+    return cards
+
+
 def parse_ebay_listings(html, max_items=MAX_ITEMS):
     if not html:
-        return {}
+        return None
     soup = BeautifulSoup(html, 'html.parser')
-    cards = soup.select('li.s-item')
-    if not cards:
-        cards = soup.select('.s-item')
-    if not cards:
-        return parse_ebay_listings_fallback(soup, max_items)
+    cards = _main_search_result_cards(soup)
+    if cards is None:
+        return None
+
     items = {}
     processed = 0
     for card in cards:
@@ -2706,53 +2900,11 @@ def parse_ebay_listings(html, max_items=MAX_ITEMS):
             'buy_it_now_price': bin_price
         }
         processed += 1
-    logging.info(f"Обработано товаров: {len(items)}")
-    return items
 
-def parse_ebay_listings_fallback(soup, max_items):
-    items = {}
-    links = soup.find_all('a', href=True)
-    itm_links = [link for link in links if '/itm/' in link['href']]
-    itm_links = itm_links[:max_items]
-    for link in itm_links:
-        url = link.get('href')
-        if url.startswith('/'):
-            url = 'https://www.ebay.co.uk' + url
-        item_id = extract_item_id(url)
-        if not item_id:
-            continue
-        title = clean_title(link.get_text(strip=True))
-        if not title:
-            continue
-        price = None
-        shipping = None
-        best_offer = False
-        auction = False
-        has_bin = False
-        bin_price = None
-        parent = link.parent
-        for _ in range(5):
-            if parent:
-                price = extract_price_jsonld(parent, url) or extract_price_css(parent)
-                if price and not is_gbp_price(price):
-                    price = None
-                shipping = extract_shipping(parent, item_price=price)
-                best_offer = extract_best_offer(parent)
-                auction = extract_auction(parent)
-                has_bin, bin_price = extract_buy_it_now_info(parent)
-                if price or shipping or best_offer or auction or has_bin:
-                    break
-                parent = parent.parent
-        items[item_id] = {
-            'url': url,
-            'title': title,
-            'price': price,
-            'shipping': shipping,
-            'best_offer': best_offer,
-            'auction': auction,
-            'has_buy_it_now': has_bin,
-            'buy_it_now_price': bin_price
-        }
+    logging.info(
+        f"Обработано товаров основной выдачи: {len(items)} "
+        f"(найдено карточек: {len(cards)}, лимит: {max_items})"
+    )
     return items
 
 def perform_initial_snapshot():
@@ -2800,12 +2952,15 @@ def check_and_send_new_items():
         return False
 
     current = parse_ebay_listings(html)
+    if current is None:
+        logging.warning("Структура основной выдачи eBay не распознана; проверка пропущена без изменений БД")
+        return False
     if not current:
-        logging.info("Текущая выдача пуста или не распознана")
+        logging.info("Основная выдача eBay распознана, но подходящих карточек нет")
         return True
 
     # ВАЖНО: вместо скачивания всех ~18k seen_items атомарно пробуем вставить только
-    # текущие 20 item_id. PRIMARY KEY + ON CONFLICT гарантирует, что старый товар
+    # текущие item_id основной выдачи (до 60). PRIMARY KEY + ON CONFLICT гарантирует, что старый товар
     # никогда не станет "новым" повторно, даже при коротком overlap двух Render instances.
     claimed = claim_new_seen_ids(list(current.keys()))
     new = []
@@ -2878,7 +3033,7 @@ def bot_worker():
 
     send_telegram_message(
         startup_line +
-        "\n🇬🇧 eBay UK monitor v6.1 работает."
+        "\n🇬🇧 eBay UK monitor v6.3 работает."
         "\nКоманды: /stop /start /list (/auctions) /delauction НОМЕР_ЛОТА"
         "\nМожно отправить ссылку на eBay-аукцион — сохраню точное время и напомню заранее.",
         reply_markup=auction_list_only_keyboard(),
@@ -2893,10 +3048,12 @@ def bot_worker():
                 wait = random.uniform(CHECK_INTERVAL, CHECK_INTERVAL + 12)
                 logging.info(f"✅ Успешная проверка. Следующая через {wait:.0f} секунд.")
             else:
-                # После неудачного поискового цикла не начинаем новый burst через 2 сек.
-                # За это время ProxyScrape успеет обновить часть бесплатного пула.
-                wait = random.uniform(25, 40)
-                logging.info(f"⚠️ Ошибка при проверке. Повтор через {wait:.1f} секунд.")
+                # Discovery уже активно искал proxy десятки секунд. Дополнительные 25-40
+                # секунд бездействия только увеличивали окно без проверки товаров.
+                # Делаем короткий безопасный jitter: pool уже принудительно обновлён, а
+                # плохие endpoints остаются в cooldown и не начинают крутиться по кругу.
+                wait = random.uniform(FAILED_SEARCH_RETRY_MIN, FAILED_SEARCH_RETRY_MAX)
+                logging.info(f"⚠️ Рабочий proxy пока не найден. Новый цикл через {wait:.1f} секунд.")
             time.sleep(wait)
         except Exception as e:
             logging.error(f"Ошибка в основном цикле: {e}", exc_info=True)
@@ -2952,7 +3109,7 @@ def leader_supervisor():
 @app.route('/')
 def index():
     role = "leader" if leader_active_event.is_set() else "standby"
-    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.1, {role})"
+    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.3, {role})"
 
 
 @app.route('/health')
