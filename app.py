@@ -61,22 +61,41 @@ LEADER_LOCK_KEY = int.from_bytes(
 LEADER_RETRY_INTERVAL = max(2, int(os.getenv("LEADER_RETRY_INTERVAL", "5")))
 LEADER_HEALTH_INTERVAL = max(5, int(os.getenv("LEADER_HEALTH_INTERVAL", "10")))
 
-# Discovery запускается только когда уже нет рабочей fixed-session. Сначала оставляем
-# привычные 3 параллельные проверки; если за короткое время победителя нет, повышаем
-# только до 4. Это заметно ускоряет аварийный поиск, не превращая его в агрессивный burst.
-PROBE_CONCURRENCY = max(1, min(int(os.getenv("PROBE_CONCURRENCY", "3")), 4))
+# Discovery запускается только когда уже нет рабочей fixed-session. По реальным логам
+# бесплатного ProxyScrape 3->4 worker слишком долго прожигали большой плохой пул.
+# V6.6 начинает с 4 уникальных IP и после 10 сек. повышается максимум до 5.
+# Это касается ТОЛЬКО аварийного discovery; при живом fixed proxy по-прежнему один запрос.
+PROBE_CONCURRENCY = max(4, min(int(os.getenv("PROBE_CONCURRENCY", "4")), 5))
 PROBE_ESCALATED_CONCURRENCY = max(
     PROBE_CONCURRENCY,
-    min(int(os.getenv("PROBE_ESCALATED_CONCURRENCY", "4")), 4),
+    min(int(os.getenv("PROBE_ESCALATED_CONCURRENCY", "5")), 5),
 )
-PROBE_ESCALATE_AFTER = max(5.0, float(os.getenv("PROBE_ESCALATE_AFTER", "15")))
+PROBE_ESCALATE_AFTER = max(5.0, float(os.getenv("PROBE_ESCALATE_AFTER", "10")))
 PROBE_CONNECT_TIMEOUT = float(os.getenv("PROBE_CONNECT_TIMEOUT", "3.5"))
 # В старой версии после 45 сек. timeout искусственно увеличивался до 4.5/12 и один
 # полуживой proxy мог держать целый batch 11+ секунд. При сотнях кандидатов выгоднее
-# продолжать быстро перебирать пул тем же строгим timeout и не тормозить вторую половину.
+# продолжать быстро перебирать пул тем же строгим timeout.
 PROBE_READ_TIMEOUT = float(os.getenv("PROBE_READ_TIMEOUT", "8"))
-PROBE_BATCH_PAUSE_MIN = max(0.10, float(os.getenv("PROBE_BATCH_PAUSE_MIN", "0.25")))
-PROBE_BATCH_PAUSE_MAX = max(PROBE_BATCH_PAUSE_MIN, float(os.getenv("PROBE_BATCH_PAUSE_MAX", "0.55")))
+# Replacement jitter зависит от причины отказа: transport/SSL/reject уже сами дали
+# достаточную задержку, а после 403/429 оставляем более осторожный ритм.
+PROBE_FAST_PAUSE_MIN = max(0.02, float(os.getenv("PROBE_FAST_PAUSE_MIN", "0.05")))
+PROBE_FAST_PAUSE_MAX = max(PROBE_FAST_PAUSE_MIN, float(os.getenv("PROBE_FAST_PAUSE_MAX", "0.15")))
+PROBE_BLOCK_PAUSE_MIN = max(0.15, float(os.getenv("PROBE_BLOCK_PAUSE_MIN", "0.30")))
+PROBE_BLOCK_PAUSE_MAX = max(PROBE_BLOCK_PAUSE_MIN, float(os.getenv("PROBE_BLOCK_PAUSE_MAX", "0.60")))
+PROBE_OTHER_PAUSE_MIN = max(0.05, float(os.getenv("PROBE_OTHER_PAUSE_MIN", "0.12")))
+PROBE_OTHER_PAUSE_MAX = max(PROBE_OTHER_PAUSE_MIN, float(os.getenv("PROBE_OTHER_PAUSE_MAX", "0.28")))
+
+# Основной ProxyScrape URL остаётся ровно тем, что задан в Render (обычно timeout=1500).
+# Аварийный URL строится автоматически, меняя ТОЛЬКО параметр timeout на 3000 мс.
+# Никакой второй обязательной Environment Variable пользователю не нужна.
+PROXY_EMERGENCY_TIMEOUT_MS = max(1500, int(os.getenv("PROXY_EMERGENCY_TIMEOUT_MS", "3000")))
+PROXY_EMERGENCY_TRIGGER_AFTER = max(15.0, float(os.getenv("PROXY_EMERGENCY_TRIGGER_AFTER", "30")))
+PROXY_EMERGENCY_TRIGGER_ATTEMPTS = max(20, int(os.getenv("PROXY_EMERGENCY_TRIGGER_ATTEMPTS", "50")))
+PROXY_EMERGENCY_MIN_AVAILABLE = max(20, int(os.getenv("PROXY_EMERGENCY_MIN_AVAILABLE", "60")))
+PROXY_EMERGENCY_MIN_RATIO = min(0.50, max(0.05, float(os.getenv("PROXY_EMERGENCY_MIN_RATIO", "0.20"))))
+PROXY_EMERGENCY_TRANSIENT_REPROBES = max(0, min(int(os.getenv("PROXY_EMERGENCY_TRANSIENT_REPROBES", "2")), 3))
+PROXY_EMERGENCY_TRANSIENT_MIN_AGE = max(30.0, float(os.getenv("PROXY_EMERGENCY_TRANSIENT_MIN_AGE", "45")))
+FINAL_KNOWN_GOOD_REPROBES = max(0, min(int(os.getenv("FINAL_KNOWN_GOOD_REPROBES", "1")), 1))
 
 # Если eBay UK не дал ни одного успешного ответа более 10 минут, один раз
 # уведомляем в Telegram. После следующего успеха аварийный флаг сбрасывается.
@@ -89,9 +108,13 @@ CONNECTION_WATCHDOG_INTERVAL = max(10, int(os.getenv("CONNECTION_WATCHDOG_INTERV
 # события (не дольше минуты) и мгновенно просыпается при добавлении новой ссылки.
 AUCTION_REMINDER_MINUTES = (60, 30, 10, 5)
 AUCTION_SCHEDULER_MAX_SLEEP = max(15, int(os.getenv("AUCTION_SCHEDULER_MAX_SLEEP", "60")))
-AUCTION_FETCH_MAX_PROXIES = max(1, min(int(os.getenv("AUCTION_FETCH_MAX_PROXIES", "4")), 6))
+AUCTION_FETCH_MAX_PROXIES = max(3, min(int(os.getenv("AUCTION_FETCH_MAX_PROXIES", "6")), 8))
+AUCTION_FETCH_PARALLEL = max(2, min(int(os.getenv("AUCTION_FETCH_PARALLEL", "3")), 4))
 AUCTION_FETCH_CONNECT_TIMEOUT = float(os.getenv("AUCTION_FETCH_CONNECT_TIMEOUT", "5"))
-AUCTION_FETCH_READ_TIMEOUT = float(os.getenv("AUCTION_FETCH_READ_TIMEOUT", "14"))
+AUCTION_FETCH_READ_TIMEOUT = float(os.getenv("AUCTION_FETCH_READ_TIMEOUT", "16"))
+# Для подтверждения пользовательской ссылки пробуем несколько независимых HTML-вариантов:
+# eBay иногда отдаёт одному proxy урезанный/иной шаблон без itemEndDate.
+AUCTION_VERIFY_MAX_PAGES = max(2, min(int(os.getenv("AUCTION_VERIFY_MAX_PAGES", "3")), 4))
 # Лёгкая проверка сохранённых аукционов: максимум два лота за проход. Это позволяет
 # заметить досрочное завершение/изменение end time, не создавая burst на eBay/Render.
 AUCTION_STATUS_BATCH = max(1, min(int(os.getenv("AUCTION_STATUS_BATCH", "1")), 2))
@@ -120,7 +143,7 @@ FIXED_RECOVERY_CONNECT_TIMEOUT = float(os.getenv("FIXED_RECOVERY_CONNECT_TIMEOUT
 FIXED_RECOVERY_READ_TIMEOUT = float(os.getenv("FIXED_RECOVERY_READ_TIMEOUT", "8"))
 
 # Один аварийный discovery-цикл не должен держать монитор без свежего pool слишком долго.
-# За 75 сек. с adaptive 3->4 workers успеваем проверить значительно больше адресов,
+# За 75 сек. с adaptive 4->5 workers успеваем проверить значительно больше адресов,
 # затем делаем лишь короткую паузу, обновляем ProxyScrape и продолжаем поиск.
 SEARCH_TIME_BUDGET = max(45, int(os.getenv("SEARCH_TIME_BUDGET", "75")))
 MAX_SEARCH_ATTEMPTS = max(60, int(os.getenv("MAX_SEARCH_ATTEMPTS", "120")))
@@ -137,6 +160,48 @@ MAX_ITEMS = 60
 RETRY_DELAY = 2
 GBP_TO_UAH = 60
 EXTRA_DELIVERY_COST = 120
+
+
+def build_proxy_list_url_with_timeout(raw_url, timeout_ms):
+    """Строит аварийный ProxyScrape URL, меняя только query-параметр timeout.
+
+    Основной PROXY_LIST из Render не изменяется. Если пользователь когда-нибудь задаст
+    PROXY_LIST_EMERGENCY вручную, он имеет приоритет; иначе URL создаётся автоматически.
+    """
+    override = (os.getenv("PROXY_LIST_EMERGENCY") or '').strip()
+    if override:
+        return override
+    if not raw_url:
+        return raw_url
+    try:
+        parts = urlsplit(raw_url)
+        pairs = parse_qsl(parts.query, keep_blank_values=True)
+        replaced = False
+        new_pairs = []
+        for k, v in pairs:
+            if k.lower() == 'timeout':
+                new_pairs.append((k, str(int(timeout_ms))))
+                replaced = True
+            else:
+                new_pairs.append((k, v))
+        if not replaced:
+            new_pairs.append(('timeout', str(int(timeout_ms))))
+        return urlunsplit((
+            parts.scheme,
+            parts.netloc,
+            parts.path,
+            urlencode(new_pairs, doseq=True),
+            parts.fragment,
+        ))
+    except Exception as e:
+        logging.warning(f"Не удалось построить emergency ProxyScrape URL: {e}")
+        return raw_url
+
+
+PROXY_LIST_EMERGENCY_URL = build_proxy_list_url_with_timeout(
+    PROXY_LIST_URL, PROXY_EMERGENCY_TIMEOUT_MS
+)
+
 
 def normalize_ebay_search_url(raw_url):
     """
@@ -299,6 +364,7 @@ class ProxyManager:
         self.all_proxies = []
         self.lock = threading.Lock()
         self.last_refresh = 0
+        self.last_emergency_refresh = 0
         self.refresh_interval = PROXY_REFRESH_INTERVAL
 
         # cooldown конкретного protocol://ip:port
@@ -311,6 +377,8 @@ class ProxyManager:
         self.success_score = {}
         self.last_success_at = {}
         self.fail_streak = {}
+        self.last_failure_result = {}
+        self.last_failure_at = {}
 
     def _cleanup_bad_locked(self):
         now = time.time()
@@ -322,19 +390,26 @@ class ProxyManager:
         # Возвращаем proxy после cooldown, если он есть в свежем списке.
         current = set(self.proxies)
         for p in self.all_proxies:
-            if self.bad_until.get(p, 0) <= now and p not in current:
+            host = _proxy_host(p)
+            if (
+                self.bad_until.get(p, 0) <= now
+                and self.host_bad_until.get(host, 0) <= now
+                and p not in current
+            ):
                 self.proxies.append(p)
                 current.add(p)
 
-    def fetch_proxies_from_api(self):
-        if not self.proxy_list_url:
+    def fetch_proxies_from_api(self, url=None, label='standard'):
+        target_url = url or self.proxy_list_url
+        if not target_url:
             return []
 
         try:
-            logging.info(f"Загрузка прокси из {self.proxy_list_url}")
-            resp = requests.get(self.proxy_list_url, timeout=15)
+            prefix = "🆘 Emergency ProxyScrape" if label == 'emergency' else "Загрузка прокси"
+            logging.info(f"{prefix} из {target_url}")
+            resp = requests.get(target_url, timeout=15)
             if resp.status_code != 200:
-                logging.error(f"Ошибка загрузки прокси: HTTP {resp.status_code}")
+                logging.error(f"Ошибка загрузки прокси ({label}): HTTP {resp.status_code}")
                 return []
 
             proxies = []
@@ -361,53 +436,124 @@ class ProxyManager:
 
             random.shuffle(proxies)
             logging.info(
-                f"Загружено {len(proxies)} пригодных proxy "
-                f"(http={scheme_counts.get('http', 0)}, "
+                f"Загружено {len(proxies)} пригодных proxy ({label}; "
+                f"http={scheme_counts.get('http', 0)}, "
                 f"https={scheme_counts.get('https', 0)}, "
                 f"socks5={scheme_counts.get('socks5', 0)}, "
                 f"пропущено={scheme_counts.get('skipped', 0)})"
             )
             return proxies
         except Exception as e:
-            logging.error(f"Ошибка при получении прокси: {e}")
+            logging.error(f"Ошибка при получении прокси ({label}): {e}")
             return []
 
-    def refresh_proxies(self, force=False):
+    def refresh_proxies(self, force=False, emergency=False):
+        """Обновляет основной пул или аккуратно ДОБАВЛЯЕТ emergency-кандидатов.
+
+        Emergency timeout=3000 не заменяет основной список 1500 и не снимает cooldown.
+        Он лишь расширяет all_proxies новыми endpoint-ами, которых не было в быстром пуле.
+        """
         with self.lock:
             self._cleanup_bad_locked()
             now = time.time()
-            if not force and self.all_proxies and (now - self.last_refresh) < self.refresh_interval:
-                return
+            if not emergency:
+                if not force and self.all_proxies and (now - self.last_refresh) < self.refresh_interval:
+                    return False
+            else:
+                if not force and (now - self.last_emergency_refresh) < self.refresh_interval:
+                    return False
 
-        new_proxies = self.fetch_proxies_from_api()
+        target_url = PROXY_LIST_EMERGENCY_URL if emergency else self.proxy_list_url
+        new_proxies = self.fetch_proxies_from_api(
+            url=target_url,
+            label='emergency' if emergency else 'standard',
+        )
 
         with self.lock:
             now = time.time()
             self._cleanup_bad_locked()
             if new_proxies:
-                self.all_proxies = new_proxies
-                self.proxies = [p for p in new_proxies if self.bad_until.get(p, 0) <= now]
-                self.last_refresh = now
+                if emergency:
+                    old_all = list(self.all_proxies)
+                    merged = list(dict.fromkeys(old_all + new_proxies))
+                    added = len(merged) - len(old_all)
+                    self.all_proxies = merged
+                    current = set(self.proxies)
+                    for p in new_proxies:
+                        if self.bad_until.get(p, 0) <= now and p not in current:
+                            host = _proxy_host(p)
+                            if self.host_bad_until.get(host, 0) <= now:
+                                self.proxies.append(p)
+                                current.add(p)
+                    self.last_emergency_refresh = now
+                    logging.info(
+                        f"🆘 Emergency pool объединён: +{added} новых endpoint; "
+                        f"всего известно {len(self.all_proxies)}, доступно {len(self.proxies)} "
+                        f"(proxy cooldown: {len(self.bad_until)}, host cooldown: {len(self.host_bad_until)})"
+                    )
+                else:
+                    self.all_proxies = new_proxies
+                    self.proxies = [
+                        p for p in new_proxies
+                        if self.bad_until.get(p, 0) <= now
+                        and self.host_bad_until.get(_proxy_host(p), 0) <= now
+                    ]
+                    self.last_refresh = now
 
-                # Не удаляем историю успешных proxy при каждом refresh: хороший IP
-                # может исчезнуть из одного снимка ProxyScrape и снова появиться.
-                # Чистим только совсем старую историю, чтобы память не росла бесконечно.
-                cutoff = now - 6 * GOOD_PROXY_MEMORY
-                stale = [p for p, ts in self.last_success_at.items() if ts < cutoff]
-                for p in stale:
-                    self.last_success_at.pop(p, None)
-                    self.success_score.pop(p, None)
-                    self.fail_streak.pop(p, None)
-                    self.last_used.pop(p, None)
+                    # Не удаляем историю успешных proxy при каждом refresh: хороший IP
+                    # может исчезнуть из одного снимка ProxyScrape и снова появиться.
+                    cutoff = now - 6 * GOOD_PROXY_MEMORY
+                    stale = [p for p, ts in self.last_success_at.items() if ts < cutoff]
+                    for p in stale:
+                        self.last_success_at.pop(p, None)
+                        self.success_score.pop(p, None)
+                        self.fail_streak.pop(p, None)
+                        self.last_used.pop(p, None)
+                        self.last_failure_result.pop(p, None)
+                        self.last_failure_at.pop(p, None)
 
-                logging.info(
-                    f"Пул proxy обновлён: {len(self.proxies)} доступно "
-                    f"(proxy cooldown: {len(self.bad_until)}, host cooldown: {len(self.host_bad_until)})"
-                )
+                    logging.info(
+                        f"Пул proxy обновлён: {len(self.proxies)} доступно "
+                        f"(proxy cooldown: {len(self.bad_until)}, host cooldown: {len(self.host_bad_until)})"
+                    )
+                return True
             elif not self.proxies:
-                logging.warning("Не удалось получить пригодные proxy")
+                logging.warning(
+                    "Не удалось получить пригодные emergency proxy"
+                    if emergency else "Не удалось получить пригодные proxy"
+                )
             else:
-                logging.warning("Не удалось обновить proxy, продолжаем использовать старые")
+                logging.warning(
+                    "Emergency ProxyScrape не дал новых proxy, продолжаем старый пул"
+                    if emergency else "Не удалось обновить proxy, продолжаем использовать старые"
+                )
+            return False
+
+    def pool_stats(self):
+        """Возвращает реальное число usable endpoint, учитывая и host cooldown."""
+        with self.lock:
+            self._cleanup_bad_locked()
+            now = time.time()
+            available = sum(
+                1 for p in self.proxies
+                if self.bad_until.get(p, 0) <= now
+                and self.host_bad_until.get(_proxy_host(p), 0) <= now
+            )
+            return (
+                available,
+                len(self.all_proxies),
+                len(self.bad_until),
+                len(self.host_bad_until),
+            )
+
+    def emergency_needed(self):
+        available, total, _, _ = self.pool_stats()
+        if total <= 0:
+            return True
+        return (
+            available <= PROXY_EMERGENCY_MIN_AVAILABLE
+            or (available / max(1, total)) <= PROXY_EMERGENCY_MIN_RATIO
+        )
 
     def _is_recent_good_locked(self, proxy, now=None):
         if now is None:
@@ -462,7 +608,19 @@ class ProxyManager:
         Так мы реально используем весь большой пул, не повышая число одновременных запросов.
         """
         tried_hosts = tried_hosts or set()
-        self.refresh_proxies()
+        # Если emergency 3000-ms pool был только что добавлен, не даём автоматическому
+        # 60-секундному standard refresh тут же заменить его обратно на один 1500-ms
+        # список посреди того же discovery. После ~90 сек. следующий поиск снова начнёт
+        # с обычного свежего 1500-ms пула.
+        now = time.time()
+        with self.lock:
+            emergency_hold = max(self.refresh_interval, SEARCH_TIME_BUDGET + 15)
+            emergency_recent = bool(
+                self.last_emergency_refresh > self.last_refresh
+                and (now - self.last_emergency_refresh) < emergency_hold
+            )
+        if not emergency_recent:
+            self.refresh_proxies()
         now = time.time()
 
         with self.lock:
@@ -606,6 +764,84 @@ class ProxyManager:
             self.last_used[proxy] = now
             return proxy
 
+    def get_due_transient_reprobe_candidate(
+        self,
+        tried_proxies,
+        reprobed_proxies,
+        inflight_hosts=None,
+        min_age=None,
+    ):
+        """Один второй шанс только для transient transport-сбоев в emergency-mode.
+
+        Жёсткие ошибки (SSL/MITM, CONNECT rejected, 403/429) сюда никогда не попадают.
+        Это позволяет временно ожившему бесплатному proxy вернуться в том же длинном
+        discovery, не превращая поиск в бесконечный круг по одним адресам.
+        """
+        tried_proxies = set(tried_proxies or ())
+        reprobed_proxies = set(reprobed_proxies or ())
+        inflight_hosts = set(inflight_hosts or ())
+        min_age = PROXY_EMERGENCY_TRANSIENT_MIN_AGE if min_age is None else float(min_age)
+        if not tried_proxies:
+            return None
+
+        now = time.time()
+        with self.lock:
+            self._cleanup_bad_locked()
+            candidates = []
+            for p in tried_proxies:
+                if p in reprobed_proxies:
+                    continue
+                if self.last_failure_result.get(p) not in ('proxy_timeout', 'proxy_error'):
+                    continue
+                failed_at = self.last_failure_at.get(p, 0)
+                if failed_at <= 0 or (now - failed_at) < min_age:
+                    continue
+                if self.fail_streak.get(p, 0) > 2:
+                    continue
+                if self.bad_until.get(p, 0) > now:
+                    continue
+                host = _proxy_host(p)
+                if not host or host in inflight_hosts:
+                    continue
+                if self.host_bad_until.get(host, 0) > now:
+                    continue
+                candidates.append(p)
+
+            if not candidates:
+                return None
+            candidates.sort(key=lambda p: self._candidate_score_locked(p, now), reverse=True)
+            proxy = candidates[0]
+            self.last_used[proxy] = now
+            return proxy
+
+    def get_final_known_good_reprobe(self, tried_proxies, inflight_hosts=None):
+        """Последний один шанс known-good после исчерпания обычных 120 попыток."""
+        tried_proxies = set(tried_proxies or ())
+        inflight_hosts = set(inflight_hosts or ())
+        now = time.time()
+        with self.lock:
+            self._cleanup_bad_locked()
+            candidates = []
+            for p in tried_proxies:
+                if not self._is_recent_good_locked(p, now):
+                    continue
+                if self.bad_until.get(p, 0) > now:
+                    continue
+                host = _proxy_host(p)
+                if not host or host in inflight_hosts:
+                    continue
+                if self.host_bad_until.get(host, 0) > now:
+                    continue
+                if self.fail_streak.get(p, 0) > 3:
+                    continue
+                candidates.append(p)
+            if not candidates:
+                return None
+            candidates.sort(key=lambda p: self._candidate_score_locked(p, now), reverse=True)
+            proxy = candidates[0]
+            self.last_used[proxy] = now
+            return proxy
+
     def mark_success(self, proxy):
         if not proxy:
             return
@@ -615,6 +851,8 @@ class ProxyManager:
             self.success_score[proxy] = min(20, self.success_score.get(proxy, 0) + 2)
             self.last_success_at[proxy] = now
             self.fail_streak[proxy] = 0
+            self.last_failure_result.pop(proxy, None)
+            self.last_failure_at.pop(proxy, None)
             self.bad_until.pop(proxy, None)
             # Если этот же IP только что доказал работоспособность, снимаем host cooldown.
             self.host_bad_until.pop(host, None)
@@ -632,6 +870,8 @@ class ProxyManager:
             known_good = self._is_recent_good_locked(proxy, now)
             streak = self.fail_streak.get(proxy, 0) + 1
             self.fail_streak[proxy] = streak
+            self.last_failure_result[proxy] = result
+            self.last_failure_at[proxy] = now
 
             # Единичный сбой недавно успешного proxy не уничтожает его репутацию.
             old_score = self.success_score.get(proxy, 0)
@@ -647,20 +887,20 @@ class ProxyManager:
                     cooldown = [600, 1200, 1800, 1800][min(streak - 1, 3)]
                 host_cooldown = cooldown
             elif result == 'blocked':
+                # 403 / Pardon — это уже сигнал eBay по exit IP, поэтому даже ранее
+                # успешный адрес не возвращаем слишком быстро: минимум 5 минут.
                 if known_good:
-                    # Главное изменение: успешный IP после единичного 403 вернётся
-                    # через ~30 сек, а не будет потерян на 30 минут.
-                    cooldown = [30, 90, 300, 600][min(streak - 1, 3)]
+                    cooldown = [300, 600, 900, 1200][min(streak - 1, 3)]
                 else:
                     cooldown = [300, 600, 1200, 1800][min(streak - 1, 3)]
                 host_cooldown = cooldown
             elif result == 'proxy_rejected':
-                # CONNECT 400/405/500/aborted у никогда не работавшего endpoint обычно
-                # означает, что он не умеет нормально туннелировать HTTPS к eBay.
-                # Не тратим на него следующий discovery через 1-2 минуты. Для ранее
-                # успешного proxy сохраняем мягкое отношение — сбой мог быть временным.
+                # CONNECT 400/405/500/aborted — жёсткий отказ туннеля. Это не обычный
+                # transient timeout, поэтому не возвращаем endpoint через 20-45 сек.
+                # Ранее успешному proxy оставляем умеренно более короткий cooldown,
+                # но всё равно значительно длиннее transport-timeout/error.
                 if known_good:
-                    cooldown = [20, 45, 120, 300][min(streak - 1, 3)]
+                    cooldown = [120, 300, 600, 900][min(streak - 1, 3)]
                 else:
                     cooldown = [600, 900, 1200, 1800][min(streak - 1, 3)]
                 host_cooldown = 0
@@ -668,13 +908,13 @@ class ProxyManager:
                 if known_good:
                     cooldown = [20, 45, 120, 300][min(streak - 1, 3)]
                 else:
-                    cooldown = [75, 150, 300, 600][min(streak - 1, 3)]
+                    cooldown = [45, 90, 180, 300][min(streak - 1, 3)]
                 host_cooldown = 0
             elif result == 'proxy_error':
                 if known_good:
                     cooldown = [15, 30, 90, 300][min(streak - 1, 3)]
                 else:
-                    cooldown = [90, 180, 300, 600][min(streak - 1, 3)]
+                    cooldown = [45, 90, 180, 300][min(streak - 1, 3)]
                 host_cooldown = 0
             else:
                 if known_good:
@@ -690,10 +930,15 @@ class ProxyManager:
                 self.proxies.remove(proxy)
 
             label = reason or result
+            available_now = sum(
+                1 for p in self.proxies
+                if self.bad_until.get(p, 0) <= now
+                and self.host_bad_until.get(_proxy_host(p), 0) <= now
+            )
             logging.info(
                 f"Proxy {proxy} cooldown {cooldown} сек. "
                 f"Причина: {label}; known_good={known_good}, fail_streak={streak}. "
-                f"Осталось {len(self.proxies)} proxy"
+                f"Осталось {available_now} реально доступных proxy"
             )
             return cooldown
 
@@ -1328,10 +1573,10 @@ def extract_ebay_urls(text):
 def extract_ebay_item_id_any(url, html=None):
     for source in (url or '', html or ''):
         patterns = (
-            r'/itm/(?:[^/?#]+/)?(\d{9,15})(?:[/?#]|$)',
-            r'[?&](?:item|itemid|item_id)=(\d{9,15})(?:&|$)',
-            r'eBay\s+item\s+number\s*:?\s*(\d{9,15})',
-            r'"itemId"\s*:\s*"?(\d{9,15})"?',
+            r'/itm/(?:[^/?#]+/)?(\d{9,19})(?:[/?#]|$)',
+            r'[?&](?:item|itemid|item_id)=(\d{9,19})(?:&|$)',
+            r'eBay\s+item\s+number\s*:?\s*(\d{9,19})',
+            r'"itemId"\s*:\s*"?(\d{9,19})"?',
         )
         for pattern in patterns:
             m = re.search(pattern, source, re.I)
@@ -1353,12 +1598,21 @@ def _request_auction_page_once(url, proxy, profile, connect_timeout=None, read_t
         )
         final_url = str(getattr(response, 'url', '') or '')
         if response.status_code not in (200, 404, 410):
+            logging.info(
+                f"Auction page через {proxy}: HTTP {response.status_code}, url={final_url[:160]}"
+            )
             return None, final_url
-        blocked, _ = _is_ebay_block_page(response)
+        blocked, reason = _is_ebay_block_page(response)
         if blocked:
+            logging.info(f"Auction page через {proxy}: eBay block/challenge ({reason})")
             return None, final_url
         if final_url and not _is_allowed_ebay_url(final_url):
+            logging.info(f"Auction page через {proxy}: неожиданный redirect {final_url[:160]}")
             return None, final_url
+        logging.info(
+            f"✅ Auction page получена через {proxy}: HTTP {response.status_code}, "
+            f"bytes={len(response.content or b'')}, url={final_url[:160]}"
+        )
         return response.text, final_url
     except Exception as e:
         logging.info(f"Auction page через {proxy} не получена: {e}")
@@ -1367,56 +1621,312 @@ def _request_auction_page_once(url, proxy, profile, connect_timeout=None, read_t
         close_session(session)
 
 
-def fetch_auction_page(url, max_reserve_proxies=None, connect_timeout=None, read_timeout=None):
-    """Редкая операция: fixed proxy первым, затем небольшой резерв без burst."""
+def _canonical_auction_url(url):
+    item_id = extract_ebay_item_id_any(url or '')
+    if item_id:
+        return f"https://www.ebay.co.uk/itm/{item_id}"
+    return url
+
+
+def fetch_auction_pages(
+    url,
+    max_reserve_proxies=None,
+    connect_timeout=None,
+    read_timeout=None,
+    max_pages=1,
+):
+    """Редкая операция: несколько proxy параллельно, без зависимости от main fixed request.
+
+    Мы не штрафуем proxy глобально за неудачу именно item-page: один IP может отлично
+    открывать search, но временно плохо отдавать тяжёлую карточку товара. Первый валидный
+    HTML не останавливает проверку мгновенно, если caller запросил несколько страниц —
+    это позволяет пережить разные HTML-шаблоны eBay без приблизительного времени.
+    """
     if not _is_allowed_ebay_url(url):
-        return None, None, None
+        return []
 
     profile = get_preferred_profile()
     if profile is None:
-        return None, None, None
+        return []
 
     if max_reserve_proxies is None:
         max_reserve_proxies = AUCTION_FETCH_MAX_PROXIES
-    max_reserve_proxies = max(0, min(int(max_reserve_proxies), 6))
+    max_reserve_proxies = max(0, min(int(max_reserve_proxies), 8))
+    max_pages = max(1, min(int(max_pages), AUCTION_VERIFY_MAX_PAGES))
+
+    canonical_url = _canonical_auction_url(url)
+    urls_to_try = [canonical_url]
+    if url != canonical_url:
+        urls_to_try.append(url)
 
     candidates = []
     current_fixed = fixed_proxy
-    if current_fixed:
+
+    # Важное изменение V6.6: auction item-page не конкурирует с основным мониторингом
+    # за тот же fixed proxy. Сначала берём отдельные reserve IP; main fixed добавляем
+    # только последним fallback. По логам fixed отлично грузил search, но тяжёлая item-page
+    # на том же IP одновременно получала timeout/reset.
+    excluded_hosts = {_proxy_host(current_fixed)} if current_fixed else set()
+    reserve = proxy_manager.get_candidate_batch(max_reserve_proxies, tried_hosts=excluded_hosts)
+    for p in reserve:
+        if p not in candidates:
+            candidates.append(p)
+    if current_fixed and current_fixed not in candidates:
         candidates.append(current_fixed)
 
-    tried_hosts = {_proxy_host(p) for p in candidates if p}
-    if max_reserve_proxies:
-        for p in proxy_manager.get_candidate_batch(max_reserve_proxies, tried_hosts=tried_hosts):
+    # Если обычный pool почти исчерпан, auction-link — редкая пользовательская операция,
+    # поэтому можно один раз добавить emergency 3000-ms candidates и не ждать main discovery.
+    if len(candidates) < 2 or proxy_manager.emergency_needed():
+        proxy_manager.refresh_proxies(force=True, emergency=True)
+        tried_hosts = {_proxy_host(p) for p in candidates if p}
+        reserve_count = len([p for p in candidates if p != current_fixed])
+        extra = proxy_manager.get_candidate_batch(
+            max(0, max_reserve_proxies - reserve_count),
+            tried_hosts=tried_hosts,
+        )
+        for p in extra:
             if p not in candidates:
                 candidates.append(p)
 
-    for proxy in candidates[:1 + max_reserve_proxies]:
-        html, final_url = _request_auction_page_once(
-            url, proxy, profile,
-            connect_timeout=connect_timeout,
-            read_timeout=read_timeout,
-        )
-        if html:
-            return html, final_url or url, proxy
-    return None, None, None
+    if not candidates:
+        return []
+
+    def worker(proxy):
+        for candidate_url in urls_to_try:
+            html, final_url = _request_auction_page_once(
+                candidate_url,
+                proxy,
+                profile,
+                connect_timeout=connect_timeout,
+                read_timeout=read_timeout,
+            )
+            if html:
+                return html, final_url or candidate_url, proxy
+        return None, None, proxy
+
+    pages = []
+    pending_candidates = list(candidates[:1 + max_reserve_proxies])
+    executor = ThreadPoolExecutor(
+        max_workers=min(AUCTION_FETCH_PARALLEL, len(pending_candidates)),
+        thread_name_prefix='auction-fetch',
+    )
+    future_to_proxy = {}
+
+    def submit_next():
+        while pending_candidates and len(future_to_proxy) < AUCTION_FETCH_PARALLEL:
+            proxy = pending_candidates.pop(0)
+            future_to_proxy[executor.submit(worker, proxy)] = proxy
+
+    submit_next()
+    try:
+        while future_to_proxy and len(pages) < max_pages:
+            done, _ = wait(tuple(future_to_proxy.keys()), timeout=1.0, return_when=FIRST_COMPLETED)
+            if not done:
+                continue
+            for future in done:
+                proxy = future_to_proxy.pop(future, None)
+                try:
+                    html, final_url, proxy_used = future.result()
+                except Exception as e:
+                    logging.info(f"Auction fetch worker {proxy} завершился ошибкой: {e}")
+                    html, final_url, proxy_used = None, None, proxy
+                if html:
+                    proxy_manager.mark_success(proxy_used)
+                    pages.append((html, final_url, proxy_used))
+                    if len(pages) >= max_pages:
+                        break
+            submit_next()
+    finally:
+        for future in list(future_to_proxy):
+            future.cancel()
+        executor.shutdown(wait=False, cancel_futures=True)
+
+    return pages
+
+
+def fetch_auction_page(url, max_reserve_proxies=None, connect_timeout=None, read_timeout=None):
+    """Совместимый wrapper: возвращает первую полученную auction page."""
+    pages = fetch_auction_pages(
+        url,
+        max_reserve_proxies=max_reserve_proxies,
+        connect_timeout=connect_timeout,
+        read_timeout=read_timeout,
+        max_pages=1,
+    )
+    if not pages:
+        return None, None, None
+    return pages[0]
 
 def _parse_iso_datetime(value):
-    if not value:
+    if value is None:
         return None
     try:
-        normalized = value.strip().replace('Z', '+00:00')
+        if isinstance(value, (int, float)):
+            number = float(value)
+            if number > 10**12:
+                number /= 1000.0
+            return datetime.fromtimestamp(number, tz=timezone.utc)
+
+        text = html_lib.unescape(str(value)).strip().strip('"\'')
+        # Декодируем только \uXXXX и escaped slash/quotes, не трогая произвольные байты.
+        text = re.sub(
+            r'\\u([0-9a-fA-F]{4})',
+            lambda m: chr(int(m.group(1), 16)),
+            text,
+        )
+        text = text.replace('\\/', '/').replace('\\"', '"')
+        if re.fullmatch(r'\d{10,13}(?:\.\d+)?', text):
+            number = float(text)
+            if number > 10**12:
+                number /= 1000.0
+            return datetime.fromtimestamp(number, tz=timezone.utc)
+
+        normalized = text.replace('Z', '+00:00')
         dt = datetime.fromisoformat(normalized)
         return _ensure_aware_utc(dt)
     except Exception:
         return None
 
 
+def _cluster_datetimes(values, tolerance_seconds=5):
+    clusters = []
+    for dt in sorted((_ensure_aware_utc(v) for v in values if v), key=lambda x: x.timestamp()):
+        placed = False
+        for cluster in clusters:
+            if abs((dt - cluster[0]).total_seconds()) <= tolerance_seconds:
+                cluster.append(dt)
+                placed = True
+                break
+        if not placed:
+            clusters.append([dt])
+    return clusters
+
+
+def _extract_structured_end_time(html, item_id=None):
+    """Ищет exact UTC end time в структурных данных eBay без угадывания по countdown.
+
+    Сначала ищем только рядом с ID текущего лота. Whole-page fallback разрешён лишь для
+    специфичных ключей itemEndDate/listingEndTime/auctionEndTime и только если значение
+    на странице фактически одно — recommendation-карточки не должны подменить лот.
+    """
+    if not html:
+        return None, 'none', False
+
+    normalized = html.replace('\\"', '"').replace('\\/', '/')
+    strict_keys = ('itemEndDate', 'listingEndTime', 'auctionEndTime')
+    broad_keys = strict_keys + ('endDateTime', 'endTime', 'endDate')
+
+    def values_from(source, keys):
+        found = []
+        key_alt = '|'.join(re.escape(k) for k in keys)
+        pattern = re.compile(
+            rf'"(?:{key_alt})"\s*:\s*(?:"([^"\\]+)"|(\d{{10,13}}(?:\.\d+)?))',
+            re.I,
+        )
+        for m in pattern.finditer(source):
+            raw = m.group(1) or m.group(2)
+            dt = _parse_iso_datetime(raw)
+            if dt:
+                found.append(dt)
+        # Некоторые eBay templates используют data-* атрибуты.
+        attr_pattern = re.compile(
+            r'data-(?:item-end-date|listing-end-time|auction-end-time|end-time|end-date)\s*=\s*["\']([^"\']+)["\']',
+            re.I,
+        )
+        for m in attr_pattern.finditer(source):
+            dt = _parse_iso_datetime(m.group(1))
+            if dt:
+                found.append(dt)
+        return found
+
+    contextual = []
+    if item_id:
+        for mm in re.finditer(re.escape(str(item_id)), normalized):
+            left = max(0, mm.start() - 5000)
+            right = min(len(normalized), mm.end() + 18000)
+            window = normalized[left:right]
+            auctionish = bool(
+                re.search(r'"buyingOptions"\s*:\s*\[[^\]]*"AUCTION"', window, re.I)
+                or re.search(r'"(?:currentBidPrice|bidCount|auction)"\s*:', window, re.I)
+                or re.search(r'"listingType"\s*:\s*"(?:Auction|Chinese)"', window, re.I)
+            )
+            contextual.extend(values_from(window, broad_keys if auctionish else strict_keys))
+            if len(contextual) >= 20:
+                break
+
+    if contextual:
+        clusters = _cluster_datetimes(contextual)
+        if len(clusters) == 1:
+            return clusters[0][0], 'structured_near_item', False
+        return None, 'structured_near_item_conflict', True
+
+    strict_values = values_from(normalized, strict_keys)
+    if strict_values:
+        clusters = _cluster_datetimes(strict_values)
+        if len(clusters) == 1:
+            return clusters[0][0], 'structured_unique_page', False
+        return None, 'structured_page_conflict', True
+
+    return None, 'none', False
+
+
+def _extract_visible_exact_uk_end(visible):
+    """Парсит только абсолютное UK-время с секундами и BST/GMT."""
+    if not visible:
+        return None, None
+    # Поддерживаем варианты:
+    # Ends: 14 Sep, 2026 19:31:22 BST
+    # Ends on Sun, 14 Sep 2026, 19:31:22 BST
+    pattern = re.compile(
+        r'\b(Ends|Ended)(?:\s+on)?\s*:?[\s,]*(?:[A-Za-z]{3},?\s+)?'
+        r'(\d{1,2})\s+([A-Za-z]{3})[,]?\s+(\d{4})[,]?\s+'
+        r'(\d{1,2}):(\d{2}):(\d{2})\s*(BST|GMT)\b',
+        re.I,
+    )
+    m = pattern.search(visible)
+    if not m:
+        return None, None
+    try:
+        naive = datetime.strptime(
+            f"{m.group(2)} {m.group(3)} {m.group(4)} {m.group(5)}:{m.group(6)}:{m.group(7)}",
+            '%d %b %Y %H:%M:%S',
+        )
+        offset = timedelta(hours=1 if m.group(8).upper() == 'BST' else 0)
+        return naive.replace(tzinfo=timezone(offset)).astimezone(timezone.utc), m.group(1).lower()
+    except Exception:
+        return None, None
+
+
+def _structured_auction_evidence(html, item_id=None):
+    if not html:
+        return False
+    normalized = html.replace('\\"', '"')
+    windows = []
+    if item_id:
+        for mm in re.finditer(re.escape(str(item_id)), normalized):
+            windows.append(normalized[max(0, mm.start()-4000): min(len(normalized), mm.end()+14000)])
+            if len(windows) >= 10:
+                break
+    if not windows:
+        windows = [normalized]
+
+    patterns = (
+        r'"buyingOptions"\s*:\s*\[[^\]]*"AUCTION"',
+        r'"listingType"\s*:\s*"(?:Auction|Chinese)"',
+        r'"format"\s*:\s*"AUCTION"',
+        r'"auction"\s*:\s*true',
+        r'"currentBidPrice"\s*:',
+        r'"bidCount"\s*:\s*\d+',
+    )
+    return any(re.search(p, w, re.I) for w in windows for p in patterns)
+
+
 def parse_auction_page(html, final_url):
     """Возвращает item_id, title, exact end_time_utc, source, status.
 
     status: active | ended | not_auction | no_item_id | no_exact_end_time | time_conflict
-    В fixed-price листинге один itemEndDate НЕ считается доказательством аукциона.
+    Время принимается только из абсолютного timestamp/UK-time с секундами — countdown
+    вроде "2d 5h" намеренно не превращается в приблизительное расписание.
     """
     if not html:
         return None, None, None, 'empty', 'unknown'
@@ -1434,92 +1944,36 @@ def parse_auction_page(html, final_url):
         title = re.sub(r'\s*\|\s*eBay(?:\s+UK)?\s*$', '', title, flags=re.I).strip()
     title = title[:300] or f'eBay item {item_id or ""}'.strip()
 
-    # 1) Точное время, которое eBay показывает пользователю. Учитываем явный BST/GMT,
-    # а не предполагаем смещение: BST=UTC+1, GMT=UTC+0.
-    visible_end_utc = None
-    visible_kind = None
-    m = re.search(
-        r'\b(Ends|Ended)\s*:?\s*'
-        r'(\d{1,2}\s+[A-Za-z]{3},\s+\d{4}\s+\d{1,2}:\d{2}:\d{2})'
-        r'\s*(BST|GMT)\b',
-        visible,
-        re.I,
+    visible_end_utc, visible_kind = _extract_visible_exact_uk_end(visible)
+    structured_end_utc, structured_source, structured_conflict = _extract_structured_end_time(
+        html, item_id=item_id
     )
-    if m:
-        try:
-            naive = datetime.strptime(m.group(2), '%d %b, %Y %H:%M:%S')
-            offset = timedelta(hours=1 if m.group(3).upper() == 'BST' else 0)
-            visible_end_utc = naive.replace(tzinfo=timezone(offset)).astimezone(timezone.utc)
-            visible_kind = m.group(1).lower()
-        except ValueError:
-            pass
+    if structured_conflict:
+        return item_id, title, None, structured_source, 'time_conflict'
 
-    # 2) Независимый UTC timestamp из данных страницы — используем как fallback
-    # и как перекрёстную проверку, когда доступны оба источника.
-    iso_end_utc = None
-    patterns = (
-        r'"itemEndDate"\s*:\s*"([^"\\]+)"',
-        r'\\"itemEndDate\\"\s*:\s*\\"([^"\\]+)\\"',
-    )
-    # В большой eBay-странице есть recommendation-карточки с чужими end dates.
-    # Поэтому сначала ищем timestamp только рядом с ID текущего лота.
-    windows = []
-    if item_id:
-        for mm in re.finditer(re.escape(item_id), html):
-            windows.append(html[mm.start(): min(len(html), mm.end()+9000)])
-            if len(windows) >= 8:
-                break
-    for window in windows:
-        for pattern in patterns:
-            m2 = re.search(pattern, window, re.I)
-            if m2:
-                iso_end_utc = _parse_iso_datetime(m2.group(1))
-                if iso_end_utc:
-                    break
-        if iso_end_utc:
-            break
-    # Если рядом с item_id ключа нет, используем его только когда на всей странице
-    # найден ровно один уникальный itemEndDate — так не перепутаем с рекомендациями.
-    if iso_end_utc is None:
-        raw_values = []
-        for pattern in patterns:
-            raw_values.extend(re.findall(pattern, html, re.I))
-        unique_values = list(dict.fromkeys(raw_values))
-        if len(unique_values) == 1:
-            iso_end_utc = _parse_iso_datetime(unique_values[0])
-
-    if visible_end_utc and iso_end_utc:
-        if abs((visible_end_utc - iso_end_utc).total_seconds()) > 5:
-            return item_id, title, None, 'visible_vs_itemEndDate_conflict', 'time_conflict'
+    if visible_end_utc and structured_end_utc:
+        if abs((visible_end_utc - structured_end_utc).total_seconds()) > 5:
+            return item_id, title, None, 'visible_vs_structured_conflict', 'time_conflict'
         end_time_utc = visible_end_utc
-        source = 'visible_exact_uk_time+itemEndDate'
+        source = f'visible_exact_uk_time+{structured_source}'
     elif visible_end_utc:
         end_time_utc = visible_end_utc
         source = 'visible_exact_uk_time'
-    elif iso_end_utc:
-        end_time_utc = iso_end_utc
-        source = 'itemEndDate'
+    elif structured_end_utc:
+        end_time_utc = structured_end_utc
+        source = structured_source
     else:
         end_time_utc = None
         source = 'none'
 
-    # Положительное подтверждение аукциона. Не доверяем словам из recommendation-карточек:
-    # структурный AUCTION ищем рядом с item_id, а видимые признаки — характерные для bid box.
     bid_box_marker = bool(
-        re.search(r'\bplace\s+bid\b', visible, re.I)
+        re.search(r'\bplace\s+(?:a\s+)?bid\b', visible, re.I)
         or re.search(r'\bcurrent\s+bid\b', visible, re.I)
         or re.search(r'\bstarting\s+bid\b', visible, re.I)
+        or re.search(r'\b\d+\s+bids?\b', visible, re.I)
+        or re.search(r'\btime\s+left\b', visible, re.I) and re.search(r'\bbid\b', visible, re.I)
     )
-    structured_auction = False
-    if item_id:
-        for mm in re.finditer(re.escape(item_id), html):
-            window = html[mm.start(): min(len(html), mm.end()+7000)]
-            if (re.search(r'"buyingOptions"\s*:\s*\[[^\]]*"AUCTION"', window, re.I)
-                    or re.search(r'\\"buyingOptions\\"\s*:\s*\[[^\]]*\\"AUCTION\\"', window, re.I)
-                    or re.search(r'"listingType"\s*:\s*"Auction"', window, re.I)
-                    or re.search(r'"format"\s*:\s*"AUCTION"', window, re.I)):
-                structured_auction = True
-                break
+    structured_auction = _structured_auction_evidence(html, item_id=item_id)
 
     explicit_closed = bool(
         visible_kind == 'ended'
@@ -1530,15 +1984,70 @@ def parse_auction_page(html, final_url):
         or re.search(r'\bwe\s+looked\s+everywhere.*looks\s+like\s+this\s+page\s+is\s+missing\b', visible, re.I)
     )
 
+    # Положительное доказательство fixed-price, чтобы урезанный auction HTML случайно
+    # не объявить "не аукционом" только из-за отсутствия кнопки Place bid.
+    fixed_price_evidence = bool(
+        re.search(r'\bbuy\s+it\s+now\b', visible, re.I)
+        and not bid_box_marker
+        and not structured_auction
+        and re.search(r'"buyingOptions"\s*:\s*\[[^\]]*"FIXED_PRICE"', html.replace('\\"', '"'), re.I)
+    )
+
     if not item_id:
         return None, title, end_time_utc, source, 'no_item_id'
     if explicit_closed:
         return item_id, title, end_time_utc, source, 'ended'
     if not end_time_utc:
         return item_id, title, None, source, 'no_exact_end_time'
-    if not (bid_box_marker or structured_auction):
+    if bid_box_marker or structured_auction:
+        return item_id, title, end_time_utc, source, 'active'
+    if fixed_price_evidence:
         return item_id, title, end_time_utc, source, 'not_auction'
-    return item_id, title, end_time_utc, source, 'active'
+    # В сомнительном HTML не делаем ложный вывод "не аукцион".
+    return item_id, title, end_time_utc, source, 'no_exact_end_time'
+
+
+def parse_auction_search_fallback(html, item_id):
+    """Fallback exact verification через eBay search по item ID.
+
+    Search page часто легче открывается через proxy, чем тяжёлая View Item page. Мы всё
+    равно принимаем только exact structured timestamp; относительный 'Time left' не годится.
+    """
+    if not html or not item_id:
+        return None
+    soup = BeautifulSoup(html, 'html.parser')
+    target_card = None
+    for a in soup.find_all('a', href=True):
+        href = str(a.get('href') or '')
+        if str(item_id) not in href:
+            continue
+        target_card = (
+            a.find_parent('li', class_=lambda c: c and ('s-item' in str(c) or 's-card' in str(c)))
+            or a.find_parent('div', class_=lambda c: c and 'su-card-container' in str(c))
+        )
+        if target_card:
+            break
+
+    visible = re.sub(r'\s+', ' ', target_card.get_text(' ', strip=True)) if target_card else ''
+    card_html = str(target_card) if target_card else ''
+    auction_marker = bool(
+        re.search(r'\b\d+\s+bids?\b', visible, re.I)
+        or re.search(r'\btime\s+left\b', visible, re.I)
+        or _structured_auction_evidence(card_html or html, item_id=item_id)
+    )
+    if not auction_marker:
+        return None
+
+    end_time, source, conflict = _extract_structured_end_time(html, item_id=item_id)
+    if conflict or not end_time:
+        return None
+
+    title = ''
+    if target_card:
+        title_node = target_card.select_one('.s-item__title, .s-card__title, .su-styled-text.primary')
+        if title_node:
+            title = re.sub(r'\s+', ' ', title_node.get_text(' ', strip=True)).strip()
+    return str(item_id), title[:300] or f'eBay item {item_id}', end_time, f'search_fallback:{source}', 'active'
 
 def _future_reminder_labels(end_time_utc):
     remaining = (_ensure_aware_utc(end_time_utc) - datetime.now(timezone.utc)).total_seconds()
@@ -1553,47 +2062,120 @@ def process_auction_link(url):
     if not _is_allowed_ebay_url(url):
         return
 
-    html, final_url, proxy_used = fetch_auction_page(url)
-    if not html:
-        send_telegram_message(
-            "❌ <b>Не удалось проверить аукцион</b>\n\n"
-            "eBay сейчас не дал открыть страницу через доступные proxy. "
-            "Основной мониторинг продолжает работать. Попробуйте отправить ссылку ещё раз немного позже."
-        )
-        return
+    expected_item_id = extract_ebay_item_id_any(url or '')
+    pages = fetch_auction_pages(
+        url,
+        max_reserve_proxies=AUCTION_FETCH_MAX_PROXIES,
+        max_pages=AUCTION_VERIFY_MAX_PAGES,
+    )
 
-    parse_url = final_url if extract_ebay_item_id_any(final_url or '') else url
-    item_id, title, end_time_utc, parse_source, auction_status = parse_auction_page(html, parse_url)
-    if proxy_used and item_id:
-        proxy_manager.mark_success(proxy_used)
+    parsed_results = []
+    for html, final_url, proxy_used in pages:
+        parse_url = final_url if extract_ebay_item_id_any(final_url or '') else url
+        result = parse_auction_page(html, parse_url)
+        item_id, title, end_time_utc, parse_source, auction_status = result
+        logging.info(
+            f"🧪 Auction parse: proxy={proxy_used}, item={item_id}, status={auction_status}, "
+            f"source={parse_source}, end={end_time_utc.isoformat() if end_time_utc else None}"
+        )
+        if expected_item_id and item_id and item_id != expected_item_id:
+            logging.warning(
+                f"Auction URL mismatch: ожидали item={expected_item_id}, получили item={item_id}; страницу игнорируем"
+            )
+            continue
+        parsed_results.append((result, proxy_used))
 
-    if not item_id:
-        send_telegram_message("❌ Не удалось определить номер лота eBay по этой ссылке.")
-        return
-    if auction_status == 'time_conflict':
-        send_telegram_message(
-            "⚠️ <b>eBay показал противоречивое время окончания.</b>\n\n"
-            "Я специально не сохраняю такой лот автоматически, чтобы не дать неверное напоминание. "
-            "Попробуйте отправить ссылку ещё раз через минуту."
+    # Выбираем только положительно подтверждённый active auction с exact timestamp.
+    chosen = None
+    for result, proxy_used in parsed_results:
+        item_id, title, end_time_utc, parse_source, auction_status = result
+        if auction_status == 'active' and item_id and end_time_utc:
+            chosen = result
+            break
+
+    # Fallback: search по точному item ID обычно легче открывается через бесплатный proxy,
+    # а в его embedded data нередко есть exact itemEndDate. Countdown не используем.
+    fallback_item_id = expected_item_id
+    if not fallback_item_id:
+        for result, _ in parsed_results:
+            if result[0]:
+                fallback_item_id = result[0]
+                break
+
+    if chosen is None and fallback_item_id:
+        search_url = (
+            "https://www.ebay.co.uk/sch/i.html?"
+            + urlencode({
+                '_nkw': str(fallback_item_id),
+                'LH_Auction': '1',
+                '_sop': '1',
+                '_ipg': '60',
+            })
         )
-        return
-    if auction_status == 'ended':
-        line = f"\n🕒 Окончание по Киеву: <b>{format_kyiv_datetime(end_time_utc)}</b>" if end_time_utc else ''
-        send_telegram_message("⌛ <b>Этот аукцион уже завершён.</b>" + line)
-        return
-    if auction_status == 'not_auction':
-        send_telegram_message(
-            "ℹ️ <b>Это не активный аукцион со ставками.</b>\n\n"
-            "Обычные товары Buy It Now / Best Offer без режима торгов в список напоминаний не сохраняются."
+        fallback_pages = fetch_auction_pages(
+            search_url,
+            max_reserve_proxies=min(4, AUCTION_FETCH_MAX_PROXIES),
+            connect_timeout=min(AUCTION_FETCH_CONNECT_TIMEOUT, 4.0),
+            read_timeout=min(AUCTION_FETCH_READ_TIMEOUT, 10.0),
+            max_pages=2,
         )
-        return
-    if auction_status != 'active' or not end_time_utc:
+        for search_html, _, proxy_used in fallback_pages:
+            fallback_result = parse_auction_search_fallback(search_html, fallback_item_id)
+            if fallback_result:
+                logging.info(
+                    f"✅ Auction search-fallback подтвердил item={fallback_item_id}, "
+                    f"end={fallback_result[2].isoformat()}, source={fallback_result[3]}, proxy={proxy_used}"
+                )
+                chosen = fallback_result
+                break
+
+    if chosen is None:
+        if not pages:
+            send_telegram_message(
+                "❌ <b>Не удалось проверить аукцион</b>\n\n"
+                "eBay сейчас не дал открыть страницу через доступные proxy. "
+                "Основной мониторинг продолжает работать. Попробуйте отправить ссылку ещё раз немного позже."
+            )
+            return
+
+        statuses = [result[4] for result, _ in parsed_results]
+        representative = parsed_results[0][0] if parsed_results else (None, '', None, 'none', 'unknown')
+        item_id, title, end_time_utc, parse_source, auction_status = representative
+
+        if 'time_conflict' in statuses:
+            send_telegram_message(
+                "⚠️ <b>eBay показал противоречивое время окончания.</b>\n\n"
+                "Я специально не сохраняю такой лот автоматически, чтобы не дать неверное напоминание. "
+                "Попробуйте отправить ссылку ещё раз через минуту."
+            )
+            return
+        if 'ended' in statuses:
+            ended_result = next(r for r, _ in parsed_results if r[4] == 'ended')
+            line = (
+                f"\n🕒 Окончание по Киеву: <b>{format_kyiv_datetime(ended_result[2])}</b>"
+                if ended_result[2] else ''
+            )
+            send_telegram_message("⌛ <b>Этот аукцион уже завершён.</b>" + line)
+            return
+        if 'not_auction' in statuses:
+            send_telegram_message(
+                "ℹ️ <b>Это не активный аукцион со ставками.</b>\n\n"
+                "Обычные товары Buy It Now / Best Offer без режима торгов в список напоминаний не сохраняются."
+            )
+            return
+
+        logging.warning(
+            f"Auction не подтверждён после {len(pages)} item-page вариантов и search fallback; "
+            f"item={fallback_item_id}, statuses={statuses}"
+        )
         send_telegram_message(
             "❌ <b>Не удалось точно подтвердить активный аукцион и время его окончания.</b>\n\n"
-            "Я не сохраняю приблизительное время, чтобы вы не пропустили ставку из-за неверного расчёта."
+            "Я проверил несколько независимых proxy и дополнительную eBay-выдачу по номеру лота, "
+            "но exact timestamp не был подтверждён. Приблизительное время не сохраняю."
         )
         return
 
+    item_id, title, end_time_utc, parse_source, auction_status = chosen
     end_time_utc = _ensure_aware_utc(end_time_utc)
     remaining = (end_time_utc - datetime.now(timezone.utc)).total_seconds()
     if remaining <= 0:
@@ -1606,8 +2188,6 @@ def process_auction_link(url):
     canonical_url = f"https://www.ebay.co.uk/itm/{item_id}"
     safe_title = html_lib.escape(title)
 
-    # Если до конца уже 5 минут или меньше, плановых reminders впереди нет.
-    # Не создаём лишнюю запись/нагрузку: сразу показываем точное время и ссылку.
     if remaining <= 5 * 60:
         send_telegram_message(
             "⚠️ <b>До окончания аукциона осталось меньше 5 минут</b> 🇬🇧\n\n"
@@ -1635,7 +2215,9 @@ def process_auction_link(url):
         f"🕒 Окончание по Киеву: <b>{format_kyiv_datetime(end_time_utc)}</b>\n"
         f"⏳ Осталось: <b>{format_remaining(remaining)}</b>\n"
         f"{reminder_line}\n\n"
-        "✅ Время подтверждено по странице eBay и сохранено в PostgreSQL."
+        "✅ Время подтверждено и сохранено в PostgreSQL.\n"
+        "⏰ <b>Напоминания работают независимо от eBay proxy:</b> в момент 60/30/10/5 минут "
+        "боту не нужно повторно открывать страницу eBay."
     )
     send_telegram_message(
         message,
@@ -1643,7 +2225,8 @@ def process_auction_link(url):
         disable_preview=True,
     )
     logging.info(
-        f"⏰ Auction reminder сохранён: item={item_id}, end_utc={end_time_utc.isoformat()}, source={parse_source}"
+        f"⏰ Auction reminder сохранён: item={item_id}, end_utc={end_time_utc.isoformat()}, "
+        f"source={parse_source}; scheduler независим от eBay proxy"
     )
 
 def auction_link_worker():
@@ -1842,7 +2425,7 @@ def handle_telegram_callback(callback):
         send_auction_list()
         return
 
-    m = re.fullmatch(r'aucdel:(\d{9,15})', data)
+    m = re.fullmatch(r'aucdel:(\d{9,19})', data)
     if m:
         item_id = m.group(1)
         if delete_auction_reminder(item_id):
@@ -2057,7 +2640,7 @@ def telegram_listener():
                                 send_auction_list()
                             elif text.startswith('/delauction'):
                                 parts = text.split(maxsplit=1)
-                                if len(parts) != 2 or not re.fullmatch(r'\d{9,15}', parts[1].strip()):
+                                if len(parts) != 2 or not re.fullmatch(r'\d{9,19}', parts[1].strip()):
                                     send_telegram_message("Использование: <code>/delauction НОМЕР_ЛОТА</code>")
                                 else:
                                     item_id = parts[1].strip()
@@ -2309,6 +2892,19 @@ def _cleanup_late_probe_future(future, proxy):
         close_session(session)
 
 
+def _discovery_replacement_pause(results):
+    """Короткий jitter между replacement probe в зависимости от причины отказа."""
+    results = [r for r in (results or []) if r]
+    if not results:
+        return 0.0
+    if any(r in ('blocked', 'rate_limited') for r in results):
+        return random.uniform(PROBE_BLOCK_PAUSE_MIN, PROBE_BLOCK_PAUSE_MAX)
+    transport = {'proxy_rejected', 'proxy_ssl', 'proxy_error', 'proxy_timeout'}
+    if all(r in transport for r in results):
+        return random.uniform(PROBE_FAST_PAUSE_MIN, PROBE_FAST_PAUSE_MAX)
+    return random.uniform(PROBE_OTHER_PAUSE_MIN, PROBE_OTHER_PAUSE_MAX)
+
+
 def fetch_ebay_html_with_fixed_pair():
     global fixed_proxy, fixed_profile, fixed_session
 
@@ -2335,8 +2931,7 @@ def fetch_ebay_html_with_fixed_pair():
             return html
 
         # Частая реальная ситуация: умерло только старое TCP/TLS соединение Session,
-        # а сам proxy всё ещё жив. Для transport-ошибки один раз создаём НОВУЮ session
-        # на том же успешном IP, прежде чем ротировать proxy.
+        # а сам proxy всё ещё жив. Для transport-ошибки один раз создаём НОВУЮ session.
         if result in ('proxy_timeout', 'proxy_error') and proxy_manager.is_recent_good(old_proxy):
             logging.info(
                 f"♻️ Недавно успешный proxy {old_proxy}: "
@@ -2382,16 +2977,18 @@ def fetch_ebay_html_with_fixed_pair():
 
         logging.info("Ищем новую рабочую пару...")
 
-    # 2) Rolling discovery: сначала 3, затем максимум 4 уникальных IP параллельно.
-    # Главное отличие от batch-модели: как только один плохой proxy завершился, его слот
-    # немедленно получает следующий кандидат. Мы больше не ждём самый медленный proxy
-    # в группе, пока остальные worker-ы простаивают.
+    # 2) Rolling discovery V6.6: 4 worker сразу -> 5 после 10 сек.
+    # Emergency ProxyScrape timeout=3000 автоматически добавляется, если быстрый пул
+    # явно плохой/истощён. Hard cooldown никогда не снимаются.
     started = time.monotonic()
     tried_hosts = set()
     tried_proxies = set()
     reprobed_proxies = set()
+    transient_reprobed_proxies = set()
     attempts = 0
     refreshed_after_exhaustion = False
+    emergency_loaded = False
+    final_reprobe_used = False
     profile = get_preferred_profile()
     if profile is None:
         logging.error("Нет поддерживаемого browser-профиля curl_cffi")
@@ -2411,85 +3008,161 @@ def fetch_ebay_html_with_fixed_pair():
             else PROBE_CONCURRENCY
         )
 
-    def submit_more():
-        """Поддерживает нужное число in-flight probe без превышения concurrency."""
-        nonlocal attempts, refreshed_after_exhaustion
-
-        if attempts >= MAX_SEARCH_ATTEMPTS:
+    def maybe_load_emergency(force=False):
+        nonlocal emergency_loaded
+        if emergency_loaded:
             return False
+        elapsed_now = time.monotonic() - started
+        long_bad_search = (
+            elapsed_now >= PROXY_EMERGENCY_TRIGGER_AFTER
+            and attempts >= PROXY_EMERGENCY_TRIGGER_ATTEMPTS
+        )
+        depleted = proxy_manager.emergency_needed()
+        if not (force or long_bad_search or depleted):
+            return False
+
+        available, total, bad_count, host_bad_count = proxy_manager.pool_stats()
+        reason = (
+            'исчерпан доступный пул'
+            if depleted
+            else f'поиск уже {elapsed_now:.0f} сек./{attempts} probe без успеха'
+        )
+        logging.warning(
+            f"🆘 Включаем emergency ProxyScrape timeout={PROXY_EMERGENCY_TIMEOUT_MS} ms: {reason}; "
+            f"до расширения доступно {available}/{total}, cooldown={bad_count}, host_cooldown={host_bad_count}"
+        )
+        proxy_manager.refresh_proxies(force=True, emergency=True)
+        emergency_loaded = True
+        return True
+
+    def submit_more():
+        """Поддерживает rolling in-flight probe и один безопасный последний re-probe."""
+        nonlocal attempts, refreshed_after_exhaustion, final_reprobe_used
+
         elapsed_now = time.monotonic() - started
         if elapsed_now >= SEARCH_TIME_BUDGET:
             return False
 
         desired = desired_concurrency()
-        need = max(0, min(desired - len(future_to_proxy), MAX_SEARCH_ATTEMPTS - attempts))
-        if need <= 0:
+        free_slots = max(0, desired - len(future_to_proxy))
+        if free_slots <= 0:
             return True
 
-        # В rolling-режиме после завершения SOCKS5 часто освобождается один слот.
-        # Поддерживаем хотя бы один SOCKS5 in-flight при concurrency>=3, если он доступен.
+        # После плохого участка расширяем 1500-ms pool более широким 3000-ms списком.
+        maybe_load_emergency(force=False)
+
+        normal_remaining = max(0, MAX_SEARCH_ATTEMPTS - attempts)
+        need = min(free_slots, normal_remaining)
+
         inflight_socks = sum(
             1 for p in future_to_proxy.values()
             if _proxy_scheme(p) == 'socks5'
         )
         preferred_scheme = 'socks5' if desired >= 3 and inflight_socks == 0 else None
-
-        batch = []
-
-        # Один контролируемый re-probe недавно успешного proxy после окончания его
-        # короткого cooldown прямо внутри текущего длинного discovery. Это не увеличивает
-        # concurrency: re-probe занимает только уже свободный worker-слот.
         inflight_hosts = {_proxy_host(p) for p in future_to_proxy.values()}
-        reprobe = proxy_manager.get_due_reprobe_candidate(
-            tried_proxies=tried_proxies,
-            reprobed_proxies=reprobed_proxies,
-            inflight_hosts=inflight_hosts,
-        )
-        if reprobe is not None and need > 0:
-            reprobed_proxies.add(reprobe)
-            batch.append(reprobe)
-            logging.info(
-                f"♻️ Re-probe недавно успешного proxy после cooldown: {reprobe}"
-            )
+        batch = []
+        batch_kinds = {}
 
-        remaining_need = need - len(batch)
-        if remaining_need > 0:
-            batch.extend(
-                proxy_manager.get_candidate_batch(
+        if need > 0:
+            # Один re-probe recently-good внутри текущего discovery после окончания cooldown.
+            reprobe = proxy_manager.get_due_reprobe_candidate(
+                tried_proxies=tried_proxies,
+                reprobed_proxies=reprobed_proxies,
+                inflight_hosts=inflight_hosts,
+            )
+            if reprobe is not None:
+                reprobed_proxies.add(reprobe)
+                batch.append(reprobe)
+                batch_kinds[reprobe] = 'Re-probe'
+                logging.info(f"♻️ Re-probe недавно успешного proxy после cooldown: {reprobe}")
+
+            # В emergency-mode допускаем максимум 2 вторых шанса только transport-timeout/error.
+            while (
+                emergency_loaded
+                and len(batch) < need
+                and len(transient_reprobed_proxies) < PROXY_EMERGENCY_TRANSIENT_REPROBES
+            ):
+                transient = proxy_manager.get_due_transient_reprobe_candidate(
+                    tried_proxies=tried_proxies,
+                    reprobed_proxies=transient_reprobed_proxies | reprobed_proxies,
+                    inflight_hosts=inflight_hosts | {_proxy_host(p) for p in batch},
+                )
+                if transient is None:
+                    break
+                transient_reprobed_proxies.add(transient)
+                batch.append(transient)
+                batch_kinds[transient] = 'Transient re-probe'
+                logging.info(f"♻️ Emergency transient re-probe после cooldown: {transient}")
+
+            remaining_need = need - len(batch)
+            if remaining_need > 0:
+                normal_batch = proxy_manager.get_candidate_batch(
                     remaining_need,
+                    tried_hosts=tried_hosts | {_proxy_host(p) for p in batch},
+                    preferred_scheme=preferred_scheme,
+                )
+                for p in normal_batch:
+                    batch.append(p)
+                    batch_kinds.setdefault(p, 'Probe')
+
+        # Если уникальные кандидаты кончились раньше лимита, emergency pool важнее
+        # бессмысленного повторного стандартного refresh того же 1500-ms списка.
+        if not batch and not future_to_proxy and attempts < MAX_SEARCH_ATTEMPTS:
+            if not emergency_loaded:
+                maybe_load_emergency(force=True)
+                batch = proxy_manager.get_candidate_batch(
+                    min(free_slots, MAX_SEARCH_ATTEMPTS - attempts),
                     tried_hosts=tried_hosts,
                     preferred_scheme=preferred_scheme,
                 )
-            )
+                for p in batch:
+                    batch_kinds[p] = 'Emergency probe'
+            elif not refreshed_after_exhaustion:
+                logging.info("♻️ Emergency-кандидаты исчерпаны; один раз обновляем расширенный список")
+                proxy_manager.refresh_proxies(force=True, emergency=True)
+                refreshed_after_exhaustion = True
+                batch = proxy_manager.get_candidate_batch(
+                    min(free_slots, MAX_SEARCH_ATTEMPTS - attempts),
+                    tried_hosts=tried_hosts,
+                    preferred_scheme=preferred_scheme,
+                )
+                for p in batch:
+                    batch_kinds[p] = 'Emergency probe'
 
-        if not batch and not future_to_proxy and not refreshed_after_exhaustion:
-            # Если реально закончились ещё не пробованные доступные IP, один раз берём
-            # свежий снимок ProxyScrape. Cooldown плохих endpoints при этом сохраняется.
-            logging.info("♻️ Доступные уникальные IP исчерпаны; обновляем ProxyScrape и продолжаем")
-            proxy_manager.refresh_proxies(force=True)
-            refreshed_after_exhaustion = True
-            # Старые hosts не очищаем: свежий ProxyScrape может добавить новые IP,
-            # и именно их нужно попробовать. Уже проверенные адреса не должны идти
-            # по третьему кругу; для recently-good существует отдельный one-shot re-probe.
-            batch = proxy_manager.get_candidate_batch(
-                need,
-                tried_hosts=tried_hosts,
-                preferred_scheme=preferred_scheme,
+        # После обычных 120 probe гарантируем максимум один последний шанс known-good,
+        # если его cooldown уже закончился. Он не вытесняет обычного кандидата и даёт
+        # максимум 121-й сетевой запрос в рамках этого discovery.
+        if (
+            not batch
+            and not future_to_proxy
+            and attempts >= MAX_SEARCH_ATTEMPTS
+            and FINAL_KNOWN_GOOD_REPROBES > 0
+            and not final_reprobe_used
+        ):
+            final_proxy = proxy_manager.get_final_known_good_reprobe(
+                tried_proxies=tried_proxies,
+                inflight_hosts=inflight_hosts,
             )
+            final_reprobe_used = True
+            if final_proxy is not None:
+                batch = [final_proxy]
+                batch_kinds[final_proxy] = 'Final known-good re-probe'
+                logging.info(f"♻️ Финальный known-good re-probe поверх лимита 120: {final_proxy}")
 
         if not batch:
             return False
 
         for proxy in batch:
-            if attempts >= MAX_SEARCH_ATTEMPTS:
+            is_final_extra = batch_kinds.get(proxy) == 'Final known-good re-probe'
+            if not is_final_extra and attempts >= MAX_SEARCH_ATTEMPTS:
                 break
             tried_hosts.add(_proxy_host(proxy))
             tried_proxies.add(proxy)
             attempts += 1
-            probe_kind = "Re-probe" if proxy in reprobed_proxies else "Probe"
+            kind = batch_kinds.get(proxy, 'Probe')
+            limit_label = f"{MAX_SEARCH_ATTEMPTS}+1" if is_final_extra else str(MAX_SEARCH_ATTEMPTS)
             logging.info(
-                f"🔍 {probe_kind} {attempts}/{MAX_SEARCH_ATTEMPTS}: proxy {proxy}, "
-                f"профиль {profile['name']}"
+                f"🔍 {kind} {attempts}/{limit_label}: proxy {proxy}, профиль {profile['name']}"
             )
             future = executor.submit(
                 _probe_proxy,
@@ -2503,7 +3176,7 @@ def fetch_ebay_html_with_fixed_pair():
     submit_more()
 
     try:
-        while future_to_proxy or attempts < MAX_SEARCH_ATTEMPTS:
+        while True:
             elapsed = time.monotonic() - started
             if elapsed >= SEARCH_TIME_BUDGET:
                 logging.warning(
@@ -2512,16 +3185,14 @@ def fetch_ebay_html_with_fixed_pair():
                 )
                 break
 
-            # Через 15 сек. разрешается 4-й worker. Если сейчас свободен слот — заполняем.
+            maybe_load_emergency(force=False)
             submit_more()
 
             if not future_to_proxy:
-                # Нет ни одного доступного кандидата прямо сейчас. Не крутим CPU и не
-                # штурмуем ProxyScrape; через короткий jitter попробуем снова.
-                time.sleep(random.uniform(0.8, 1.3))
-                if not submit_more():
-                    break
-                continue
+                # Нет in-flight. Даём шанс final known-good re-probe; если и его нет — выход.
+                if submit_more():
+                    continue
+                break
 
             remaining_budget = max(0.05, SEARCH_TIME_BUDGET - (time.monotonic() - started))
             done, _ = wait(
@@ -2558,8 +3229,6 @@ def fetch_ebay_html_with_fixed_pair():
                     proxy_manager.mark_failure(proxy, result, reason=result)
 
             if winner is not None:
-                # Остальные 1-3 probe уже запущены. Не ждём их: они завершатся в фоне,
-                # закроют Session и могут запомниться как резервный успешный proxy.
                 for future, proxy in list(future_to_proxy.items()):
                     if future.done():
                         _cleanup_late_probe_future(future, proxy)
@@ -2581,16 +3250,11 @@ def fetch_ebay_html_with_fixed_pair():
                 )
                 return winner_html
 
-            # Даже если 2-3 proxy упали почти одновременно, не запускаем замену абсолютно
-            # мгновенно. Небольшой jitter сохраняет безопасный ритм, но не блокирует все
-            # worker-ы до завершения самого медленного соседа, как делал старый batch.
             if completed_results:
-                time.sleep(random.uniform(PROBE_BATCH_PAUSE_MIN, PROBE_BATCH_PAUSE_MAX))
+                time.sleep(_discovery_replacement_pause(completed_results))
             submit_more()
 
     finally:
-        # При исчерпании budget не ждём до 8 сек. оставшиеся плохие соединения.
-        # Уже работающие futures получают cleanup callback; новые больше не запускаются.
         for future, proxy in list(future_to_proxy.items()):
             if future.done():
                 _cleanup_late_probe_future(future, proxy)
@@ -2604,11 +3268,12 @@ def fetch_ebay_html_with_fixed_pair():
         f"❌ В этом цикле рабочий proxy не найден: "
         f"проверено {attempts}, время {time.monotonic() - started:.1f} сек."
     )
-    # Перед коротким следующим циклом берём максимально свежий снимок ProxyScrape.
-    # Реальные cooldown сохраняются, поэтому только что плохие proxy не пойдут по кругу.
+    # Перед следующим коротким циклом освежаем 1500-ms список. Если он уже заметно
+    # истощён cooldown-ами, сразу дополнительно мерджим emergency 3000-ms candidates.
     proxy_manager.refresh_proxies(force=True)
+    if proxy_manager.emergency_needed():
+        proxy_manager.refresh_proxies(force=True, emergency=True)
     return None
-
 
 def fetch_ebay_html_with_retry():
     return fetch_ebay_html_with_fixed_pair()
@@ -2624,7 +3289,7 @@ def extract_item_id(url):
     """
     if not url or '/itm/' not in url:
         return None
-    m = re.search(r'/itm/(?:[^/?#]+/)?(\d{8,15})(?:[/?#]|$)', str(url), re.I)
+    m = re.search(r'/itm/(?:[^/?#]+/)?(\d{8,19})(?:[/?#]|$)', str(url), re.I)
     return m.group(1) if m else None
 
 def clean_title(title):
@@ -3210,7 +3875,7 @@ def check_and_send_new_items():
         if item_id in claimed:
             new.append({'id': item_id, **data})
             logging.info(
-                f"НОВЫЙ: {data['title'][:50]}... цена: {data['price']}, "
+                f"НОВЫЙ [{item_id}]: {data['title'][:50]}... цена: {data['price']}, "
                 f"доставка: {data.get('shipping')}, best_offer: {data.get('best_offer')}, "
                 f"auction: {data.get('auction')}, has_buy_it_now: {data.get('has_buy_it_now')}"
             )
@@ -3277,7 +3942,7 @@ def bot_worker():
     seen_line = f"\n📚 В базе: {seen_total} товаров." if seen_total is not None else ""
     send_telegram_message(
         startup_line +
-        "\n🇬🇧 eBay UK monitor v6.5 работает." +
+        "\n🇬🇧 eBay UK monitor v6.6 работает." +
         seen_line +
         "\nКоманды: /stop /start /list (/auctions) /delauction НОМЕР_ЛОТА"
         "\nМожно отправить ссылку на eBay-аукцион — сохраню точное время и напомню заранее.",
@@ -3361,7 +4026,7 @@ def leader_supervisor():
 @app.route('/')
 def index():
     role = "leader" if leader_active_event.is_set() else "standby"
-    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.5, {role})"
+    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.6, {role})"
 
 
 @app.route('/health')
