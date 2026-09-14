@@ -63,7 +63,7 @@ LEADER_HEALTH_INTERVAL = max(5, int(os.getenv("LEADER_HEALTH_INTERVAL", "10")))
 
 # Discovery запускается только когда уже нет рабочей fixed-session. По реальным логам
 # бесплатного ProxyScrape 3->4 worker слишком долго прожигали большой плохой пул.
-# V6.6 начинает с 4 уникальных IP и после 10 сек. повышается максимум до 5.
+# V6.7 начинает с 4 уникальных IP и после 10 сек. повышается максимум до 5.
 # Это касается ТОЛЬКО аварийного discovery; при живом fixed proxy по-прежнему один запрос.
 PROBE_CONCURRENCY = max(4, min(int(os.getenv("PROBE_CONCURRENCY", "4")), 5))
 PROBE_ESCALATED_CONCURRENCY = max(
@@ -547,13 +547,25 @@ class ProxyManager:
             )
 
     def emergency_needed(self):
+        """Emergency допустим только ПОСЛЕ появления обычного 1500-ms pool.
+
+        В V6.6 свежий процесс имел 0/0 proxy до первого standard refresh, и 0/0
+        ошибочно считался "истощённым пулом". Из-за этого бот сразу стартовал с
+        timeout=3000. Нулевой ещё-не-загруженный pool теперь НЕ является emergency.
+        Если standard ProxyScrape действительно не загрузится, discovery сначала
+        сделает обычную попытку 1500 ms, и лишь после этого может расшириться.
+        """
         available, total, _, _ = self.pool_stats()
         if total <= 0:
-            return True
+            return False
         return (
             available <= PROXY_EMERGENCY_MIN_AVAILABLE
             or (available / max(1, total)) <= PROXY_EMERGENCY_MIN_RATIO
         )
+
+    def standard_pool_loaded(self):
+        with self.lock:
+            return bool(self.all_proxies) and self.last_refresh > 0
 
     def _is_recent_good_locked(self, proxy, now=None):
         if now is None:
@@ -1634,6 +1646,7 @@ def fetch_auction_pages(
     connect_timeout=None,
     read_timeout=None,
     max_pages=1,
+    canonicalize_item=True,
 ):
     """Редкая операция: несколько proxy параллельно, без зависимости от main fixed request.
 
@@ -1654,15 +1667,17 @@ def fetch_auction_pages(
     max_reserve_proxies = max(0, min(int(max_reserve_proxies), 8))
     max_pages = max(1, min(int(max_pages), AUCTION_VERIFY_MAX_PAGES))
 
-    canonical_url = _canonical_auction_url(url)
+    canonical_url = _canonical_auction_url(url) if canonicalize_item else url
+    # Если ItemID распознан, tracking-параметры исходной ссылки не дают более точных
+    # auction-данных, зато в V6.6 один и тот же proxy мог дважды подряд ждать timeout:
+    # сначала canonical URL, затем исходный длинный URL. Для item-page пробуем только
+    # canonical URL. Для иных eBay URL (например search fallback) сохраняем исходный URL.
     urls_to_try = [canonical_url]
-    if url != canonical_url:
-        urls_to_try.append(url)
 
     candidates = []
     current_fixed = fixed_proxy
 
-    # Важное изменение V6.6: auction item-page не конкурирует с основным мониторингом
+    # Важное изменение V6.7: auction item-page не конкурирует с основным мониторингом
     # за тот же fixed proxy. Сначала берём отдельные reserve IP; main fixed добавляем
     # только последним fallback. По логам fixed отлично грузил search, но тяжёлая item-page
     # на том же IP одновременно получала timeout/reset.
@@ -1744,7 +1759,7 @@ def fetch_auction_pages(
     return pages
 
 
-def fetch_auction_page(url, max_reserve_proxies=None, connect_timeout=None, read_timeout=None):
+def fetch_auction_page(url, max_reserve_proxies=None, connect_timeout=None, read_timeout=None, canonicalize_item=True):
     """Совместимый wrapper: возвращает первую полученную auction page."""
     pages = fetch_auction_pages(
         url,
@@ -1752,6 +1767,7 @@ def fetch_auction_page(url, max_reserve_proxies=None, connect_timeout=None, read
         connect_timeout=connect_timeout,
         read_timeout=read_timeout,
         max_pages=1,
+        canonicalize_item=canonicalize_item,
     )
     if not pages:
         return None, None, None
@@ -1788,6 +1804,369 @@ def _parse_iso_datetime(value):
         return None
 
 
+
+
+def _ebay_decoded_variants(raw_html):
+    """Несколько безопасных представлений eBay HTML/embedded JSON.
+
+    Современный View Item может хранить hydration JSON не только как обычный JSON,
+    но и HTML-entity / JS-unicode escaped. V6.6 искал ключи только после замены \\" и
+    из-за этого мог не увидеть реальный itemEndDate/endTime в полноценной 700+ KB странице.
+    """
+    if not raw_html:
+        return []
+    variants = []
+    current = str(raw_html)
+    for _ in range(4):
+        if current not in variants:
+            variants.append(current)
+        decoded = html_lib.unescape(current)
+        decoded = re.sub(r'\\u0022', '"', decoded, flags=re.I)
+        decoded = re.sub(r'\\u0027', "'", decoded, flags=re.I)
+        decoded = re.sub(r'\\u003a', ':', decoded, flags=re.I)
+        decoded = re.sub(r'\\u002f', '/', decoded, flags=re.I)
+        decoded = re.sub(r'\\u003d', '=', decoded, flags=re.I)
+        decoded = re.sub(r'\\u0026', '&', decoded, flags=re.I)
+        decoded = decoded.replace('\\/', '/').replace('\\"', '"')
+        if decoded == current:
+            break
+        current = decoded
+    return variants
+
+
+def _parse_human_tz_datetime(value):
+    """Парсит только абсолютное человекочитаемое время с явной TZ (BST/GMT/UTC)."""
+    if value is None:
+        return None
+    text = html_lib.unescape(str(value))
+    text = re.sub(r'\s+', ' ', text).strip(' \t\r\n,;|')
+    text = re.sub(r'\bat\b', ' ', text, flags=re.I)
+    text = re.sub(r'\s+', ' ', text)
+    m = re.search(r'\b(BST|GMT|UTC)\b\s*$', text, re.I)
+    if not m:
+        return None
+    tz_name = m.group(1).upper()
+    core = text[:m.start()].strip(' ,')
+    offset = timezone(timedelta(hours=1 if tz_name == 'BST' else 0))
+    formats = (
+        '%d %b %Y %H:%M:%S', '%d %B %Y %H:%M:%S',
+        '%d %b, %Y %H:%M:%S', '%d %B, %Y %H:%M:%S',
+        '%b %d %Y %H:%M:%S', '%B %d %Y %H:%M:%S',
+        '%b %d, %Y %H:%M:%S', '%B %d, %Y %H:%M:%S',
+        '%d %b %Y %I:%M:%S %p', '%d %B %Y %I:%M:%S %p',
+        '%b %d, %Y %I:%M:%S %p', '%B %d, %Y %I:%M:%S %p',
+    )
+    for fmt in formats:
+        try:
+            return datetime.strptime(core, fmt).replace(tzinfo=offset).astimezone(timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
+def _find_absolute_datetime_values(fragment):
+    """Ищет timestamp в небольшом фрагменте возле конкретного semantic key."""
+    values = []
+    if not fragment:
+        return values
+    # ISO 8601 with timezone / Z.
+    for m in re.finditer(
+        r'20\d{2}-\d{2}-\d{2}[Tt ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})',
+        fragment,
+    ):
+        dt = _parse_iso_datetime(m.group(0))
+        if dt:
+            values.append(dt)
+    # Epoch sec/ms. Ограничиваемся 10-13 digits, item id обычно 12 digits, поэтому
+    # используем это только внутри фрагмента ПОСЛЕ semantic time-key и кластеризуем.
+    for m in re.finditer(r'(?<!\d)(\d{10,13})(?!\d)', fragment):
+        dt = _parse_iso_datetime(m.group(1))
+        if dt and 2020 <= dt.year <= 2040:
+            values.append(dt)
+    # Human UK time with exact seconds.
+    human_pat = re.compile(
+        r'(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)?[,]?\s*'
+        r'\d{1,2}\s+[A-Za-z]{3,9}[,]?\s+20\d{2}[,]?\s+'
+        r'\d{1,2}:\d{2}:\d{2}(?:\s*(?:AM|PM))?\s*(?:BST|GMT|UTC)',
+        re.I,
+    )
+    for m in human_pat.finditer(fragment):
+        dt = _parse_human_tz_datetime(m.group(0))
+        if dt:
+            values.append(dt)
+    return values
+
+
+def _extract_keyed_datetimes(raw_html, keys, item_id=None, whole_page=False):
+    """Достаёт exact datetime возле набора semantic keys из escaped/plain HTML."""
+    if not raw_html:
+        return []
+    key_alt = '|'.join(re.escape(k) for k in keys)
+    values = []
+    for variant in _ebay_decoded_variants(raw_html):
+        sources = []
+        if item_id:
+            for mm in re.finditer(re.escape(str(item_id)), variant):
+                sources.append(variant[max(0, mm.start()-7000): min(len(variant), mm.end()+26000)])
+                if len(sources) >= 12:
+                    break
+        if whole_page or not sources:
+            sources.append(variant)
+        for source in sources:
+            key_re = re.compile(rf'(?i)(?:["\']|\b)({key_alt})(?:["\']|\b)\s*[:=]')
+            for km in key_re.finditer(source):
+                # Time value may be scalar or nested {value: ...}; 700 chars is enough
+                # while keeping unrelated recommendation timestamps out.
+                values.extend(_find_absolute_datetime_values(source[km.end():km.end()+700]))
+                if len(values) >= 40:
+                    return values
+    return values
+
+
+def _extract_visible_exact_start(visible):
+    if not visible:
+        return None
+    label_re = re.compile(r'\b(?:Started|Start(?:ed)?\s*time|Listing\s+started)\b\s*:?\s*', re.I)
+    for m in label_re.finditer(visible):
+        frag = visible[m.end():m.end()+150]
+        # Drop leading weekday punctuation only; parser requires explicit TZ + seconds.
+        human = re.search(
+            r'(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)?[,]?\s*\d{1,2}\s+[A-Za-z]{3,9}[,]?\s+20\d{2}[,]?\s+'
+            r'\d{1,2}:\d{2}:\d{2}(?:\s*(?:AM|PM))?\s*(?:BST|GMT|UTC)',
+            frag, re.I,
+        )
+        if human:
+            dt = _parse_human_tz_datetime(human.group(0))
+            if dt:
+                return dt
+    return None
+
+
+def _extract_exact_start_time(raw_html, item_id=None):
+    if not raw_html:
+        return None, 'none'
+    soup = BeautifulSoup(raw_html, 'html.parser')
+    visible = re.sub(r'\s+', ' ', soup.get_text(' ', strip=True))
+    visible_start = _extract_visible_exact_start(visible)
+    if visible_start:
+        return visible_start, 'visible_exact_start'
+
+    strong_keys = (
+        'itemStartDate', 'listingStartTime', 'auctionStartTime',
+        'listingStartDate', 'startDateTime', 'startTime', 'startDate',
+    )
+    vals = _extract_keyed_datetimes(raw_html, strong_keys, item_id=item_id, whole_page=False)
+    if vals:
+        clusters = _cluster_datetimes(vals)
+        if len(clusters) == 1:
+            return clusters[0][0], 'structured_start_near_item'
+
+    # itemCreationDate может отличаться от фактического StartTime у scheduled listing.
+    # Поэтому возвращаем его отдельным source: derive-функция не имеет права строить
+    # end только из creation+duration без дополнительного corroboration.
+    vals = _extract_keyed_datetimes(
+        raw_html, ('itemCreationDate',), item_id=item_id, whole_page=False
+    )
+    if vals:
+        clusters = _cluster_datetimes(vals)
+        if len(clusters) == 1:
+            return clusters[0][0], 'structured_item_creation_near_item'
+
+    # Whole page only strong keys; generic analytics timestamps не принимаем.
+    vals = _extract_keyed_datetimes(raw_html, strong_keys, item_id=None, whole_page=True)
+    if vals:
+        clusters = _cluster_datetimes(vals)
+        if len(clusters) == 1:
+            return clusters[0][0], 'structured_start_unique_page'
+    return None, 'none'
+
+
+def _extract_listing_duration_days(raw_html, item_id=None):
+    """Возвращает только стандартную auction duration, если она однозначна."""
+    if not raw_html:
+        return None, 'none'
+    allowed = {1, 3, 5, 7, 10, 30}
+    found = []
+    variants = _ebay_decoded_variants(raw_html)
+    keys = ('listingDuration', 'auctionDuration', 'listingPeriod', 'durationDays')
+    key_alt = '|'.join(re.escape(k) for k in keys)
+
+    for variant in variants:
+        sources = []
+        if item_id:
+            for mm in re.finditer(re.escape(str(item_id)), variant):
+                sources.append(variant[max(0, mm.start()-7000): min(len(variant), mm.end()+26000)])
+                if len(sources) >= 10:
+                    break
+        if not sources:
+            sources = [variant]
+        for src in sources:
+            for km in re.finditer(rf'(?i)(?:["\']|\b)(?:{key_alt})(?:["\']|\b)\s*[:=]', src):
+                frag = src[km.end():km.end()+180]
+                patterns = (
+                    r'(?i)Days[_\s-]?(\d{1,2})',
+                    r'(?i)P(\d{1,2})D\b',
+                    r'(?i)(\d{1,2})\s*days?\b',
+                    r'^[\s"\']*(\d{1,2})(?:[\s,"\'}]|$)',
+                )
+                for pat in patterns:
+                    m = re.search(pat, frag)
+                    if m:
+                        d = int(m.group(1))
+                        if d in allowed:
+                            found.append(d)
+                            break
+
+    soup = BeautifulSoup(raw_html, 'html.parser')
+    visible = re.sub(r'\s+', ' ', soup.get_text(' ', strip=True))
+    for m in re.finditer(r'\bDuration\b\s*:?\s*(\d{1,2})\s*days?\b', visible, re.I):
+        d = int(m.group(1))
+        if d in allowed:
+            found.append(d)
+    unique = sorted(set(found))
+    if len(unique) == 1:
+        return unique[0], 'listing_duration'
+    return None, 'none'
+
+
+def _extract_relative_time_left(visible):
+    """Парсит только отображаемый countdown; сам по себе он НЕ считается exact end time."""
+    if not visible:
+        return None
+    candidates = []
+    anchor_re = re.compile(r'\b(?:Time\s+left|Ends?\s+in)\b\s*:?\s*', re.I)
+    for anchor in anchor_re.finditer(visible):
+        frag = visible[anchor.end():anchor.end()+100]
+        vals = {}
+        unit_patterns = (
+            ('d', r'(\d+)\s*(?:d\b|days?\b)'),
+            ('h', r'(\d+)\s*(?:h\b|hrs?\b|hours?\b)'),
+            ('m', r'(\d+)\s*(?:m\b|mins?\b|minutes?\b)'),
+            ('s', r'(\d+)\s*(?:s\b|secs?\b|seconds?\b)'),
+        )
+        for unit, pat in unit_patterns:
+            mm = re.search(pat, frag, re.I)
+            if mm:
+                vals[unit] = int(mm.group(1))
+        if not vals:
+            continue
+        seconds = vals.get('d', 0)*86400 + vals.get('h', 0)*3600 + vals.get('m', 0)*60 + vals.get('s', 0)
+        if seconds < 0:
+            continue
+        if 's' in vals:
+            tolerance = 45
+        elif 'm' in vals:
+            tolerance = 150
+        elif 'h' in vals:
+            tolerance = 3900
+        else:
+            tolerance = 90000
+        candidates.append((len(vals), seconds, tolerance, dict(vals)))
+    if not candidates:
+        return None
+    candidates.sort(reverse=True, key=lambda x: x[0])
+    _, seconds, tolerance, vals = candidates[0]
+    return seconds, tolerance, vals
+
+
+def _extract_visible_end_minute(visible):
+    """Абсолютный UK end-date до минуты. Seconds специально НЕ придумываем здесь."""
+    if not visible:
+        return None
+    label_re = re.compile(r'\b(?:Ends?|Ending|End\s*time)(?:\s+on)?\s*:?[,\s]*', re.I)
+    pat = re.compile(
+        r'(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)?[,]?\s*'
+        r'(\d{1,2})\s+([A-Za-z]{3,9})[,]?\s+(20\d{2})[,]?\s+'
+        r'(\d{1,2}):(\d{2})(?!:)(?:\s*(AM|PM))?\s*(BST|GMT|UTC)\b',
+        re.I,
+    )
+    for lm in label_re.finditer(visible):
+        frag = visible[lm.end():lm.end()+150]
+        m = pat.search(frag)
+        if not m:
+            continue
+        day, month_text, year, hh, mm, ampm, tz_name = m.groups()
+        core = f"{day} {month_text} {year} {hh}:{mm}" + (f" {ampm}" if ampm else '')
+        formats = ('%d %b %Y %H:%M', '%d %B %Y %H:%M') if not ampm else (
+            '%d %b %Y %I:%M %p', '%d %B %Y %I:%M %p'
+        )
+        parsed = None
+        for fmt in formats:
+            try:
+                parsed = datetime.strptime(core, fmt)
+                break
+            except ValueError:
+                pass
+        if parsed is None:
+            continue
+        offset = timezone(timedelta(hours=1 if tz_name.upper() == 'BST' else 0))
+        return parsed.replace(tzinfo=offset).astimezone(timezone.utc)
+    return None
+
+
+def _derive_exact_end_from_start_duration(raw_html, item_id=None, supporting_htmls=None, observed_at=None):
+    """Консервативный exact fallback без приблизительного countdown.
+
+    Приоритет:
+      1) exact start + explicit eBay listing duration;
+      2) exact start + абсолютное displayed end до минуты, где секунду берём ИЗ start;
+      3) exact start + unique standard duration, подтверждённую отображаемым Time left.
+
+    Вариант 3 не использует countdown как конечное время: countdown только выбирает
+    duration из стандартных eBay 1/3/5/7/10/30 дней, а exact seconds приходят из start.
+    Если выбор не однозначен — ничего не сохраняем.
+    """
+    blobs = [raw_html] + [x for x in (supporting_htmls or []) if x]
+    start = None
+    start_source = 'none'
+    start_blob = None
+    for blob in blobs:
+        st, src = _extract_exact_start_time(blob, item_id=item_id)
+        if st:
+            start, start_source, start_blob = st, src, blob
+            break
+    if not start:
+        return None, 'none'
+
+    creation_only_start = 'item_creation' in start_source
+    for blob in blobs:
+        days, dur_source = _extract_listing_duration_days(blob, item_id=item_id)
+        if days and not creation_only_start:
+            end = start + timedelta(days=days)
+            if end > datetime.now(timezone.utc) - timedelta(hours=1):
+                return end, f'derived:{start_source}+{dur_source}:{days}d'
+
+    # eBay UI sometimes hides seconds in the displayed Ends line. Since fixed-duration
+    # auctions preserve the start second, combine the displayed minute with exact start second.
+    for blob in blobs:
+        soup = BeautifulSoup(blob, 'html.parser')
+        visible = re.sub(r'\s+', ' ', soup.get_text(' ', strip=True))
+        minute_end = _extract_visible_end_minute(visible)
+        if minute_end and not creation_only_start:
+            candidate = minute_end.replace(second=start.second, microsecond=start.microsecond)
+            if candidate > datetime.now(timezone.utc) - timedelta(hours=1):
+                return candidate, f'derived:{start_source}+visible_end_minute'
+
+    now = _ensure_aware_utc(observed_at or datetime.now(timezone.utc))
+    standard_days = (1, 3, 5, 7, 10, 30)
+    for blob in blobs:
+        soup = BeautifulSoup(blob, 'html.parser')
+        visible = re.sub(r'\s+', ' ', soup.get_text(' ', strip=True))
+        rel = _extract_relative_time_left(visible)
+        if not rel:
+            continue
+        rel_seconds, tolerance, _ = rel
+        matches = []
+        for days in standard_days:
+            candidate = start + timedelta(days=days)
+            remaining = (candidate - now).total_seconds()
+            if remaining >= -60 and abs(remaining - rel_seconds) <= tolerance:
+                matches.append((days, candidate))
+        if len(matches) == 1:
+            days, candidate = matches[0]
+            return candidate, f'derived:{start_source}+time_left_unique_duration:{days}d'
+    return None, 'none'
+
 def _cluster_datetimes(values, tolerance_seconds=5):
     clusters = []
     for dt in sorted((_ensure_aware_utc(v) for v in values if v), key=lambda x: x.timestamp()):
@@ -1803,98 +2182,107 @@ def _cluster_datetimes(values, tolerance_seconds=5):
 
 
 def _extract_structured_end_time(html, item_id=None):
-    """Ищет exact UTC end time в структурных данных eBay без угадывания по countdown.
+    """Ищет exact UTC end time в plain/escaped structured data eBay.
 
-    Сначала ищем только рядом с ID текущего лота. Whole-page fallback разрешён лишь для
-    специфичных ключей itemEndDate/listingEndTime/auctionEndTime и только если значение
-    на странице фактически одно — recommendation-карточки не должны подменить лот.
+    V6.7 понимает HTML entities, JS-unicode escapes и новые semantic key names.
+    Whole-page fallback остаётся строгим: generic ``endTime`` по всей странице не
+    принимается, чтобы recommendation cards не подменили основной лот.
     """
     if not html:
         return None, 'none', False
 
-    normalized = html.replace('\\"', '"').replace('\\/', '/')
-    strict_keys = ('itemEndDate', 'listingEndTime', 'auctionEndTime')
-    broad_keys = strict_keys + ('endDateTime', 'endTime', 'endDate')
+    contextual_keys = (
+        'itemEndDate', 'listingEndTime', 'auctionEndTime', 'listingEndDate',
+        'auctionEndDate', 'listingEndsAt', 'auctionEndsAt', 'endDateTime',
+        'endTime', 'endDate', 'endsAt', 'endAt', 'endTimestamp', 'endTimeUtc',
+    )
+    strong_page_keys = (
+        'itemEndDate', 'listingEndTime', 'auctionEndTime', 'listingEndDate',
+        'auctionEndDate', 'listingEndsAt', 'auctionEndsAt', 'endDateTime',
+        'endTimeUtc',
+    )
 
-    def values_from(source, keys):
-        found = []
-        key_alt = '|'.join(re.escape(k) for k in keys)
-        pattern = re.compile(
-            rf'"(?:{key_alt})"\s*:\s*(?:"([^"\\]+)"|(\d{{10,13}}(?:\.\d+)?))',
-            re.I,
-        )
-        for m in pattern.finditer(source):
-            raw = m.group(1) or m.group(2)
-            dt = _parse_iso_datetime(raw)
-            if dt:
-                found.append(dt)
-        # Некоторые eBay templates используют data-* атрибуты.
-        attr_pattern = re.compile(
-            r'data-(?:item-end-date|listing-end-time|auction-end-time|end-time|end-date)\s*=\s*["\']([^"\']+)["\']',
-            re.I,
-        )
-        for m in attr_pattern.finditer(source):
-            dt = _parse_iso_datetime(m.group(1))
-            if dt:
-                found.append(dt)
-        return found
-
-    contextual = []
-    if item_id:
-        for mm in re.finditer(re.escape(str(item_id)), normalized):
-            left = max(0, mm.start() - 5000)
-            right = min(len(normalized), mm.end() + 18000)
-            window = normalized[left:right]
-            auctionish = bool(
-                re.search(r'"buyingOptions"\s*:\s*\[[^\]]*"AUCTION"', window, re.I)
-                or re.search(r'"(?:currentBidPrice|bidCount|auction)"\s*:', window, re.I)
-                or re.search(r'"listingType"\s*:\s*"(?:Auction|Chinese)"', window, re.I)
-            )
-            contextual.extend(values_from(window, broad_keys if auctionish else strict_keys))
-            if len(contextual) >= 20:
-                break
-
+    contextual = _extract_keyed_datetimes(
+        html, contextual_keys, item_id=item_id, whole_page=False
+    )
     if contextual:
         clusters = _cluster_datetimes(contextual)
         if len(clusters) == 1:
             return clusters[0][0], 'structured_near_item', False
+        # Не считаем timestamps из прошлого/далёкого будущего, если среди clusters есть
+        # ровно один правдоподобный current-auction end. Это помогает, когда возле item id
+        # соседствует analytics timestamp, но не ослабляет защиту от реального конфликта.
+        now = datetime.now(timezone.utc)
+        plausible = [
+            c for c in clusters
+            if now - timedelta(days=1) <= c[0] <= now + timedelta(days=45)
+        ]
+        if len(plausible) == 1:
+            return plausible[0][0], 'structured_near_item_plausible', False
         return None, 'structured_near_item_conflict', True
 
-    strict_values = values_from(normalized, strict_keys)
+    strict_values = _extract_keyed_datetimes(
+        html, strong_page_keys, item_id=None, whole_page=True
+    )
     if strict_values:
         clusters = _cluster_datetimes(strict_values)
         if len(clusters) == 1:
             return clusters[0][0], 'structured_unique_page', False
+        now = datetime.now(timezone.utc)
+        plausible = [
+            c for c in clusters
+            if now - timedelta(days=1) <= c[0] <= now + timedelta(days=45)
+        ]
+        if len(plausible) == 1:
+            return plausible[0][0], 'structured_unique_page_plausible', False
         return None, 'structured_page_conflict', True
+
+    # Semantic HTML / microdata fallback. Accept only elements explicitly named as end.
+    soup = BeautifulSoup(html, 'html.parser')
+    semantic_values = []
+    for tag in soup.find_all(True):
+        attrs = {str(k).lower(): str(v) for k, v in (tag.attrs or {}).items()}
+        marker = ' '.join([
+            attrs.get('itemprop', ''), attrs.get('data-testid', ''), attrs.get('id', ''),
+            attrs.get('class', ''), attrs.get('name', ''), attrs.get('property', ''),
+        ]).lower()
+        if not re.search(r'(?:item|listing|auction)?[-_ ]?end(?:date|time|ing|s|at)?', marker):
+            continue
+        for field in ('content', 'datetime', 'data-end-time', 'data-end-date', 'value', 'aria-label', 'title'):
+            raw = attrs.get(field)
+            if not raw:
+                continue
+            dt = _parse_iso_datetime(raw) or _parse_human_tz_datetime(raw)
+            if dt:
+                semantic_values.append(dt)
+    if semantic_values:
+        clusters = _cluster_datetimes(semantic_values)
+        if len(clusters) == 1:
+            return clusters[0][0], 'semantic_end_time', False
 
     return None, 'none', False
 
 
 def _extract_visible_exact_uk_end(visible):
-    """Парсит только абсолютное UK-время с секундами и BST/GMT."""
+    """Парсит абсолютное UK/UTC end time только когда страница показывает seconds."""
     if not visible:
         return None, None
-    # Поддерживаем варианты:
-    # Ends: 14 Sep, 2026 19:31:22 BST
-    # Ends on Sun, 14 Sep 2026, 19:31:22 BST
-    pattern = re.compile(
-        r'\b(Ends|Ended)(?:\s+on)?\s*:?[\s,]*(?:[A-Za-z]{3},?\s+)?'
-        r'(\d{1,2})\s+([A-Za-z]{3})[,]?\s+(\d{4})[,]?\s+'
-        r'(\d{1,2}):(\d{2}):(\d{2})\s*(BST|GMT)\b',
+    label_re = re.compile(r'\b(Ends|Ended|Ending|End\s*time)(?:\s+on)?\s*:?[,\s]*', re.I)
+    human_pat = re.compile(
+        r'(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)?[,]?\s*'
+        r'\d{1,2}\s+[A-Za-z]{3,9}[,]?\s+20\d{2}[,]?\s+'
+        r'\d{1,2}:\d{2}:\d{2}(?:\s*(?:AM|PM))?\s*(?:BST|GMT|UTC)',
         re.I,
     )
-    m = pattern.search(visible)
-    if not m:
-        return None, None
-    try:
-        naive = datetime.strptime(
-            f"{m.group(2)} {m.group(3)} {m.group(4)} {m.group(5)}:{m.group(6)}:{m.group(7)}",
-            '%d %b %Y %H:%M:%S',
-        )
-        offset = timedelta(hours=1 if m.group(8).upper() == 'BST' else 0)
-        return naive.replace(tzinfo=timezone(offset)).astimezone(timezone.utc), m.group(1).lower()
-    except Exception:
-        return None, None
+    for lm in label_re.finditer(visible):
+        frag = visible[lm.end():lm.end()+170]
+        hm = human_pat.search(frag)
+        if hm:
+            dt = _parse_human_tz_datetime(hm.group(0))
+            if dt:
+                kind = 'ended' if lm.group(1).lower().startswith('ended') else 'ends'
+                return dt, kind
+    return None, None
 
 
 def _structured_auction_evidence(html, item_id=None):
@@ -1963,8 +2351,15 @@ def parse_auction_page(html, final_url):
         end_time_utc = structured_end_utc
         source = structured_source
     else:
-        end_time_utc = None
-        source = 'none'
+        derived_end_utc, derived_source = _derive_exact_end_from_start_duration(
+            html, item_id=item_id
+        )
+        if derived_end_utc:
+            end_time_utc = derived_end_utc
+            source = derived_source
+        else:
+            end_time_utc = None
+            source = 'none'
 
     bid_box_marker = bool(
         re.search(r'\bplace\s+(?:a\s+)?bid\b', visible, re.I)
@@ -2039,7 +2434,13 @@ def parse_auction_search_fallback(html, item_id):
         return None
 
     end_time, source, conflict = _extract_structured_end_time(html, item_id=item_id)
-    if conflict or not end_time:
+    if conflict:
+        return None
+    if not end_time:
+        end_time, derived_source = _derive_exact_end_from_start_duration(html, item_id=item_id)
+        if end_time:
+            source = derived_source
+    if not end_time:
         return None
 
     title = ''
@@ -2048,6 +2449,62 @@ def parse_auction_search_fallback(html, item_id):
         if title_node:
             title = re.sub(r'\s+', ' ', title_node.get_text(' ', strip=True)).strip()
     return str(item_id), title[:300] or f'eBay item {item_id}', end_time, f'search_fallback:{source}', 'active'
+
+
+
+def parse_auction_bid_history_fallback(html, item_id, supporting_htmls=None):
+    """Exact-time fallback через публичную eBay Bid History page.
+
+    Bid history полезна тем, что eBay часто показывает там exact start time до секунды,
+    даже когда View Item сверху показывает end time только до минуты/countdown.
+    Мы НЕ используем countdown как конечное время. Если direct end timestamp отсутствует,
+    exact end строится только из exact start + duration (явной или однозначно
+    подтверждённой Time left среди стандартных auction durations).
+    """
+    if not html or not item_id:
+        return str(item_id) if item_id else None, f'eBay item {item_id or ""}'.strip(), None, 'bid_history_empty', 'no_exact_end_time'
+
+    soup = BeautifulSoup(html, 'html.parser')
+    visible = re.sub(r'\s+', ' ', soup.get_text(' ', strip=True))
+    title = ''
+    # Typical Bid History text: Item title: ... Time left: ...
+    m = re.search(r'\bItem\s+title\s*:\s*(.+?)(?:\bTime\s+left\b|\bBid\s+history\b|$)', visible, re.I)
+    if m:
+        title = re.sub(r'\s+', ' ', m.group(1)).strip(' -|')[:300]
+    if not title:
+        title = f'eBay item {item_id}'
+
+    direct_end, visible_kind = _extract_visible_exact_uk_end(visible)
+    structured_end, structured_source, conflict = _extract_structured_end_time(html, item_id=item_id)
+    if conflict:
+        return str(item_id), title, None, structured_source, 'time_conflict'
+
+    if direct_end and structured_end and abs((direct_end - structured_end).total_seconds()) > 5:
+        return str(item_id), title, None, 'bid_history_time_conflict', 'time_conflict'
+    if direct_end:
+        end = direct_end
+        source = 'bid_history_visible_exact_end'
+    elif structured_end:
+        end = structured_end
+        source = f'bid_history:{structured_source}'
+    else:
+        end, derived_source = _derive_exact_end_from_start_duration(
+            html,
+            item_id=item_id,
+            supporting_htmls=supporting_htmls,
+        )
+        source = f'bid_history:{derived_source}' if end else 'bid_history:none'
+
+    explicit_ended = bool(
+        visible_kind == 'ended'
+        or re.search(r'\bAuction\s+has\s+ended\b', visible, re.I)
+        or re.search(r'\bThis\s+listing\s+(?:has\s+)?ended\b', visible, re.I)
+    )
+    if not end:
+        return str(item_id), title, None, source, 'no_exact_end_time'
+    if explicit_ended or end <= datetime.now(timezone.utc):
+        return str(item_id), title, end, source, 'ended'
+    return str(item_id), title, end, source, 'active'
 
 def _future_reminder_labels(end_time_utc):
     remaining = (_ensure_aware_utc(end_time_utc) - datetime.now(timezone.utc)).total_seconds()
@@ -2070,6 +2527,8 @@ def process_auction_link(url):
     )
 
     parsed_results = []
+    timing_support_htmls = [html for html, _, _ in pages if html]
+    search_support_htmls = []
     for html, final_url, proxy_used in pages:
         parse_url = final_url if extract_ebay_item_id_any(final_url or '') else url
         result = parse_auction_page(html, parse_url)
@@ -2120,6 +2579,7 @@ def process_auction_link(url):
             max_pages=2,
         )
         for search_html, _, proxy_used in fallback_pages:
+            search_support_htmls.append(search_html)
             fallback_result = parse_auction_search_fallback(search_html, fallback_item_id)
             if fallback_result:
                 logging.info(
@@ -2127,6 +2587,49 @@ def process_auction_link(url):
                     f"end={fallback_result[2].isoformat()}, source={fallback_result[3]}, proxy={proxy_used}"
                 )
                 chosen = fallback_result
+                break
+            logging.info(
+                f"🧪 Auction search-fallback: item={fallback_item_id}, proxy={proxy_used}, exact_end=не найден"
+            )
+
+    # Самый надёжный HTML-fallback без API-key: публичная Bid History page.
+    # Она часто содержит точный Start time до секунды. Если top item-page показывает
+    # Ends только до минуты, секунду можно восстановить из exact start; если показан
+    # Time left, он лишь подтверждает стандартную duration, но не используется как
+    # самостоятельный approximate end timestamp.
+    if chosen is None and fallback_item_id:
+        bid_history_url = (
+            f"https://www.ebay.co.uk/bfl/viewbids/{fallback_item_id}"
+            f"?item={fallback_item_id}&rt=nc"
+        )
+        bid_pages = fetch_auction_pages(
+            bid_history_url,
+            max_reserve_proxies=min(4, AUCTION_FETCH_MAX_PROXIES),
+            connect_timeout=min(AUCTION_FETCH_CONNECT_TIMEOUT, 4.0),
+            read_timeout=min(AUCTION_FETCH_READ_TIMEOUT, 10.0),
+            max_pages=2,
+            canonicalize_item=False,
+        )
+        supports = timing_support_htmls + search_support_htmls
+        for bid_html, _, proxy_used in bid_pages:
+            bid_result = parse_auction_bid_history_fallback(
+                bid_html, fallback_item_id, supporting_htmls=supports
+            )
+            logging.info(
+                f"🧪 Auction bid-history: proxy={proxy_used}, item={bid_result[0]}, "
+                f"status={bid_result[4]}, source={bid_result[3]}, "
+                f"end={bid_result[2].isoformat() if bid_result[2] else None}"
+            )
+            parsed_results.append((bid_result, proxy_used))
+            if bid_result[4] == 'active' and bid_result[2]:
+                # Сохраняем хороший title с item-page, если bid-history отдала лишь generic.
+                if bid_result[1].startswith('eBay item '):
+                    better_title = next(
+                        (r[0][1] for r in parsed_results if r[0][1] and not r[0][1].startswith('eBay item ')),
+                        bid_result[1],
+                    )
+                    bid_result = (bid_result[0], better_title, bid_result[2], bid_result[3], bid_result[4])
+                chosen = bid_result
                 break
 
     if chosen is None:
@@ -2165,12 +2668,12 @@ def process_auction_link(url):
             return
 
         logging.warning(
-            f"Auction не подтверждён после {len(pages)} item-page вариантов и search fallback; "
+            f"Auction не подтверждён после {len(pages)} item-page вариантов, search и bid-history fallback; "
             f"item={fallback_item_id}, statuses={statuses}"
         )
         send_telegram_message(
             "❌ <b>Не удалось точно подтвердить активный аукцион и время его окончания.</b>\n\n"
-            "Я проверил несколько независимых proxy и дополнительную eBay-выдачу по номеру лота, "
+            "Я проверил несколько независимых proxy, eBay-выдачу по номеру лота и Bid History, "
             "но exact timestamp не был подтверждён. Приблизительное время не сохраняю."
         )
         return
@@ -2977,9 +3480,14 @@ def fetch_ebay_html_with_fixed_pair():
 
         logging.info("Ищем новую рабочую пару...")
 
-    # 2) Rolling discovery V6.6: 4 worker сразу -> 5 после 10 сек.
+    # 2) Rolling discovery V6.7: 4 worker сразу -> 5 после 10 сек.
     # Emergency ProxyScrape timeout=3000 автоматически добавляется, если быстрый пул
     # явно плохой/истощён. Hard cooldown никогда не снимаются.
+    # На свежем старте сначала ОБЯЗАТЕЛЬНО загружаем обычный Render PROXY_LIST
+    # (timeout=1500). Emergency 3000 не имеет права включаться на пустом 0/0 pool.
+    if not proxy_manager.standard_pool_loaded():
+        proxy_manager.refresh_proxies(force=True, emergency=False)
+
     started = time.monotonic()
     tried_hosts = set()
     tried_proxies = set()
@@ -3017,11 +3525,11 @@ def fetch_ebay_html_with_fixed_pair():
             elapsed_now >= PROXY_EMERGENCY_TRIGGER_AFTER
             and attempts >= PROXY_EMERGENCY_TRIGGER_ATTEMPTS
         )
-        depleted = proxy_manager.emergency_needed()
+        available, total, bad_count, host_bad_count = proxy_manager.pool_stats()
+        depleted = total > 0 and proxy_manager.emergency_needed()
         if not (force or long_bad_search or depleted):
             return False
 
-        available, total, bad_count, host_bad_count = proxy_manager.pool_stats()
         reason = (
             'исчерпан доступный пул'
             if depleted
@@ -3216,9 +3724,16 @@ def fetch_ebay_html_with_fixed_pair():
                     result, html, session = 'proxy_error', None, None
 
                 completed_results.append(result)
-                if result == 'success' and winner is None:
+                if result == 'success':
                     proxy_manager.mark_success(proxy)
-                    winner = (proxy, html, session)
+                    if winner is None:
+                        winner = (proxy, html, session)
+                    else:
+                        # Несколько probes могут завершиться одним wait() одновременно.
+                        # В V6.6 второй success ошибочно попадал в mark_failure(..., 'success').
+                        # Теперь это корректно запомненный запасной рабочий proxy.
+                        logging.info(f"🟢 Запомнен запасной успешный proxy {proxy} (same batch)")
+                        close_session(session)
                 elif result == 'profile_error':
                     close_session(session)
                     fallback_profile = get_preferred_profile()
@@ -3942,7 +4457,7 @@ def bot_worker():
     seen_line = f"\n📚 В базе: {seen_total} товаров." if seen_total is not None else ""
     send_telegram_message(
         startup_line +
-        "\n🇬🇧 eBay UK monitor v6.6 работает." +
+        "\n🇬🇧 eBay UK monitor v6.7 работает." +
         seen_line +
         "\nКоманды: /stop /start /list (/auctions) /delauction НОМЕР_ЛОТА"
         "\nМожно отправить ссылку на eBay-аукцион — сохраню точное время и напомню заранее.",
@@ -4026,7 +4541,7 @@ def leader_supervisor():
 @app.route('/')
 def index():
     role = "leader" if leader_active_event.is_set() else "standby"
-    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.6, {role})"
+    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.7, {role})"
 
 
 @app.route('/health')
