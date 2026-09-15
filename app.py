@@ -63,7 +63,7 @@ LEADER_HEALTH_INTERVAL = max(5, int(os.getenv("LEADER_HEALTH_INTERVAL", "10")))
 
 # Discovery запускается только когда уже нет рабочей fixed-session. По реальным логам
 # бесплатного ProxyScrape 3->4 worker слишком долго прожигали большой плохой пул.
-# V6.9 сохраняет безопасные 4 уникальных IP и после 10 сек. повышается максимум до 5.
+# V6.10 сохраняет безопасные 4 уникальных IP и после 10 сек. повышается максимум до 5.
 # Это касается ТОЛЬКО аварийного discovery; при живом fixed proxy по-прежнему один запрос.
 PROBE_CONCURRENCY = max(4, min(int(os.getenv("PROBE_CONCURRENCY", "4")), 5))
 PROBE_ESCALATED_CONCURRENCY = max(
@@ -134,6 +134,15 @@ AUCTION_REMINDER_LATE_GRACE = max(30, int(os.getenv("AUCTION_REMINDER_LATE_GRACE
 # тестирует extended bidding в некоторых категориях. Grace даёт время увидеть
 # продление, даже если Render/proxy временно недоступны возле самого конца.
 AUCTION_END_GRACE = max(300, int(os.getenv("AUCTION_END_GRACE", "1800")))
+# Если eBay пока показывает только грубый countdown (например 4d 14h), не угадываем
+# минуту. Сохраняем лот как pending и возвращаемся к нему, когда до даже самого
+# позднего возможного конца останется меньше ~23.5 ч. Если минутная точность всё ещё
+# скрыта, повторяем редко (по умолчанию раз в 10 минут), без Bid History/Sign-In.
+AUCTION_PENDING_REFINE_TARGET = max(20 * 3600, int(os.getenv("AUCTION_PENDING_REFINE_TARGET", str(23 * 3600 + 30 * 60))))
+AUCTION_PENDING_RETRY = max(300, int(os.getenv("AUCTION_PENDING_RETRY", "600")))
+AUCTION_PENDING_MIN_DELAY = max(60, int(os.getenv("AUCTION_PENDING_MIN_DELAY", "300")))
+AUCTION_PENDING_WINDOW_MARGIN = max(30, int(os.getenv("AUCTION_PENDING_WINDOW_MARGIN", "120")))
+AUCTION_PENDING_MINUTE_MARGIN = max(5, int(os.getenv("AUCTION_PENDING_MINUTE_MARGIN", "15")))
 
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 LONDON_TZ = ZoneInfo("Europe/London")
@@ -646,7 +655,7 @@ class ProxyManager:
             return self._is_recent_good_locked(proxy)
 
     def _candidate_score_locked(self, proxy, now):
-        # V6.9: recently-good с 0-2 сбоями по-прежнему ценен, но после 3+ подряд
+        # V6.10: recently-good с 0-2 сбоями по-прежнему ценен, но после 3+ подряд
         # ошибок историческая репутация почти обнуляется. В V6.7 proxy с fail_streak=4
         # всё ещё мог обгонять абсолютно свежий endpoint из нового standard snapshot.
         last_ok = self.last_success_at.get(proxy, 0)
@@ -1060,6 +1069,10 @@ proxy_manager = ProxyManager(PROXY_LIST_URL)
 fixed_proxy = None
 fixed_profile = None
 fixed_session = None
+# Auction-refinement может аккуратно воспользоваться текущим рабочим proxy, но не
+# одновременно с основным search request. Main request берёт этот lock блокирующе;
+# auction берёт его только non-blocking и при занятости сразу использует reserve IP.
+main_fixed_request_lock = threading.Lock()
 
 
 def close_session(session):
@@ -1121,6 +1134,28 @@ def init_db():
             cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_auction_reminders_end_time "
                 "ON auction_reminders (end_time_utc)"
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS auction_pending (
+                    item_id TEXT PRIMARY KEY,
+                    url TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    observed_at_utc TIMESTAMPTZ NOT NULL,
+                    end_earliest_utc TIMESTAMPTZ NOT NULL,
+                    end_latest_utc TIMESTAMPTZ NOT NULL,
+                    remaining_text TEXT NOT NULL DEFAULT '',
+                    clock_text TEXT NOT NULL DEFAULT '',
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    last_check TIMESTAMPTZ NULL,
+                    next_check TIMESTAMPTZ NOT NULL
+                )
+                """
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_auction_pending_next_check "
+                "ON auction_pending (next_check)"
             )
         conn.commit()
 
@@ -1327,8 +1362,20 @@ def save_auction_reminder(item_id, url, title, end_time_utc):
                     flags[60], flags[30], flags[10], flags[5],
                 ),
             )
+            # Exact schedule supersedes any earlier coarse/pending observation.
+            cur.execute("DELETE FROM auction_pending WHERE item_id = %s", (item_id,))
         conn.commit()
     wake_auction_workers()
+
+
+def get_exact_auction_by_id(item_id):
+    with get_db_connection('ebay_uk_auction_exact_get') as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT item_id, url, title, end_time_utc FROM auction_reminders WHERE item_id=%s",
+                (item_id,),
+            )
+            return cur.fetchone()
 
 
 def list_active_auctions(limit=20):
@@ -1355,6 +1402,192 @@ def delete_auction_reminder(item_id):
         conn.commit()
     wake_auction_workers()
     return deleted
+
+
+
+def _pending_next_check(now_utc, end_latest_utc, window_seconds):
+    now_utc = _ensure_aware_utc(now_utc)
+    end_latest_utc = _ensure_aware_utc(end_latest_utc)
+    remaining_latest = (end_latest_utc - now_utc).total_seconds()
+    # Если eBay уже показывает минуты, повторяем сравнительно скоро: возможно следующая
+    # страница даст structured timestamp/локализованный clock и minute станет exact.
+    if window_seconds <= 120:
+        return now_utc + timedelta(seconds=max(90, min(AUCTION_PENDING_RETRY, 180)))
+    # Как только даже верхняя граница меньше 24ч, проверяем каждые ~10 минут.
+    if remaining_latest <= 24 * 3600:
+        return now_utc + timedelta(seconds=AUCTION_PENDING_RETRY)
+    # До этого не мучаем eBay: будим pending около 23ч30м до самого позднего
+    # возможного конца. Тогда реальный лот гарантированно уже находится <24ч.
+    target = end_latest_utc - timedelta(seconds=AUCTION_PENDING_REFINE_TARGET)
+    minimum = now_utc + timedelta(seconds=AUCTION_PENDING_MIN_DELAY)
+    return max(minimum, target)
+
+
+def save_pending_auction(
+    item_id,
+    url,
+    title,
+    observed_at_utc,
+    low_seconds,
+    high_seconds,
+    remaining_text='',
+    clock_text='',
+):
+    """Сохраняет НЕ точное время как безопасное окно, не включая reminders.
+
+    Например ``4d 14h`` означает [4d14h, 4d15h). Мы сознательно не выбираем
+    случайную минуту из этого часа. Запись переживает deploy/restart в PostgreSQL и
+    позже автоматически уточняется lightweight search-card запросом.
+    """
+    observed = _ensure_aware_utc(observed_at_utc or datetime.now(timezone.utc))
+    low_seconds = max(0.0, float(low_seconds))
+    high_seconds = max(low_seconds + 1.0, float(high_seconds))
+    raw_window_seconds = max(1.0, high_seconds - low_seconds)
+    margin = float(
+        AUCTION_PENDING_MINUTE_MARGIN
+        if raw_window_seconds <= 60.0
+        else AUCTION_PENDING_WINDOW_MARGIN
+    )
+    new_earliest = observed + timedelta(seconds=max(0.0, low_seconds - margin))
+    new_latest = observed + timedelta(seconds=high_seconds + margin)
+    window_seconds = max(1.0, new_latest.timestamp() - new_earliest.timestamp())
+    canonical_url = f"https://www.ebay.co.uk/itm/{item_id}"
+    url = canonical_url if item_id else url
+
+    with get_db_connection('ebay_uk_auction_pending_save') as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT end_earliest_utc, end_latest_utc FROM auction_pending "
+                "WHERE item_id=%s FOR UPDATE",
+                (item_id,),
+            )
+            old = cur.fetchone()
+            earliest, latest = new_earliest, new_latest
+            if old:
+                old_earliest = _ensure_aware_utc(old[0])
+                old_latest = _ensure_aware_utc(old[1])
+                # Повторные countdown-наблюдения сужают окно. Если окна не пересекаются,
+                # eBay мог изменить окончание — тогда безопаснее заменить старое новым.
+                overlap_earliest = max(old_earliest, new_earliest)
+                overlap_latest = min(old_latest, new_latest)
+                if overlap_earliest < overlap_latest:
+                    earliest, latest = overlap_earliest, overlap_latest
+            window_seconds = max(1.0, (latest - earliest).total_seconds())
+            next_check = _pending_next_check(observed, latest, window_seconds)
+            cur.execute(
+                """
+                INSERT INTO auction_pending (
+                    item_id, url, title, observed_at_utc,
+                    end_earliest_utc, end_latest_utc,
+                    remaining_text, clock_text, last_check, next_check
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW(),%s)
+                ON CONFLICT (item_id) DO UPDATE SET
+                    url=EXCLUDED.url,
+                    title=EXCLUDED.title,
+                    observed_at_utc=EXCLUDED.observed_at_utc,
+                    end_earliest_utc=EXCLUDED.end_earliest_utc,
+                    end_latest_utc=EXCLUDED.end_latest_utc,
+                    remaining_text=EXCLUDED.remaining_text,
+                    clock_text=EXCLUDED.clock_text,
+                    last_check=NOW(),
+                    next_check=EXCLUDED.next_check,
+                    updated_at=NOW()
+                """,
+                (
+                    item_id, url, title or f'eBay item {item_id}', observed,
+                    earliest, latest,
+                    str(remaining_text or ''), str(clock_text or ''), next_check,
+                ),
+            )
+        conn.commit()
+    wake_auction_workers()
+    return earliest, latest, next_check
+
+
+def _pending_window_single_minute(earliest, latest):
+    """Возвращает UTC minute, только если ВСЁ сохранённое окно лежит в одной минуте."""
+    earliest = _ensure_aware_utc(earliest)
+    latest = _ensure_aware_utc(latest)
+    if latest <= earliest:
+        return None
+    last_possible = latest - timedelta(microseconds=1)
+    first_minute = earliest.replace(second=0, microsecond=0)
+    last_minute = last_possible.replace(second=0, microsecond=0)
+    return first_minute if first_minute == last_minute else None
+
+
+def list_pending_auctions(limit=20):
+    with get_db_connection('ebay_uk_auction_pending_list') as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT item_id, url, title, end_earliest_utc, end_latest_utc,
+                       remaining_text, clock_text, next_check
+                FROM auction_pending
+                WHERE end_latest_utc > NOW() - INTERVAL '30 minutes'
+                ORDER BY end_earliest_utc ASC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            return cur.fetchall()
+
+
+def get_due_pending_auctions(limit=1):
+    with get_db_connection('ebay_uk_auction_pending_due') as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT item_id, url, title, end_earliest_utc, end_latest_utc,
+                       remaining_text, clock_text, next_check
+                FROM auction_pending
+                WHERE next_check <= NOW()
+                  AND end_latest_utc > NOW() - INTERVAL '30 minutes'
+                ORDER BY next_check ASC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            return cur.fetchall()
+
+
+def postpone_pending_auction(item_id, delay_seconds=None):
+    delay_seconds = int(delay_seconds or AUCTION_PENDING_RETRY)
+    with get_db_connection('ebay_uk_auction_pending_retry') as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE auction_pending
+                SET last_check=NOW(), next_check=NOW() + (%s * INTERVAL '1 second'), updated_at=NOW()
+                WHERE item_id=%s
+                """,
+                (delay_seconds, item_id),
+            )
+        conn.commit()
+
+
+def delete_pending_auction(item_id, wake=True):
+    with get_db_connection('ebay_uk_auction_pending_delete') as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM auction_pending WHERE item_id=%s RETURNING item_id", (item_id,))
+            deleted = cur.fetchone() is not None
+        conn.commit()
+    if wake:
+        wake_auction_workers()
+    return deleted
+
+
+def delete_auction_any(item_id):
+    """Удаляет и exact reminder, и pending-refinement одной командой/callback."""
+    with get_db_connection('ebay_uk_auction_delete_any') as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM auction_reminders WHERE item_id=%s RETURNING item_id", (item_id,))
+            exact = cur.fetchone() is not None
+            cur.execute("DELETE FROM auction_pending WHERE item_id=%s RETURNING item_id", (item_id,))
+            pending = cur.fetchone() is not None
+        conn.commit()
+    wake_auction_workers()
+    return exact or pending
 
 
 def mark_auction_status_checked(item_id):
@@ -1750,13 +1983,15 @@ def fetch_auction_pages(
     read_timeout=None,
     max_pages=1,
     canonicalize_item=True,
+    prefer_current_fixed=False,
 ):
-    """Редкая операция: несколько proxy параллельно, без зависимости от main fixed request.
+    """Получает auction/search HTML без полного proxy-discovery.
 
-    Мы не штрафуем proxy глобально за неудачу именно item-page: один IP может отлично
-    открывать search, но временно плохо отдавать тяжёлую карточку товара. Первый валидный
-    HTML не останавливает проверку мгновенно, если caller запросил несколько страниц —
-    это позволяет пережить разные HTML-шаблоны eBay без приблизительного времени.
+    V6.10: для редкого пользовательского auction search можно сначала попробовать
+    ТЕКУЩИЙ уже доказанный main fixed proxy. Он используется только если main request
+    сейчас не держит ``main_fixed_request_lock``. Поэтому auction не запускает новый
+    полный discovery и не делает одновременный запрос тем же IP. При неудаче быстро
+    переходим к небольшому reserve-набору.
     """
     if not _is_allowed_ebay_url(url):
         return []
@@ -1771,59 +2006,88 @@ def fetch_auction_pages(
     max_pages = max(1, min(int(max_pages), AUCTION_VERIFY_MAX_PAGES))
 
     canonical_url = _canonical_auction_url(url) if canonicalize_item else url
-    # Если ItemID распознан, tracking-параметры исходной ссылки не дают более точных
-    # auction-данных, зато в V6.6 один и тот же proxy мог дважды подряд ждать timeout:
-    # сначала canonical URL, затем исходный длинный URL. Для item-page пробуем только
-    # canonical URL. Для иных eBay URL (например search fallback) сохраняем исходный URL.
     urls_to_try = [canonical_url]
-
-    candidates = []
     current_fixed = fixed_proxy
+    current_fixed_profile = fixed_profile or profile
+    pages = []
 
-    # Важное изменение V6.9: auction item-page не конкурирует с основным мониторингом
-    # за тот же fixed proxy. Сначала берём отдельные reserve IP; main fixed добавляем
-    # только последним fallback. По логам fixed отлично грузил search, но тяжёлая item-page
-    # на том же IP одновременно получала timeout/reset.
+    def request_with_optional_fixed_guard(candidate_url, proxy, use_profile):
+        if current_fixed and proxy == current_fixed:
+            acquired = main_fixed_request_lock.acquire(blocking=False)
+            if not acquired:
+                logging.info(
+                    f"Auction: текущий main proxy {proxy} сейчас занят основной проверкой; "
+                    "не мешаем ему и используем reserve"
+                )
+                return None, ''
+            try:
+                return _request_auction_page_once(
+                    candidate_url, proxy, use_profile,
+                    connect_timeout=connect_timeout,
+                    read_timeout=read_timeout,
+                )
+            finally:
+                main_fixed_request_lock.release()
+        return _request_auction_page_once(
+            candidate_url, proxy, use_profile,
+            connect_timeout=connect_timeout,
+            read_timeout=read_timeout,
+        )
+
+    # Для lightweight exact-item search это самый быстрый/стабильный путь: уже рабочий
+    # proxy сначала, но только если main monitor в этот момент им не пользуется.
+    if prefer_current_fixed and current_fixed:
+        for candidate_url in urls_to_try:
+            html, final_url = request_with_optional_fixed_guard(
+                candidate_url, current_fixed, current_fixed_profile
+            )
+            if html:
+                pages.append((html, final_url or candidate_url, current_fixed))
+                if len(pages) >= max_pages:
+                    return pages
+                break
+
     excluded_hosts = {_proxy_host(current_fixed)} if current_fixed else set()
     reserve = proxy_manager.get_candidate_batch(max_reserve_proxies, tried_hosts=excluded_hosts)
-    for p in reserve:
-        if p not in candidates:
-            candidates.append(p)
-    if current_fixed and current_fixed not in candidates:
+    candidates = []
+    for candidate in reserve:
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+
+    # Старое поведение сохраняем для callers, которые не просили fixed-first:
+    # current fixed остаётся последним fallback, но тоже под lock.
+    if not prefer_current_fixed and current_fixed and current_fixed not in candidates:
         candidates.append(current_fixed)
 
-    # Если обычный pool почти исчерпан, auction-link — редкая пользовательская операция,
-    # поэтому можно один раз добавить emergency 3000-ms candidates и не ждать main discovery.
-    if len(candidates) < 2 or proxy_manager.emergency_needed():
+    # Только если reserve действительно мал/истощён — один emergency merge. Это НЕ
+    # main discovery и не меняет рабочую fixed-пару.
+    if len(candidates) < 2 and max_reserve_proxies > len(candidates):
         proxy_manager.refresh_proxies(force=True, emergency=True)
         tried_hosts = {_proxy_host(p) for p in candidates if p}
-        reserve_count = len([p for p in candidates if p != current_fixed])
+        if current_fixed:
+            tried_hosts.add(_proxy_host(current_fixed))
         extra = proxy_manager.get_candidate_batch(
-            max(0, max_reserve_proxies - reserve_count),
+            max(0, max_reserve_proxies - len(candidates)),
             tried_hosts=tried_hosts,
         )
-        for p in extra:
-            if p not in candidates:
-                candidates.append(p)
+        for candidate in extra:
+            if candidate and candidate not in candidates:
+                candidates.append(candidate)
 
     if not candidates:
-        return []
+        return pages
 
     def worker(proxy):
+        use_profile = current_fixed_profile if current_fixed and proxy == current_fixed else profile
         for candidate_url in urls_to_try:
-            html, final_url = _request_auction_page_once(
-                candidate_url,
-                proxy,
-                profile,
-                connect_timeout=connect_timeout,
-                read_timeout=read_timeout,
-            )
+            html, final_url = request_with_optional_fixed_guard(candidate_url, proxy, use_profile)
             if html:
                 return html, final_url or candidate_url, proxy
         return None, None, proxy
 
-    pages = []
-    pending_candidates = list(candidates[:1 + max_reserve_proxies])
+    pending_candidates = list(candidates[:max_reserve_proxies + (0 if prefer_current_fixed else 1)])
+    if not pending_candidates:
+        return pages
     executor = ThreadPoolExecutor(
         max_workers=min(AUCTION_FETCH_PARALLEL, len(pending_candidates)),
         thread_name_prefix='auction-fetch',
@@ -1849,10 +2113,7 @@ def fetch_auction_pages(
                     logging.info(f"Auction fetch worker {proxy} завершился ошибкой: {e}")
                     html, final_url, proxy_used = None, None, proxy
                 if html:
-                    # Auction/item-page success НЕ превращаем в known-good для основного
-                    # search-monitor. По реальным логам один IP может открыть item page,
-                    # но получать 403 на search (и наоборот); смешивание репутации
-                    # загрязняло приоритет discovery.
+                    # Не смешиваем репутацию auction page и main search proxy.
                     pages.append((html, final_url, proxy_used))
                     if len(pages) >= max_pages:
                         break
@@ -1865,7 +2126,7 @@ def fetch_auction_pages(
     return pages
 
 
-def fetch_auction_page(url, max_reserve_proxies=None, connect_timeout=None, read_timeout=None, canonicalize_item=True):
+def fetch_auction_page(url, max_reserve_proxies=None, connect_timeout=None, read_timeout=None, canonicalize_item=True, prefer_current_fixed=False):
     """Совместимый wrapper: возвращает первую полученную auction page."""
     pages = fetch_auction_pages(
         url,
@@ -1874,6 +2135,7 @@ def fetch_auction_page(url, max_reserve_proxies=None, connect_timeout=None, read
         read_timeout=read_timeout,
         max_pages=1,
         canonicalize_item=canonicalize_item,
+        prefer_current_fixed=prefer_current_fixed,
     )
     if not pages:
         return None, None, None
@@ -1943,7 +2205,7 @@ def _ebay_decoded_variants(raw_html):
 def _parse_human_tz_datetime(value):
     """Парсит абсолютное человекочитаемое время с явной TZ.
 
-    V6.9 принимает точность ДО МИНУТЫ: секунды могут присутствовать, но не обязательны.
+    V6.10 принимает точность ДО МИНУТЫ: секунды могут присутствовать, но не обязательны.
     Это соответствует реальной задаче reminders: пользователю важны дата, час и минута.
     """
     if value is None:
@@ -2050,7 +2312,7 @@ def _extract_keyed_datetimes(raw_html, keys, item_id=None, whole_page=False):
                 frag = source[km.end():km.end()+700]
                 values.extend(_find_absolute_datetime_values(frag))
                 # Некоторые hydration fragments содержат локализованный HH:MM без TZ.
-                # V6.9 его намеренно НЕ принимает как London: реальный ux-timer может
+                # V6.10 его намеренно НЕ принимает как London: реальный ux-timer может
                 # отображаться в timezone клиента/proxy. Здесь берём только явную TZ.
                 try:
                     local_dt = _parse_visible_market_datetime(frag, default_tz=None)
@@ -2212,7 +2474,7 @@ def _extract_relative_time_left(visible):
 def _parse_visible_market_datetime(text, observed_at=None, default_tz=None):
     """Парсит абсолютную дату/время минимум до минуты.
 
-    КРИТИЧНО V6.9: отсутствие timezone больше НЕ означает Europe/London. Скриншот
+    КРИТИЧНО V6.10: отсутствие timezone больше НЕ означает Europe/London. Скриншот
     реального ebay.co.uk показывает ``Monday, 18:42`` в локальном времени браузера,
     поэтому через proxy такой clock может зависеть от географии/локали. Без явной TZ
     значение принимается только если caller сознательно передал default_tz.
@@ -2397,9 +2659,13 @@ def _relative_floor_window(relative):
 def _localized_clock_utc_candidates(relative_text, clock_text, observed_at=None):
     """Строит ВСЕ правдоподобные UTC-minute для локализованного eBay timer.
 
-    Мы намеренно НЕ предполагаем Europe/London: скриншот пользователя показывает,
-    что ``ux-timer__time-left`` может отображаться в локальном времени браузера.
-    Кандидат принимается только если его remaining-time согласуется с ``Ends in ...``.
+    Географию proxy определять не нужно. Берём countdown (timezone-independent) и
+    weekday/HH:MM (локализованный clock), перебираем реальные civil UTC offsets и
+    оставляем только те UTC-minute, которые попадают в countdown-window.
+
+    V6.10 не предполагает, что offset в момент запроса равен offset в момент конца:
+    это делает inference устойчивее около перехода DST. Мы перебираем локальные даты
+    нужного weekday в разумном горизонте, а не строим их из fixed-offset ``local_now``.
     """
     parsed_clock = _parse_weekday_clock(clock_text)
     if not parsed_clock:
@@ -2411,32 +2677,30 @@ def _localized_clock_utc_candidates(relative_text, clock_text, observed_at=None)
 
     observed = _ensure_aware_utc(observed_at or datetime.now(timezone.utc))
     low, high, vals = floor_window
-    # Fetch/parse может занять несколько секунд. Для minute-level countdown разрешаем
-    # до 90 сек. технического лага, для hour-level это не влияет на выбор offset.
     slack = 90.0 if ('m' in vals or 's' in vals) else 30.0
     target_wd, hh, mm = parsed_clock
     candidates = set()
 
+    # eBay auctions в этом bot use-case имеют горизонт в пределах нескольких дней;
+    # +14 дней оставляет большой запас и покрывает weekly rollover/DST edge cases.
+    utc_base_date = observed.date()
     for offset_minutes in _CIVIL_UTC_OFFSETS_MINUTES:
         fixed_tz = timezone(timedelta(minutes=offset_minutes))
-        local_now = observed.astimezone(fixed_tz)
-        days_ahead = (target_wd - local_now.weekday()) % 7
-        target_date = local_now.date() + timedelta(days=days_ahead)
-        try:
-            local_end = datetime(
-                target_date.year, target_date.month, target_date.day,
-                hh, mm, 0, tzinfo=fixed_tz,
-            )
-        except ValueError:
-            continue
-        # Если weekday совпал с today, но указанное время уже прошло, имеется в виду
-        # следующая неделя (типично для 7-day auction).
-        if local_end <= local_now - timedelta(minutes=1):
-            local_end += timedelta(days=7)
-        end_utc = local_end.astimezone(timezone.utc).replace(second=0, microsecond=0)
-        remaining = (end_utc - observed).total_seconds()
-        if low - slack <= remaining < high + slack:
-            candidates.add(end_utc)
+        for day_delta in range(-1, 15):
+            local_date = utc_base_date + timedelta(days=day_delta)
+            if local_date.weekday() != target_wd:
+                continue
+            try:
+                local_end = datetime(
+                    local_date.year, local_date.month, local_date.day,
+                    hh, mm, 0, tzinfo=fixed_tz,
+                )
+            except ValueError:
+                continue
+            end_utc = local_end.astimezone(timezone.utc).replace(second=0, microsecond=0)
+            remaining = (end_utc - observed).total_seconds()
+            if low - slack <= remaining < high + slack:
+                candidates.add(end_utc)
 
     diagnostic = {
         'relative': re.sub(r'\s+', ' ', str(relative_text)).strip(),
@@ -2447,13 +2711,28 @@ def _localized_clock_utc_candidates(relative_text, clock_text, observed_at=None)
 
 
 def _extract_localized_timer_observations(raw_html, observed_at=None):
-    """Извлекает современный eBay ``ux-timer`` и безопасные UTC candidate sets."""
+    """Извлекает современный eBay timer и безопасные UTC candidate sets.
+
+    Поддерживаются оба реально встреченных формата:
+      * ``Ends in 6d 23h`` + ``Monday, 18:42`` (View Item);
+      * ``Time left 4d 14h left (Sat, 14:26)`` (точная search-card).
+    Сам clock может быть локализован proxy/браузером — London не предполагаем.
+    """
     if not raw_html:
         return []
     soup = BeautifulSoup(raw_html, 'html.parser')
     observed = _ensure_aware_utc(observed_at or datetime.now(timezone.utc))
     observations = []
     seen_pairs = set()
+
+    clock_regex = (
+        r'\b(?:Monday|Mon|Tuesday|Tue(?:s)?|Wednesday|Wed|Thursday|Thu(?:rs?)?|Friday|Fri|Saturday|Sat|Sunday|Sun)\b'
+        r'\s*[,]?\s*\d{1,2}:\d{2}(?:\s*(?:AM|PM))?'
+    )
+    relative_regex = (
+        r'\b(?:Ends?\s+in|Time\s+left)\s*:?[\s]*'
+        r'(?:(?:\d+)\s*(?:d|days?|h|hrs?|hours?|m|mins?|minutes?|s|secs?|seconds?)\s*){1,4}'
+    )
 
     containers = soup.select(
         '[data-testid="x-end-time"], .x-end-time, [data-testid="ux-timer"], .ux-timer'
@@ -2471,16 +2750,8 @@ def _extract_localized_timer_observations(raw_html, observed_at=None):
         clock_text = clock_node.get_text(' ', strip=True) if clock_node else ''
         if not rel_text or not clock_text:
             whole = container.get_text(' ', strip=True)
-            # DOM/layout fallback: keep only the short part around Ends in + weekday clock.
-            rel_m = re.search(
-                r'\bEnds?\s+in\s+(?:(?:\d+)\s*(?:d|days?|h|hrs?|hours?|m|mins?|minutes?|s|secs?|seconds?)\s*){1,4}',
-                whole, re.I,
-            )
-            clock_m = re.search(
-                r'\b(?:Monday|Mon|Tuesday|Tue(?:s)?|Wednesday|Wed|Thursday|Thu(?:rs?)?|Friday|Fri|Saturday|Sat|Sunday|Sun)\b'
-                r'\s*[,]?\s*\d{1,2}:\d{2}(?:\s*(?:AM|PM))?',
-                whole, re.I,
-            )
+            rel_m = re.search(relative_regex, whole, re.I)
+            clock_m = re.search(clock_regex, whole, re.I)
             if rel_m and not rel_text:
                 rel_text = rel_m.group(0)
             if clock_m and not clock_text:
@@ -2501,33 +2772,31 @@ def _extract_localized_timer_observations(raw_html, observed_at=None):
                 'source': 'ux_timer',
             })
 
-    # Generic fallback for simplified/search HTML where class names disappeared but
-    # visible string remains: ``Ends in 6d 23h Monday, 18:42``.
-    if not observations:
-        visible = re.sub(r'\s+', ' ', soup.get_text(' ', strip=True))
-        pat = re.compile(
-            r'(Ends?\s+in\s+(?:(?:\d+)\s*(?:d|days?|h|hrs?|hours?|m|mins?|minutes?|s|secs?|seconds?)\s*){1,4})'
-            r'.{0,80}?'
-            r'((?:Monday|Mon|Tuesday|Tue(?:s)?|Wednesday|Wed|Thursday|Thu(?:rs?)?|Friday|Fri|Saturday|Sat|Sunday|Sun)'
-            r'\s*[,]?\s*\d{1,2}:\d{2}(?:\s*(?:AM|PM))?)',
-            re.I,
+    # Search-card fallback. В реальном логе eBay текст ровно такой:
+    # ``Time left 4d 14h left (Sat, 14:26)``. предыдущий regex видел строку, но искал
+    # только ``Ends in``, поэтому точный UTC candidate вообще не строился.
+    visible = re.sub(r'\s+', ' ', soup.get_text(' ', strip=True))
+    pat = re.compile(
+        rf'({relative_regex})\s*(?:left\b)?\s*[\(\[]?\s*.{{0,20}}?'
+        rf'({clock_regex})\s*[\)\]]?',
+        re.I,
+    )
+    for m in pat.finditer(visible):
+        pair = (m.group(1).strip(), m.group(2).strip())
+        if pair in seen_pairs:
+            continue
+        seen_pairs.add(pair)
+        candidates, diagnostic = _localized_clock_utc_candidates(
+            pair[0], pair[1], observed_at=observed
         )
-        for m in pat.finditer(visible):
-            pair = (m.group(1).strip(), m.group(2).strip())
-            if pair in seen_pairs:
-                continue
-            seen_pairs.add(pair)
-            candidates, diagnostic = _localized_clock_utc_candidates(
-                pair[0], pair[1], observed_at=observed
-            )
-            if candidates:
-                observations.append({
-                    'candidates': candidates,
-                    'relative': diagnostic['relative'],
-                    'clock': diagnostic['clock'],
-                    'observed_at': observed,
-                    'source': 'visible_timer',
-                })
+        if candidates:
+            observations.append({
+                'candidates': candidates,
+                'relative': diagnostic['relative'],
+                'clock': diagnostic['clock'],
+                'observed_at': observed,
+                'source': 'visible_timer',
+            })
     return observations
 
 
@@ -2738,7 +3007,7 @@ def _choose_unique_plausible_end(values, horizon_days=45):
 def _extract_structured_end_time(html, item_id=None):
     """Ищет exact UTC end time в plain/escaped structured data eBay.
 
-    V6.9 понимает HTML entities, JS-unicode escapes и новые semantic key names.
+    V6.10 понимает HTML entities, JS-unicode escapes и новые semantic key names.
     Whole-page fallback остаётся строгим: generic ``endTime`` по всей странице не
     принимается, чтобы recommendation cards не подменили основной лот.
     """
@@ -2890,7 +3159,7 @@ def _auction_timing_snippet(text, limit=220):
 def parse_auction_page(html, final_url):
     """Возвращает item_id, title, end_time_utc, source, status.
 
-    V6.9 считает достаточной подтверждённую абсолютную дату+время ДО МИНУТЫ.
+    V6.10 считает достаточной подтверждённую абсолютную дату+время ДО МИНУТЫ.
     Секунды больше не обязательны. Относительный countdown вроде "2d 5h" сам по
     себе по-прежнему не используется как точное время окончания.
     """
@@ -3009,31 +3278,47 @@ def _search_target_card_html(html, item_id):
     return None
 
 
-def parse_auction_search_fallback(html, item_id):
-    """Fallback verification через eBay search по item ID.
-
-    V6.9 принимает абсолютный end time до минуты из ТОЧНОЙ карточки нужного ItemID.
-    Это важное отличие от V6.7, который видел успешную search-page, но игнорировал
-    отображаемое eBay время без секунд.
-    """
+def _search_target_card_tag(html, item_id):
     if not html or not item_id:
         return None
     soup = BeautifulSoup(html, 'html.parser')
-    target_card = None
     for a in soup.find_all('a', href=True):
         href = str(a.get('href') or '')
         if str(item_id) not in href:
             continue
-        target_card = (
+        card = (
             a.find_parent('li', class_=lambda c: c and ('s-item' in str(c) or 's-card' in str(c)))
             or a.find_parent('div', class_=lambda c: c and 'su-card-container' in str(c))
         )
-        if target_card:
-            break
+        if card:
+            return card
+    return None
 
+
+def _search_card_title(target_card, item_id):
+    title = ''
+    if target_card:
+        title_node = target_card.select_one('.s-item__title, .s-card__title, .su-styled-text.primary')
+        if title_node:
+            title = re.sub(r'\s+', ' ', title_node.get_text(' ', strip=True)).strip()
+    return title[:300] or f'eBay item {item_id}'
+
+
+def parse_auction_search_fallback(html, item_id, observed_at=None):
+    """Точная verification через search-card конкретного ItemID.
+
+    V6.10 дополнительно понимает реальный формат ``Time left 4d 14h left
+    (Sat, 14:26)``. Даже если countdown округлён до часа, weekday+HH:MM позволяет
+    построить UTC-кандидаты для всех civil timezone offsets. Если кандидат ровно один,
+    это уже безопасная точность до минуты — геолокация proxy не требуется.
+    """
+    if not html or not item_id:
+        return None
+    target_card = _search_target_card_tag(html, item_id)
     if not target_card:
         return None
 
+    observed = _ensure_aware_utc(observed_at or datetime.now(timezone.utc))
     visible = re.sub(r'\s+', ' ', target_card.get_text(' ', strip=True))
     card_html = str(target_card)
     auction_marker = bool(
@@ -3045,13 +3330,11 @@ def parse_auction_search_fallback(html, item_id):
     if not auction_marker:
         return None
 
-    # 1) Exact/minute structured data inside only the target card.
     card_end, card_source, card_conflict = _extract_structured_end_time(card_html, item_id=item_id)
     if card_conflict:
         return None
 
-    # 2) Visible absolute Ends/Ending time in the target card. Seconds optional.
-    visible_end = _extract_visible_end_minute(visible)
+    visible_end = _extract_visible_end_minute(visible, observed_at=observed)
     if card_end and visible_end and not _auction_times_compatible(card_end, visible_end):
         return None
 
@@ -3062,13 +3345,21 @@ def parse_auction_search_fallback(html, item_id):
         end_time = visible_end.replace(second=0, microsecond=0)
         source = 'card:visible_end_minute'
     else:
-        # 3) Whole search HTML contextualized by exact ItemID.
         end_time, source, conflict = _extract_structured_end_time(html, item_id=item_id)
         if conflict:
             return None
         if not end_time:
+            # ВАЖНО: сначала современный localized timer самой target-card.
+            timer_end, timer_source, timer_obs = _resolve_localized_timer_evidence(
+                [card_html], observed_at=observed
+            )
+            _log_timer_observations(item_id, timer_obs, prefix='Auction search timer')
+            if timer_end:
+                end_time = timer_end
+                source = f'card:{timer_source}'
+        if not end_time:
             end_time, derived_source = _derive_exact_end_from_start_duration(
-                card_html, item_id=item_id, supporting_htmls=[html]
+                card_html, item_id=item_id, supporting_htmls=[html], observed_at=observed
             )
             if end_time:
                 source = derived_source
@@ -3079,66 +3370,54 @@ def parse_auction_search_fallback(html, item_id):
         )
         return None
 
-    title = ''
-    title_node = target_card.select_one('.s-item__title, .s-card__title, .su-styled-text.primary')
-    if title_node:
-        title = re.sub(r'\s+', ' ', title_node.get_text(' ', strip=True)).strip()
-    return str(item_id), title[:300] or f'eBay item {item_id}', end_time, f'search_fallback:{source}', 'active'
+    title = _search_card_title(target_card, item_id)
+    return str(item_id), title, end_time, f'search_fallback:{source}', 'active'
 
-def parse_auction_bid_history_fallback(html, item_id, supporting_htmls=None):
-    """Дополнительный fallback через eBay Bid History.
 
-    Секунды не обязательны. Sign-In HTML отсеивается ещё на fetch-уровне.
-    """
+def extract_coarse_auction_search_observation(html, item_id, observed_at=None):
+    """Возвращает безопасное coarse-окно, если exact minute пока недоступна."""
     if not html or not item_id:
-        return str(item_id) if item_id else None, f'eBay item {item_id or ""}'.strip(), None, 'bid_history_empty', 'no_exact_end_time'
-
-    soup = BeautifulSoup(html, 'html.parser')
-    visible = re.sub(r'\s+', ' ', soup.get_text(' ', strip=True))
-    title = ''
-    m = re.search(r'\bItem\s+title\s*:\s*(.+?)(?:\bTime\s+left\b|\bBid\s+history\b|$)', visible, re.I)
-    if m:
-        title = re.sub(r'\s+', ' ', m.group(1)).strip(' -|')[:300]
-    if not title:
-        title = f'eBay item {item_id}'
-
-    direct_exact, visible_kind = _extract_visible_exact_uk_end(visible)
-    direct_minute = _extract_visible_end_minute(visible)
-    structured_end, structured_source, conflict = _extract_structured_end_time(html, item_id=item_id)
-    if conflict:
-        return str(item_id), title, None, structured_source, 'time_conflict'
-
-    direct = direct_exact or direct_minute
-    if direct and structured_end and not _auction_times_compatible(direct, structured_end):
-        return str(item_id), title, None, 'bid_history_time_conflict', 'time_conflict'
-
-    if structured_end:
-        end = structured_end
-        source = f'bid_history:{structured_source}'
-    elif direct_exact:
-        end = direct_exact
-        source = 'bid_history_visible_exact_end'
-    elif direct_minute:
-        end = direct_minute.replace(second=0, microsecond=0)
-        source = 'bid_history_visible_end_minute'
-    else:
-        end, derived_source = _derive_exact_end_from_start_duration(
-            html,
-            item_id=item_id,
-            supporting_htmls=supporting_htmls,
-        )
-        source = f'bid_history:{derived_source}' if end else 'bid_history:none'
-
-    explicit_ended = bool(
-        visible_kind == 'ended'
-        or re.search(r'\bAuction\s+has\s+ended\b', visible, re.I)
-        or re.search(r'\bThis\s+listing\s+(?:has\s+)?ended\b', visible, re.I)
+        return None
+    target_card = _search_target_card_tag(html, item_id)
+    if not target_card:
+        return None
+    observed = _ensure_aware_utc(observed_at or datetime.now(timezone.utc))
+    visible = re.sub(r'\s+', ' ', target_card.get_text(' ', strip=True))
+    card_html = str(target_card)
+    active = bool(
+        re.search(r'\b\d+\s+bids?\b', visible, re.I)
+        or re.search(r'\btime\s+left\b', visible, re.I)
+        or re.search(r'\bplace\s+(?:a\s+)?bid\b', visible, re.I)
+        or _structured_auction_evidence(card_html, item_id=item_id)
     )
-    if not end:
-        return str(item_id), title, None, source, 'no_exact_end_time'
-    if explicit_ended or end <= datetime.now(timezone.utc):
-        return str(item_id), title, end, source, 'ended'
-    return str(item_id), title, end, source, 'active'
+    if not active:
+        return None
+    relative = _extract_relative_time_left(visible)
+    floor_window = _relative_floor_window(relative)
+    if not floor_window:
+        return None
+    low, high, vals = floor_window
+
+    unit_order = (('d', 'd'), ('h', 'h'), ('m', 'm'), ('s', 's'))
+    remaining_text = ' '.join(f"{vals[k]}{label}" for k, label in unit_order if k in vals)
+    clock_m = re.search(
+        r'\b(Monday|Mon|Tuesday|Tue(?:s)?|Wednesday|Wed|Thursday|Thu(?:rs?)?|Friday|Fri|Saturday|Sat|Sunday|Sun)\b'
+        r'\s*[,]?\s*\d{1,2}:\d{2}(?:\s*(?:AM|PM))?',
+        visible, re.I,
+    )
+    clock_text = clock_m.group(0).strip() if clock_m else ''
+    return {
+        'item_id': str(item_id),
+        'title': _search_card_title(target_card, item_id),
+        'observed_at': observed,
+        'low_seconds': low,
+        'high_seconds': high,
+        'values': vals,
+        'remaining_text': remaining_text,
+        'clock_text': clock_text,
+        'visible_snippet': _auction_timing_snippet(visible),
+    }
+
 
 def _future_reminder_labels(end_time_utc):
     remaining = (_ensure_aware_utc(end_time_utc) - datetime.now(timezone.utc)).total_seconds()
@@ -3149,22 +3428,279 @@ def _future_reminder_labels(end_time_utc):
     return labels
 
 
+def _auction_exact_search_url(item_id):
+    return (
+        "https://www.ebay.co.uk/sch/i.html?"
+        + urlencode({
+            '_nkw': str(item_id),
+            'LH_Auction': '1',
+            '_sop': '1',
+            '_ipg': '60',
+        })
+    )
+
+
+def extract_coarse_auction_page_observation(html, final_url, expected_item_id=None, observed_at=None):
+    if not html:
+        return None
+    observed = _ensure_aware_utc(observed_at or datetime.now(timezone.utc))
+    soup = BeautifulSoup(html, 'html.parser')
+    visible = re.sub(r'\s+', ' ', soup.get_text(' ', strip=True))
+    item_id = extract_ebay_item_id_any(final_url or '', html) or expected_item_id
+    if expected_item_id and item_id and str(item_id) != str(expected_item_id):
+        return None
+    if not item_id or not _page_has_active_auction_evidence(html, item_id=item_id):
+        return None
+    relative = _extract_relative_time_left(visible)
+    floor_window = _relative_floor_window(relative)
+    if not floor_window:
+        return None
+    low, high, vals = floor_window
+    h1 = soup.find('h1')
+    title = re.sub(r'\s+', ' ', h1.get_text(' ', strip=True)).strip() if h1 else ''
+    title = title[:300] or f'eBay item {item_id}'
+    remaining_text = ' '.join(
+        f"{vals[k]}{label}" for k, label in (('d','d'),('h','h'),('m','m'),('s','s')) if k in vals
+    )
+    clock_m = re.search(
+        r'\b(Monday|Mon|Tuesday|Tue(?:s)?|Wednesday|Wed|Thursday|Thu(?:rs?)?|Friday|Fri|Saturday|Sat|Sunday|Sun)\b'
+        r'\s*[,]?\s*\d{1,2}:\d{2}(?:\s*(?:AM|PM))?',
+        visible, re.I,
+    )
+    return {
+        'item_id': str(item_id),
+        'title': title,
+        'observed_at': observed,
+        'low_seconds': low,
+        'high_seconds': high,
+        'values': vals,
+        'remaining_text': remaining_text,
+        'clock_text': clock_m.group(0).strip() if clock_m else '',
+        'visible_snippet': _auction_timing_snippet(visible),
+    }
+
+
+def _format_pending_remaining_ru(remaining_text):
+    vals = {}
+    for number, unit in re.findall(r'(\d+)\s*([dhms])\b', str(remaining_text or ''), re.I):
+        vals[unit.lower()] = int(number)
+    parts = []
+    if 'd' in vals:
+        parts.append(f"{vals['d']} дн.")
+    if 'h' in vals:
+        parts.append(f"{vals['h']} ч.")
+    if 'm' in vals:
+        parts.append(f"{vals['m']} мин.")
+    if 's' in vals and 'd' not in vals:
+        parts.append(f"{vals['s']} сек.")
+    return ' '.join(parts) or str(remaining_text or 'уточняется')
+
+
+def _save_pending_from_observation(observation, original_url, notify=True, refined=False):
+    item_id = observation['item_id']
+    title = observation.get('title') or f'eBay item {item_id}'
+    canonical_url = f"https://www.ebay.co.uk/itm/{item_id}"
+    existing_exact = get_exact_auction_by_id(item_id)
+    if existing_exact:
+        if notify:
+            send_telegram_message(
+                "ℹ️ <b>Этот аукцион уже сохранён с точным временем.</b>\n\n"
+                f"🕒 Окончание по Киеву: <b>{format_kyiv_datetime(existing_exact[3])}</b>",
+                reply_markup=auction_message_keyboard(item_id, canonical_url),
+                disable_preview=True,
+            )
+        return 'existing_exact'
+    earliest, latest, next_check = save_pending_auction(
+        item_id=item_id,
+        url=canonical_url,
+        title=title,
+        observed_at_utc=observation.get('observed_at') or datetime.now(timezone.utc),
+        low_seconds=observation['low_seconds'],
+        high_seconds=observation['high_seconds'],
+        remaining_text=observation.get('remaining_text', ''),
+        clock_text=observation.get('clock_text', ''),
+    )
+    resolved_minute = _pending_window_single_minute(earliest, latest)
+    if resolved_minute and 'm' in (observation.get('values') or {}):
+        logging.info(
+            f"✅ Pending minute-window сошлось в одну UTC минуту: item={item_id}, "
+            f"end={resolved_minute.isoformat()}"
+        )
+        _finish_exact_auction_save(
+            item_id, title, resolved_minute,
+            'pending:relative_minute_window_consensus',
+            notify=(True if refined else notify),
+            refined=refined,
+        )
+        return 'exact'
+
+    logging.info(
+        f"🟡 Auction pending сохранён: item={item_id}, remaining={observation.get('remaining_text')!r}, "
+        f"window={earliest.isoformat()}..{latest.isoformat()}, next_check={next_check.isoformat()}"
+    )
+    if notify:
+        safe_title = html_lib.escape(title)
+        shown_remaining = _format_pending_remaining_ru(observation.get('remaining_text'))
+        next_local = next_check.astimezone(KYIV_TZ).strftime('%d.%m %H:%M')
+        send_telegram_message(
+            "🟡 <b>Аукцион сохранён для автоматического уточнения</b> 🇬🇧\n\n"
+            f"📦 <b>{safe_title}</b>\n\n"
+            f"⏳ eBay сейчас показывает: <b>{html_lib.escape(shown_remaining)}</b>\n"
+            "🕒 Точную минуту я не выдумываю и обычные 60/30/10/5-минутные reminders пока не запускаю.\n\n"
+            "✅ Лот и грубый остаток уже сохранены в PostgreSQL. Когда до конца останется меньше суток, "
+            "бот автоматически снова проверит точную карточку этого ItemID. Как только eBay даст минутную "
+            "точность (или timer+локальный clock однозначно сведутся к UTC), точное время по Киеву будет "
+            "сохранено и обычные напоминания включатся автоматически.\n"
+            f"🔎 Следующее плановое уточнение: <b>{next_local}</b> по Киеву.",
+            reply_markup=auction_message_keyboard(item_id, canonical_url),
+            disable_preview=True,
+        )
+    return 'pending'
+
+
+def _finish_exact_auction_save(item_id, title, end_time_utc, parse_source, notify=True, refined=False):
+    end_time_utc = _ensure_aware_utc(end_time_utc).replace(microsecond=0)
+    remaining = (end_time_utc - datetime.now(timezone.utc)).total_seconds()
+    canonical_url = f"https://www.ebay.co.uk/itm/{item_id}"
+    safe_title = html_lib.escape(title or f'eBay item {item_id}')
+    if remaining <= 0:
+        delete_pending_auction(item_id, wake=False)
+        if notify:
+            send_telegram_message(
+                "⌛ <b>Этот аукцион уже завершён.</b>\n\n"
+                f"🕒 Окончание по Киеву: <b>{format_kyiv_datetime(end_time_utc)}</b>"
+            )
+        return False
+    if remaining <= 5 * 60:
+        delete_pending_auction(item_id, wake=False)
+        if notify:
+            send_telegram_message(
+                "⚠️ <b>До окончания аукциона осталось меньше 5 минут</b> 🇬🇧\n\n"
+                f"📦 <b>{safe_title}</b>\n\n"
+                f"🕒 Окончание по Киеву: <b>{format_kyiv_datetime(end_time_utc)}</b>\n"
+                f"⏳ Осталось: <b>{format_remaining(remaining, with_seconds=False)}</b>\n\n"
+                "Последний плановый порог 5 минут уже наступил, поэтому reminder не создаю.",
+                reply_markup=auction_open_list_keyboard(canonical_url),
+                disable_preview=True,
+            )
+        return False
+
+    save_auction_reminder(item_id, canonical_url, title or f'eBay item {item_id}', end_time_utc)
+    mark_auction_status_checked(item_id)
+    labels = _future_reminder_labels(end_time_utc)
+    reminder_line = "🔔 Напомню: <b>" + ", ".join(labels) + "</b> до окончания." if labels else ''
+    if notify:
+        header = "✅ <b>Время аукциона уточнено и сохранено</b> 🇬🇧" if refined else "✅ <b>Аукцион сохранён</b> 🇬🇧"
+        send_telegram_message(
+            header + "\n\n"
+            f"📦 <b>{safe_title}</b>\n\n"
+            f"🕒 Окончание по Киеву: <b>{format_kyiv_datetime(end_time_utc)}</b>\n"
+            f"⏳ Осталось: <b>{format_remaining(remaining, with_seconds=False)}</b>\n"
+            f"{reminder_line}\n\n"
+            "✅ В PostgreSQL хранится точный UTC-момент до минуты. Proxy/страна отображения eBay на reminders "
+            "не влияют: 60/30/10/5 минут отправляются уже из сохранённого времени.",
+            reply_markup=auction_message_keyboard(item_id, canonical_url),
+            disable_preview=True,
+        )
+    logging.info(
+        f"⏰ Auction reminder сохранён: item={item_id}, end_utc={end_time_utc.isoformat()}, "
+        f"source={parse_source}; refined={refined}"
+    )
+    return True
+
+
+def _evaluate_search_pages_for_auction(search_pages, item_id):
+    exact = None
+    coarse = None
+    had_target = False
+    for search_html, _, proxy_used in search_pages:
+        observed = datetime.now(timezone.utc)
+        target = _search_target_card_tag(search_html, item_id)
+        if target:
+            had_target = True
+        result = parse_auction_search_fallback(search_html, item_id, observed_at=observed)
+        if result:
+            logging.info(
+                f"✅ Auction search-card подтвердил item={item_id}, end={result[2].isoformat()}, "
+                f"source={result[3]}, proxy={proxy_used}"
+            )
+            exact = result
+            break
+        observation = extract_coarse_auction_search_observation(
+            search_html, item_id, observed_at=observed
+        )
+        if observation:
+            logging.info(
+                f"🟡 Auction coarse search-card: item={item_id}, proxy={proxy_used}, "
+                f"remaining={observation['remaining_text']!r}, clock={observation['clock_text']!r}, "
+                f"text='{observation['visible_snippet']}'"
+            )
+            coarse = observation
+            break
+    return exact, coarse, had_target
+
+
+def _fetch_exact_item_search_pages(item_id, reserve_if_needed=True):
+    search_url = _auction_exact_search_url(item_id)
+    # Сначала ОДИН запрос: current fixed, если main сейчас свободен. Если он занят,
+    # fetch helper без ожидания берёт небольшой reserve. Никакого полного discovery.
+    pages = fetch_auction_pages(
+        search_url,
+        max_reserve_proxies=2,
+        connect_timeout=min(AUCTION_FETCH_CONNECT_TIMEOUT, 4.0),
+        read_timeout=min(AUCTION_FETCH_READ_TIMEOUT, 10.0),
+        max_pages=1,
+        canonicalize_item=False,
+        prefer_current_fixed=True,
+    )
+    exact, coarse, had_target = _evaluate_search_pages_for_auction(pages, item_id)
+    if exact or coarse or not reserve_if_needed:
+        return exact, coarse, had_target, pages
+
+    # Только если первая HTML вообще не дала target-card/timing — максимум две reserve
+    # страницы. Это существенно легче старого 8-proxy item-page + Bid History пути.
+    reserve_pages = fetch_auction_pages(
+        search_url,
+        max_reserve_proxies=2,
+        connect_timeout=min(AUCTION_FETCH_CONNECT_TIMEOUT, 4.0),
+        read_timeout=min(AUCTION_FETCH_READ_TIMEOUT, 10.0),
+        max_pages=2,
+        canonicalize_item=False,
+        prefer_current_fixed=False,
+    )
+    exact2, coarse2, had_target2 = _evaluate_search_pages_for_auction(reserve_pages, item_id)
+    return exact2, coarse2, had_target or had_target2, pages + reserve_pages
+
+
 def process_auction_link(url):
     if not _is_allowed_ebay_url(url):
         return
 
     expected_item_id = extract_ebay_item_id_any(url or '')
+
+    # 1) Самый лёгкий и полезный путь — exact search-card по ItemID. Именно здесь
+    # в реальном логе была строка ``Time left 4d 14h left (Sat, 14:26)``.
+    if expected_item_id:
+        exact, coarse, had_target, _ = _fetch_exact_item_search_pages(expected_item_id)
+        if exact:
+            item_id, title, end_time_utc, source, status = exact
+            return _finish_exact_auction_save(item_id, title, end_time_utc, source, notify=True)
+        if coarse:
+            return _save_pending_from_observation(coarse, url, notify=True)
+
+    # 2) Если search-card недоступна/изменилась, оставляем консервативный item-page
+    # fallback. Bid History больше НЕ вызываем: логи доказали redirect на Sign In и
+    # лишний proxy-трафик без полезного end time.
     pages = fetch_auction_pages(
         url,
-        max_reserve_proxies=AUCTION_FETCH_MAX_PROXIES,
-        max_pages=AUCTION_VERIFY_MAX_PAGES,
+        max_reserve_proxies=min(3, AUCTION_FETCH_MAX_PROXIES),
+        max_pages=min(2, AUCTION_VERIFY_MAX_PAGES),
+        prefer_current_fixed=False,
     )
 
     parsed_results = []
     timing_support_htmls = [html for html, _, _ in pages if html]
-    search_support_htmls = []
-    search_target_card_htmls = []
-    had_any_auction_html = bool(timing_support_htmls)
+    coarse_page_observation = None
     for html, final_url, proxy_used in pages:
         parse_url = final_url if extract_ebay_item_id_any(final_url or '') else url
         result = parse_auction_page(html, parse_url)
@@ -3179,20 +3715,17 @@ def process_auction_link(url):
             )
             continue
         parsed_results.append((result, proxy_used))
+        if not end_time_utc and not coarse_page_observation:
+            coarse_page_observation = extract_coarse_auction_page_observation(
+                html, parse_url, expected_item_id=expected_item_id, observed_at=datetime.now(timezone.utc)
+            )
 
-    # Выбираем положительно подтверждённый active auction с абсолютным временем минимум до минуты.
-    chosen = None
-    for result, proxy_used in parsed_results:
+    for result, _proxy_used in parsed_results:
         item_id, title, end_time_utc, parse_source, auction_status = result
         if auction_status == 'active' and item_id and end_time_utc:
-            chosen = result
-            break
+            return _finish_exact_auction_save(item_id, title, end_time_utc, parse_source, notify=True)
 
-    # V6.9: если structured timestamp скрыт, сводим современный ux-timer из нескольких
-    # независимых item-page. Время ``Monday, 18:42`` НЕ считаем London/UK автоматически:
-    # оно может быть локализовано. Countdown + weekday/HH:MM дают набор UTC-кандидатов,
-    # а разные proxy должны сойтись в одном UTC minute.
-    if chosen is None and timing_support_htmls:
+    if timing_support_htmls:
         timer_end, timer_source, timer_observations = _resolve_localized_timer_evidence(
             timing_support_htmls
         )
@@ -3208,214 +3741,53 @@ def process_auction_link(url):
             timer_item = expected_item_id or (representative[0] if representative else None)
             timer_title = (representative[1] if representative else '') or f'eBay item {timer_item}'
             if timer_item:
-                chosen = (timer_item, timer_title, timer_end, timer_source, 'active')
-                logging.info(
-                    f"✅ Auction ux-timer подтвердил item={timer_item}, "
-                    f"end={timer_end.isoformat()}, source={timer_source}"
+                return _finish_exact_auction_save(
+                    timer_item, timer_title, timer_end, timer_source, notify=True
                 )
 
-    # Fallback: search по точному item ID обычно легче открывается через бесплатный proxy,
-    # а в его карточке/embedded data может быть абсолютное время до минуты. Грубый countdown не используем.
-    fallback_item_id = expected_item_id
-    if not fallback_item_id:
-        for result, _ in parsed_results:
-            if result[0]:
-                fallback_item_id = result[0]
-                break
+    if coarse_page_observation:
+        return _save_pending_from_observation(coarse_page_observation, url, notify=True)
 
-    if chosen is None and fallback_item_id:
-        search_url = (
-            "https://www.ebay.co.uk/sch/i.html?"
-            + urlencode({
-                '_nkw': str(fallback_item_id),
-                'LH_Auction': '1',
-                '_sop': '1',
-                '_ipg': '60',
-            })
-        )
-        fallback_pages = fetch_auction_pages(
-            search_url,
-            max_reserve_proxies=min(4, AUCTION_FETCH_MAX_PROXIES),
-            connect_timeout=min(AUCTION_FETCH_CONNECT_TIMEOUT, 4.0),
-            read_timeout=min(AUCTION_FETCH_READ_TIMEOUT, 10.0),
-            max_pages=2,
-        )
-        for search_html, _, proxy_used in fallback_pages:
-            search_support_htmls.append(search_html)
-            target_card_html = _search_target_card_html(search_html, fallback_item_id)
-            if target_card_html:
-                search_target_card_htmls.append(target_card_html)
-            had_any_auction_html = True
-            fallback_result = parse_auction_search_fallback(search_html, fallback_item_id)
-            if fallback_result:
-                logging.info(
-                    f"✅ Auction search-fallback подтвердил item={fallback_item_id}, "
-                    f"end={fallback_result[2].isoformat()}, source={fallback_result[3]}, proxy={proxy_used}"
-                )
-                chosen = fallback_result
-                break
-            logging.info(
-                f"🧪 Auction search-fallback: item={fallback_item_id}, proxy={proxy_used}, end_minute=не найден"
-            )
-
-    # Search-card тоже может содержать тот же localized timer. Используем ТОЛЬКО
-    # HTML точной карточки ItemID, а не всю search page с соседними объявлениями.
-    if chosen is None and fallback_item_id and search_target_card_htmls:
-        timer_sources = timing_support_htmls + search_target_card_htmls
-        timer_end, timer_source, timer_observations = _resolve_localized_timer_evidence(timer_sources)
-        _log_timer_observations(fallback_item_id, timer_observations, prefix='Auction timer+search')
-        if timer_end and any(
-            _page_has_active_auction_evidence(h, item_id=fallback_item_id)
-            for h in timer_sources
-        ):
-            better_title = next(
-                (r[0][1] for r in parsed_results if r[0][1] and not r[0][1].startswith('eBay item ')),
-                f'eBay item {fallback_item_id}',
-            )
-            chosen = (fallback_item_id, better_title, timer_end, timer_source, 'active')
-            logging.info(
-                f"✅ Auction localized-timer consensus подтвердил item={fallback_item_id}, "
-                f"end={timer_end.isoformat()}, source={timer_source}"
-            )
-
-    # Дополнительный fallback без API-key: публичная Bid History page.
-    # В V6.9 секунды не обязательны; достаточно абсолютной даты + HH:MM.
-    # Redirect на eBay Sign In заранее отбрасывается как непригодный HTML.
-    if chosen is None and fallback_item_id:
-        bid_history_url = (
-            f"https://www.ebay.co.uk/bfl/viewbids/{fallback_item_id}"
-            f"?item={fallback_item_id}&rt=nc"
-        )
-        bid_pages = fetch_auction_pages(
-            bid_history_url,
-            max_reserve_proxies=min(4, AUCTION_FETCH_MAX_PROXIES),
-            connect_timeout=min(AUCTION_FETCH_CONNECT_TIMEOUT, 4.0),
-            read_timeout=min(AUCTION_FETCH_READ_TIMEOUT, 10.0),
-            max_pages=2,
-            canonicalize_item=False,
-        )
-        supports = timing_support_htmls + search_support_htmls
-        for bid_html, _, proxy_used in bid_pages:
-            had_any_auction_html = True
-            bid_result = parse_auction_bid_history_fallback(
-                bid_html, fallback_item_id, supporting_htmls=supports
-            )
-            logging.info(
-                f"🧪 Auction bid-history: proxy={proxy_used}, item={bid_result[0]}, "
-                f"status={bid_result[4]}, source={bid_result[3]}, "
-                f"end={bid_result[2].isoformat() if bid_result[2] else None}"
-            )
-            parsed_results.append((bid_result, proxy_used))
-            if bid_result[4] == 'active' and bid_result[2]:
-                # Сохраняем хороший title с item-page, если bid-history отдала лишь generic.
-                if bid_result[1].startswith('eBay item '):
-                    better_title = next(
-                        (r[0][1] for r in parsed_results if r[0][1] and not r[0][1].startswith('eBay item ')),
-                        bid_result[1],
-                    )
-                    bid_result = (bid_result[0], better_title, bid_result[2], bid_result[3], bid_result[4])
-                chosen = bid_result
-                break
-
-    if chosen is None:
-        if not had_any_auction_html:
-            send_telegram_message(
-                "❌ <b>Не удалось проверить аукцион</b>\n\n"
-                "eBay сейчас не дал открыть ни карточку, ни поисковую выдачу через доступные proxy. "
-                "Основной мониторинг продолжает работать. Попробуйте отправить ссылку ещё раз немного позже."
-            )
-            return
-
-        statuses = [result[4] for result, _ in parsed_results]
-        representative = parsed_results[0][0] if parsed_results else (None, '', None, 'none', 'unknown')
-        item_id, title, end_time_utc, parse_source, auction_status = representative
-
-        if 'time_conflict' in statuses:
-            send_telegram_message(
-                "⚠️ <b>eBay показал противоречивое время окончания.</b>\n\n"
-                "Я специально не сохраняю такой лот автоматически, чтобы не дать неверное напоминание. "
-                "Попробуйте отправить ссылку ещё раз через минуту."
-            )
-            return
-        if 'ended' in statuses:
-            ended_result = next(r for r, _ in parsed_results if r[4] == 'ended')
-            line = (
-                f"\n🕒 Окончание по Киеву: <b>{format_kyiv_datetime(ended_result[2])}</b>"
-                if ended_result[2] else ''
-            )
-            send_telegram_message("⌛ <b>Этот аукцион уже завершён.</b>" + line)
-            return
-        if 'not_auction' in statuses:
-            send_telegram_message(
-                "ℹ️ <b>Это не активный аукцион со ставками.</b>\n\n"
-                "Обычные товары Buy It Now / Best Offer без режима торгов в список напоминаний не сохраняются."
-            )
-            return
-
-        logging.warning(
-            f"Auction не подтверждён после {len(pages)} item-page вариантов, search и bid-history fallback; "
-            f"item={fallback_item_id}, statuses={statuses}"
-        )
+    if not pages:
         send_telegram_message(
-            "❌ <b>Не удалось подтвердить активный аукцион и время окончания до минуты.</b>\n\n"
-            "Я проверил несколько независимых proxy, eBay-выдачу по номеру лота и Bid History. "
-            "Секунды мне не нужны, но дата, час и минута должны быть подтверждены — грубый countdown не сохраняю."
+            "❌ <b>Не удалось проверить аукцион</b>\n\n"
+            "eBay сейчас не дал открыть ни точную search-card, ни карточку товара через доступные proxy. "
+            "Основной мониторинг продолжает работать. Попробуйте отправить ссылку ещё раз немного позже."
         )
         return
 
-    item_id, title, end_time_utc, parse_source, auction_status = chosen
-    end_time_utc = _ensure_aware_utc(end_time_utc)
-    remaining = (end_time_utc - datetime.now(timezone.utc)).total_seconds()
-    if remaining <= 0:
+    statuses = [result[4] for result, _ in parsed_results]
+    if 'time_conflict' in statuses:
         send_telegram_message(
-            "⌛ <b>Этот аукцион уже завершён.</b>\n\n"
-            f"🕒 Окончание по Киеву: <b>{format_kyiv_datetime(end_time_utc)}</b>"
+            "⚠️ <b>eBay показал противоречивое время окончания.</b>\n\n"
+            "Я не сохраняю случайную минуту. Лот можно отправить ещё раз чуть позже."
+        )
+        return
+    if 'ended' in statuses:
+        ended_result = next(r for r, _ in parsed_results if r[4] == 'ended')
+        line = (
+            f"\n🕒 Окончание по Киеву: <b>{format_kyiv_datetime(ended_result[2])}</b>"
+            if ended_result[2] else ''
+        )
+        send_telegram_message("⌛ <b>Этот аукцион уже завершён.</b>" + line)
+        return
+    if 'not_auction' in statuses:
+        send_telegram_message(
+            "ℹ️ <b>Это не активный аукцион со ставками.</b>\n\n"
+            "Buy It Now / Best Offer без режима торгов не сохраняется."
         )
         return
 
-    canonical_url = f"https://www.ebay.co.uk/itm/{item_id}"
-    safe_title = html_lib.escape(title)
-
-    if remaining <= 5 * 60:
-        send_telegram_message(
-            "⚠️ <b>До окончания аукциона осталось меньше 5 минут</b> 🇬🇧\n\n"
-            f"📦 <b>{safe_title}</b>\n\n"
-            f"🕒 Окончание по Киеву: <b>{format_kyiv_datetime(end_time_utc)}</b>\n"
-            f"⏳ Осталось: <b>{format_remaining(remaining)}</b>\n\n"
-            "В список напоминаний не добавляю: последний плановый порог 5 минут уже наступил.",
-            reply_markup=auction_open_list_keyboard(canonical_url),
-            disable_preview=True,
-        )
-        return
-
-    save_auction_reminder(item_id, canonical_url, title, end_time_utc)
-    mark_auction_status_checked(item_id)
-
-    labels = _future_reminder_labels(end_time_utc)
-    if labels:
-        reminder_line = "🔔 Напомню: <b>" + ", ".join(labels) + "</b> до окончания."
-    else:
-        reminder_line = "⚠️ До конца меньше 5 минут — плановые напоминания уже прошли."
-
-    message = (
-        "✅ <b>Аукцион сохранён</b> 🇬🇧\n\n"
-        f"📦 <b>{safe_title}</b>\n\n"
-        f"🕒 Окончание по Киеву: <b>{format_kyiv_datetime(end_time_utc)}</b>\n"
-        f"⏳ Осталось: <b>{format_remaining(remaining)}</b>\n"
-        f"{reminder_line}\n\n"
-        "✅ Дата и время окончания подтверждены до минуты и сохранены в PostgreSQL.\n"
-        "⏰ <b>Напоминания работают независимо от eBay proxy:</b> в момент 60/30/10/5 минут "
-        "боту не нужно повторно открывать страницу eBay."
+    logging.warning(
+        f"Auction не подтверждён после lightweight search и {len(pages)} item-page вариантов; "
+        f"item={expected_item_id}, statuses={statuses}. Bid History намеренно не используется."
     )
     send_telegram_message(
-        message,
-        reply_markup=auction_message_keyboard(item_id, canonical_url),
-        disable_preview=True,
+        "❌ <b>Не удалось получить даже надёжный остаток времени этого аукциона.</b>\n\n"
+        "Bid History/Sign In больше не открываю. Если eBay даст хотя бы дни+часы, лот будет сохранён как pending "
+        "и автоматически уточнён позже; точную минуту я не угадываю."
     )
-    logging.info(
-        f"⏰ Auction reminder сохранён: item={item_id}, end_utc={end_time_utc.isoformat()}, "
-        f"source={parse_source}; scheduler независим от eBay proxy"
-    )
+
 
 def auction_link_worker():
     logging.info("🔗 Worker ссылок на eBay-аукционы запущен")
@@ -3436,34 +3808,58 @@ def auction_link_worker():
 
 def send_auction_list():
     try:
-        rows = list_active_auctions(limit=20)
+        exact_rows = list_active_auctions(limit=20)
+        pending_rows = list_pending_auctions(limit=20)
     except Exception as e:
         logging.error(f"Не удалось получить список аукционов: {e}")
         send_telegram_message("❌ Не удалось сейчас прочитать список аукционов из базы.")
         return
 
-    if not rows:
-        send_telegram_message("📭 <b>Активных аукционов для напоминаний сейчас нет.</b>")
+    if not exact_rows and not pending_rows:
+        send_telegram_message("📭 <b>Активных аукционов сейчас нет.</b>")
         return
 
     now = datetime.now(timezone.utc)
+    entries = []
+    for row in exact_rows:
+        entries.append(('exact', _ensure_aware_utc(row[3]), row))
+    for row in pending_rows:
+        entries.append(('pending', _ensure_aware_utc(row[3]), row))
+    entries.sort(key=lambda x: x[1])
+    entries = entries[:20]
+
     parts = ["⏰ <b>Мои аукционы eBay UK</b> 🇬🇧\n"]
     keyboard = []
-    for idx, (item_id, url, title, end_time) in enumerate(rows, 1):
-        end_time = _ensure_aware_utc(end_time)
-        remaining = max(0, (end_time - now).total_seconds())
-        short_title = title if len(title) <= 70 else title[:67] + '…'
-        parts.append(
-            f"\n<b>{idx}.</b> {html_lib.escape(short_title)}\n"
-            f"🕒 <b>{format_kyiv_datetime(end_time)}</b>\n"
-            f"⏳ {format_remaining(remaining, with_seconds=False)}"
-        )
+    for idx, (kind, _sort_time, row) in enumerate(entries, 1):
+        if kind == 'exact':
+            item_id, url, title, end_time = row
+            end_time = _ensure_aware_utc(end_time)
+            remaining = max(0, (end_time - now).total_seconds())
+            short_title = title if len(title) <= 70 else title[:67] + '…'
+            parts.append(
+                f"\n<b>{idx}.</b> {html_lib.escape(short_title)}\n"
+                f"🟢 Точное время: <b>{format_kyiv_datetime(end_time)}</b>\n"
+                f"⏳ {format_remaining(remaining, with_seconds=False)}"
+            )
+        else:
+            item_id, url, title, earliest, latest, remaining_text, clock_text, next_check = row
+            short_title = title if len(title) <= 70 else title[:67] + '…'
+            shown = _format_pending_remaining_ru(remaining_text)
+            next_local = _ensure_aware_utc(next_check).astimezone(KYIV_TZ).strftime('%d.%m %H:%M')
+            parts.append(
+                f"\n<b>{idx}.</b> {html_lib.escape(short_title)}\n"
+                f"🟡 Точное время уточняется\n"
+                f"⏳ eBay: <b>{html_lib.escape(shown)}</b>\n"
+                f"🔎 Следующая проверка: <b>{next_local}</b>"
+            )
         keyboard.append([
             {'text': f'🔗 Открыть #{idx}', 'url': url},
             {'text': f'❌ Удалить #{idx}', 'callback_data': f'aucdel:{item_id}'},
         ])
 
-    parts.append("\n\nНажмите ❌ возле нужного аукциона — номер вводить вручную не нужно.")
+    parts.append(
+        "\n\n🟢 — точная минута уже сохранена; 🟡 — бот запомнил грубый countdown и уточнит его автоматически."
+    )
     send_telegram_message(
         ''.join(parts),
         reply_markup={'inline_keyboard': keyboard},
@@ -3512,8 +3908,6 @@ def verify_saved_auction(item_id, url, title, expected_end, max_reserve_proxies=
 
     parse_url = final_url if extract_ebay_item_id_any(final_url or '') else url
     parsed_id, parsed_title, parsed_end, source, status = parse_auction_page(html, parse_url)
-    if proxy_used and parsed_id:
-        proxy_manager.mark_success(proxy_used)
     if parsed_id and parsed_id != item_id:
         logging.warning(f"Auction status mismatch: expected {item_id}, page {parsed_id}")
         return 'unverified'
@@ -3562,16 +3956,75 @@ def verify_saved_auction(item_id, url, title, expected_end, max_reserve_proxies=
     return status
 
 
+def refine_pending_auction(item_id, url, title, end_earliest, end_latest, remaining_text='', clock_text=''):
+    """Уточняет pending только lightweight search-card запросом; Bid History не нужен."""
+    exact, coarse, had_target, pages = _fetch_exact_item_search_pages(item_id)
+    if exact:
+        exact_id, exact_title, exact_end, source, status = exact
+        logging.info(
+            f"✅ Pending auction уточнён: item={item_id}, end={exact_end.isoformat()}, source={source}"
+        )
+        return 'exact' if _finish_exact_auction_save(
+            exact_id, exact_title or title, exact_end, source, notify=True, refined=True
+        ) else 'finished'
+
+    if coarse:
+        pending_state = _save_pending_from_observation(coarse, url, notify=False, refined=True)
+        if pending_state == 'exact':
+            return 'exact'
+        logging.info(
+            f"🟡 Pending auction пока coarse: item={item_id}, remaining={coarse['remaining_text']!r}; "
+            f"следующая проверка будет рассчитана заново"
+        )
+        return 'coarse'
+
+    # Network/HTML ambiguity никогда не удаляет pending. Повторяем позже.
+    postpone_pending_auction(item_id, AUCTION_PENDING_RETRY)
+    logging.info(
+        f"🟡 Pending auction {item_id}: точная search-card пока недоступна; "
+        f"повтор через {AUCTION_PENDING_RETRY} сек."
+    )
+    return 'unverified'
+
+
+def _cleanup_stale_pending_auctions():
+    """Чистит только окна, которые гарантированно закончились >30 мин назад."""
+    with get_db_connection('ebay_uk_auction_pending_cleanup') as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM auction_pending
+                WHERE end_latest_utc <= NOW() - INTERVAL '30 minutes'
+                RETURNING item_id, title
+                """
+            )
+            rows = cur.fetchall()
+        conn.commit()
+    if rows:
+        logging.info(f"🧹 Удалено просроченных pending-аукционов: {len(rows)}")
+    return rows
+
+
 def auction_status_worker():
-    """Лёгкая проверка досрочно закрытых лотов до 5-минутного reminder."""
+    """Контроль exact-аукционов + редкое автоматическое уточнение pending."""
     logging.info("🛰 Worker контроля сохранённых аукционов запущен")
     db_ready_event.wait()
     while True:
         try:
-            # Когда основной монитор уже имеет проблемы с eBay, не добавляем лишний трафик.
             elapsed, _, had_success = _connection_outage_snapshot()
             healthy = is_paused or (had_success and elapsed < 180)
             if healthy:
+                # Сначала максимум ОДИН pending: это редкая лёгкая search-card проверка.
+                pending_rows = get_due_pending_auctions(limit=1)
+                for row in pending_rows:
+                    item_id, url, title, earliest, latest, remaining_text, clock_text, _next_check = row
+                    refine_pending_auction(
+                        item_id, url, title,
+                        _ensure_aware_utc(earliest), _ensure_aware_utc(latest),
+                        remaining_text, clock_text,
+                    )
+                    time.sleep(random.uniform(0.6, 1.0))
+
                 rows = get_auctions_for_status_check(limit=100)
                 now = datetime.now(timezone.utc)
                 due = []
@@ -3580,7 +4033,6 @@ def auction_status_worker():
                     remaining = (end_time - now).total_seconds()
                     interval = _status_check_interval_seconds(remaining)
                     if interval is None:
-                        # После 5 минут запись должен завершить reminder worker.
                         continue
                     if last_check is None or (now - _ensure_aware_utc(last_check)).total_seconds() >= interval:
                         due.append((item_id, url, title, end_time))
@@ -3594,6 +4046,8 @@ def auction_status_worker():
                         notify_time_change=True,
                     )
                     time.sleep(random.uniform(0.8, 1.4))
+
+                _cleanup_stale_pending_auctions()
         except Exception as e:
             logging.error(f"Ошибка auction status worker: {e}", exc_info=True)
         auction_status_wakeup_event.wait(timeout=AUCTION_STATUS_TICK)
@@ -3617,7 +4071,7 @@ def handle_telegram_callback(callback):
     m = re.fullmatch(r'aucdel:(\d{9,19})', data)
     if m:
         item_id = m.group(1)
-        if delete_auction_reminder(item_id):
+        if delete_auction_any(item_id):
             answer_callback_query(callback_id, "Аукцион удалён ✅")
             edit_message_reply_markup(message.get('message_id'), auction_list_only_keyboard())
         else:
@@ -3833,8 +4287,8 @@ def telegram_listener():
                                     send_telegram_message("Использование: <code>/delauction НОМЕР_ЛОТА</code>")
                                 else:
                                     item_id = parts[1].strip()
-                                    if delete_auction_reminder(item_id):
-                                        send_telegram_message(f"❌ Напоминание для лота <b>{item_id}</b> удалено.")
+                                    if delete_auction_any(item_id):
+                                        send_telegram_message(f"❌ Аукцион <b>{item_id}</b> удалён из списка.")
                                     else:
                                         send_telegram_message(f"ℹ️ Активный лот <b>{item_id}</b> в списке не найден.")
                             else:
@@ -4108,12 +4562,13 @@ def fetch_ebay_html_with_fixed_pair():
 
         old_proxy = fixed_proxy
         old_profile = fixed_profile
-        result, html, returned_session = _make_request(
-            old_proxy,
-            old_profile,
-            session=fixed_session,
-            timeout=(FIXED_CONNECT_TIMEOUT, FIXED_READ_TIMEOUT),
-        )
+        with main_fixed_request_lock:
+            result, html, returned_session = _make_request(
+                old_proxy,
+                old_profile,
+                session=fixed_session,
+                timeout=(FIXED_CONNECT_TIMEOUT, FIXED_READ_TIMEOUT),
+            )
 
         if result == 'success':
             fixed_session = returned_session
@@ -4132,12 +4587,13 @@ def fetch_ebay_html_with_fixed_pair():
             fixed_session = None
             time.sleep(random.uniform(0.4, 0.8))
 
-            retry_result, retry_html, retry_session = _make_request(
-                old_proxy,
-                old_profile,
-                session=None,
-                timeout=(FIXED_RECOVERY_CONNECT_TIMEOUT, FIXED_RECOVERY_READ_TIMEOUT),
-            )
+            with main_fixed_request_lock:
+                retry_result, retry_html, retry_session = _make_request(
+                    old_proxy,
+                    old_profile,
+                    session=None,
+                    timeout=(FIXED_RECOVERY_CONNECT_TIMEOUT, FIXED_RECOVERY_READ_TIMEOUT),
+                )
             if retry_result == 'success':
                 fixed_proxy = old_proxy
                 fixed_profile = old_profile
@@ -4168,7 +4624,7 @@ def fetch_ebay_html_with_fixed_pair():
 
         logging.info("Ищем новую рабочую пару...")
 
-    # 2) Rolling discovery V6.9: 4 worker сразу -> 5 после 10 сек.
+    # 2) Rolling discovery V6.10: 4 worker сразу -> 5 после 10 сек.
     # Emergency ProxyScrape timeout=3000 автоматически добавляется, если быстрый пул
     # явно плохой/истощён. Hard cooldown никогда не снимаются.
     # На свежем старте сначала ОБЯЗАТЕЛЬНО загружаем обычный Render PROXY_LIST
@@ -5166,7 +5622,7 @@ def bot_worker():
     seen_line = f"\n📚 В базе: {seen_total} товаров." if seen_total is not None else ""
     send_telegram_message(
         startup_line +
-        "\n🇬🇧 eBay UK monitor v6.9 работает." +
+        "\n🇬🇧 eBay UK monitor v6.10 работает." +
         seen_line +
         "\nКоманды: /stop /start /list (/auctions) /delauction НОМЕР_ЛОТА"
         "\nМожно отправить ссылку на eBay-аукцион — сохраню точное время и напомню заранее.",
@@ -5250,7 +5706,7 @@ def leader_supervisor():
 @app.route('/')
 def index():
     role = "leader" if leader_active_event.is_set() else "standby"
-    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.9, {role})"
+    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.10, {role})"
 
 
 @app.route('/health')
