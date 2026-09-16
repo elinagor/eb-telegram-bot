@@ -7,7 +7,6 @@ import re
 import json
 import threading
 import logging
-import queue
 import html as html_lib
 import hashlib
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
@@ -166,6 +165,13 @@ AUCTION_PENDING_MIN_DELAY = max(60, int(os.getenv("AUCTION_PENDING_MIN_DELAY", "
 AUCTION_PENDING_WINDOW_MARGIN = max(30, int(os.getenv("AUCTION_PENDING_WINDOW_MARGIN", "120")))
 AUCTION_PENDING_MINUTE_MARGIN = max(5, int(os.getenv("AUCTION_PENDING_MINUTE_MARGIN", "15")))
 
+# Пользовательские auction-ссылки храним в PostgreSQL до успешной проверки.
+# Если прямо сейчас нет рабочего proxy, ссылка НЕ отклоняется и НЕ теряется при deploy/restart:
+# worker откладывает её с мягким backoff и параллельно может обработать следующие ссылки.
+AUCTION_LINK_RETRY_BASE = max(10, int(os.getenv("AUCTION_LINK_RETRY_BASE", "15")))
+AUCTION_LINK_RETRY_MAX = max(AUCTION_LINK_RETRY_BASE, int(os.getenv("AUCTION_LINK_RETRY_MAX", "60")))
+AUCTION_LINK_WORKER_IDLE = max(2, int(os.getenv("AUCTION_LINK_WORKER_IDLE", "5")))
+
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 LONDON_TZ = ZoneInfo("Europe/London")
 
@@ -285,10 +291,10 @@ app = Flask(__name__)
 
 is_paused = False
 
-# Telegram listener только кладёт ссылку в очередь и сразу возвращается к getUpdates.
-# Тяжёлое получение страницы eBay выполняется отдельным ОДНИМ worker'ом, чтобы
-# пользовательские ссылки не создавали параллельный burst и не мешали основному monitor.
-auction_add_queue = queue.Queue(maxsize=100)
+# Telegram listener сохраняет auction-ссылку в PostgreSQL и сразу возвращается к getUpdates.
+# Тяжёлое получение страницы eBay выполняется отдельным ОДНИМ worker'ом. Если proxy
+# временно нет, job остаётся в БД и переживает deploy/restart, а следующие ссылки не блокируются.
+auction_link_wakeup_event = threading.Event()
 auction_reminder_wakeup_event = threading.Event()
 auction_status_wakeup_event = threading.Event()
 db_ready_event = threading.Event()
@@ -1235,6 +1241,29 @@ def init_db():
                 "CREATE INDEX IF NOT EXISTS idx_auction_pending_next_check "
                 "ON auction_pending (next_check)"
             )
+            cur.execute(
+                "ALTER TABLE auction_pending "
+                "ADD COLUMN IF NOT EXISTS status_message_id BIGINT NULL"
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS auction_link_queue (
+                    queue_key TEXT PRIMARY KEY,
+                    item_id TEXT NULL,
+                    url TEXT NOT NULL,
+                    status_message_id BIGINT NULL,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT NOT NULL DEFAULT '',
+                    next_attempt TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_auction_link_queue_next_attempt "
+                "ON auction_link_queue (next_attempt, created_at)"
+            )
         conn.commit()
 
 
@@ -1483,6 +1512,199 @@ def delete_auction_reminder(item_id):
 
 
 
+def _auction_queue_key(url, item_id=None):
+    item_id = str(item_id or '').strip()
+    if item_id:
+        return f"item:{item_id}"
+    digest = hashlib.sha256(str(url or '').encode('utf-8', 'ignore')).hexdigest()[:32]
+    return f"url:{digest}"
+
+
+def enqueue_auction_link(url):
+    """Надёжно ставит пользовательскую auction-ссылку в PostgreSQL-очередь.
+
+    Повторная отправка того же ItemID не создаёт второй job. Уже существующий job
+    просто будится немедленно, при этом его Telegram status_message_id сохраняется.
+    """
+    item_id = extract_ebay_item_id_any(url or '')
+    canonical = f"https://www.ebay.co.uk/itm/{item_id}" if item_id else str(url or '')
+    key = _auction_queue_key(canonical, item_id)
+    with get_db_connection('ebay_uk_auction_link_enqueue') as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT status_message_id FROM auction_link_queue WHERE queue_key=%s FOR UPDATE",
+                (key,),
+            )
+            row = cur.fetchone()
+            existing_message_id = row[0] if row else None
+            if row:
+                cur.execute(
+                    """
+                    UPDATE auction_link_queue
+                    SET item_id=%s, url=%s, next_attempt=NOW(), updated_at=NOW()
+                    WHERE queue_key=%s
+                    """,
+                    (item_id, canonical, key),
+                )
+                is_new = False
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO auction_link_queue (queue_key, item_id, url, next_attempt)
+                    VALUES (%s,%s,%s,NOW())
+                    """,
+                    (key, item_id, canonical),
+                )
+                is_new = True
+        conn.commit()
+    auction_link_wakeup_event.set()
+    return key, item_id, canonical, existing_message_id, is_new
+
+
+def set_auction_link_status_message(queue_key, message_id):
+    if not queue_key or not message_id:
+        return False
+    with get_db_connection('ebay_uk_auction_link_message') as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE auction_link_queue
+                SET status_message_id=%s, updated_at=NOW()
+                WHERE queue_key=%s
+                """,
+                (int(message_id), queue_key),
+            )
+            changed = cur.rowcount > 0
+        conn.commit()
+    return changed
+
+
+def get_due_auction_link_jobs(limit=1):
+    with get_db_connection('ebay_uk_auction_link_due') as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT queue_key, item_id, url, status_message_id, attempt_count, created_at
+                FROM auction_link_queue
+                WHERE next_attempt <= NOW()
+                ORDER BY next_attempt ASC, created_at ASC
+                LIMIT %s
+                """,
+                (max(1, int(limit)),),
+            )
+            return cur.fetchall()
+
+
+def list_queued_auction_links(limit=20):
+    with get_db_connection('ebay_uk_auction_link_list') as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT item_id, url, created_at, next_attempt
+                FROM auction_link_queue
+                WHERE item_id IS NOT NULL
+                ORDER BY created_at ASC
+                LIMIT %s
+                """,
+                (max(1, int(limit)),),
+            )
+            return cur.fetchall()
+
+
+def postpone_auction_link_job(queue_key, attempt_count, reason='temporary_unavailable'):
+    attempt_count = max(0, int(attempt_count or 0)) + 1
+    # 15 -> 30 -> 60 сек., затем держим максимум 60. Небольшой jitter не создаёт
+    # синхронный ритм и не мешает следующей ссылке в очереди получить свой шанс.
+    delay = min(AUCTION_LINK_RETRY_MAX, AUCTION_LINK_RETRY_BASE * (2 ** min(attempt_count - 1, 2)))
+    delay = max(AUCTION_LINK_RETRY_BASE, int(delay + random.uniform(0, min(5, delay * 0.15))))
+    with get_db_connection('ebay_uk_auction_link_retry') as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE auction_link_queue
+                SET attempt_count=%s,
+                    last_error=%s,
+                    next_attempt=NOW() + (%s * INTERVAL '1 second'),
+                    updated_at=NOW()
+                WHERE queue_key=%s
+                """,
+                (attempt_count, str(reason or '')[:300], delay, queue_key),
+            )
+        conn.commit()
+    logging.info(
+        f"🟡 Auction link остаётся в очереди: key={queue_key}, attempt={attempt_count}, "
+        f"повтор примерно через {delay} сек.; reason={reason}"
+    )
+    return delay
+
+
+def delete_auction_link_job(queue_key):
+    with get_db_connection('ebay_uk_auction_link_delete') as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM auction_link_queue WHERE queue_key=%s RETURNING queue_key", (queue_key,))
+            deleted = cur.fetchone() is not None
+        conn.commit()
+    return deleted
+
+
+def transfer_auction_link_status_to_pending(item_id):
+    """Страховочная DB-передача message_id перед удалением queue-row."""
+    if not item_id:
+        return False
+    with get_db_connection('ebay_uk_auction_link_message_transfer') as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE auction_pending AS p
+                SET status_message_id = COALESCE(p.status_message_id, q.status_message_id),
+                    updated_at = NOW()
+                FROM auction_link_queue AS q
+                WHERE p.item_id=%s
+                  AND q.item_id=p.item_id
+                  AND q.status_message_id IS NOT NULL
+                """,
+                (str(item_id),),
+            )
+            changed = cur.rowcount > 0
+        conn.commit()
+    return changed
+
+
+def get_auction_link_status_message(item_id):
+    if not item_id:
+        return None
+    with get_db_connection('ebay_uk_auction_link_message_get') as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT status_message_id FROM auction_link_queue WHERE item_id=%s ORDER BY created_at DESC LIMIT 1",
+                (str(item_id),),
+            )
+            row = cur.fetchone()
+            return row[0] if row else None
+
+
+def get_pending_status_message(item_id):
+    with get_db_connection('ebay_uk_auction_pending_message_get') as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT status_message_id FROM auction_pending WHERE item_id=%s", (str(item_id),))
+            row = cur.fetchone()
+            return row[0] if row else None
+
+
+def set_pending_status_message(item_id, message_id):
+    if not item_id or not message_id:
+        return False
+    with get_db_connection('ebay_uk_auction_pending_message_set') as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE auction_pending SET status_message_id=%s, updated_at=NOW() WHERE item_id=%s",
+                (int(message_id), str(item_id)),
+            )
+            changed = cur.rowcount > 0
+        conn.commit()
+    return changed
+
+
 def _pending_next_check(now_utc, end_latest_utc, window_seconds):
     now_utc = _ensure_aware_utc(now_utc)
     end_latest_utc = _ensure_aware_utc(end_latest_utc)
@@ -1656,29 +1878,49 @@ def delete_pending_auction(item_id, wake=True):
 
 
 def delete_auction_any(item_id):
-    """Удаляет и exact reminder, и pending-refinement одной командой/callback."""
+    """Удаляет exact, pending и ещё не проверенный queue-job одного ItemID."""
     with get_db_connection('ebay_uk_auction_delete_any') as conn:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM auction_reminders WHERE item_id=%s RETURNING item_id", (item_id,))
             exact = cur.fetchone() is not None
             cur.execute("DELETE FROM auction_pending WHERE item_id=%s RETURNING item_id", (item_id,))
             pending = cur.fetchone() is not None
+            cur.execute("DELETE FROM auction_link_queue WHERE item_id=%s RETURNING queue_key", (item_id,))
+            queued = cur.fetchone() is not None
         conn.commit()
     wake_auction_workers()
-    return exact or pending
+    auction_link_wakeup_event.set()
+    return exact or pending or queued
 
 
 def delete_all_auctions():
-    """Удаляет ВСЕ exact и pending аукционы одной транзакцией после явного подтверждения."""
+    """Удаляет exact, pending и waiting queue одной транзакцией после подтверждения."""
+    status_message_ids = []
     with get_db_connection('ebay_uk_auction_delete_all') as conn:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM auction_reminders RETURNING item_id")
             exact = [row[0] for row in cur.fetchall()]
-            cur.execute("DELETE FROM auction_pending RETURNING item_id")
-            pending = [row[0] for row in cur.fetchall()]
+            cur.execute("DELETE FROM auction_pending RETURNING item_id, status_message_id")
+            pending_rows = cur.fetchall()
+            pending = [row[0] for row in pending_rows]
+            status_message_ids.extend(row[1] for row in pending_rows if row[1])
+            cur.execute("DELETE FROM auction_link_queue RETURNING queue_key, status_message_id")
+            queued_rows = cur.fetchall()
+            queued = [row[0] for row in queued_rows]
+            status_message_ids.extend(row[1] for row in queued_rows if row[1])
         conn.commit()
+
+    # Удаляем только технические жёлтые status-сообщения. Exact/reminder сообщения
+    # не трогаем: у них нет отдельного transient message_id в БД.
+    for message_id in dict.fromkeys(status_message_ids):
+        try:
+            delete_telegram_message(message_id)
+        except Exception as e:
+            logging.warning(f"Не удалось удалить auction status message_id={message_id}: {e}")
+
     wake_auction_workers()
-    return len(exact), len(pending)
+    auction_link_wakeup_event.set()
+    return len(exact), len(pending), len(queued)
 
 
 def mark_auction_status_checked(item_id):
@@ -1881,22 +2123,7 @@ def _telegram_post(method, payload, timeout=10, max_attempts=3):
     return None
 
 
-def send_telegram_message(
-    message,
-    parse_mode='HTML',
-    reply_markup=None,
-    disable_preview=False,
-    preview_url=None,
-    preview_small=True,
-):
-    payload = {
-        'chat_id': TELEGRAM_CHAT_ID,
-        'text': message,
-        'parse_mode': parse_mode,
-    }
-    # Bot API LinkPreviewOptions позволяет явно указать URL для preview, даже когда
-    # длинную ссылку не хочется печатать в тексте. Для eBay просим компактную карточку
-    # с миниатюрой; окончательный вид всё равно выбирает Telegram/eBay metadata.
+def _apply_link_preview_payload(payload, disable_preview=False, preview_url=None, preview_small=True):
     if preview_url and not disable_preview:
         payload['link_preview_options'] = {
             'is_disabled': False,
@@ -1907,10 +2134,129 @@ def send_telegram_message(
     else:
         payload['disable_web_page_preview'] = bool(disable_preview)
 
+
+def send_telegram_message(
+    message,
+    parse_mode='HTML',
+    reply_markup=None,
+    disable_preview=False,
+    preview_url=None,
+    preview_small=True,
+    return_message_id=False,
+):
+    payload = {
+        'chat_id': TELEGRAM_CHAT_ID,
+        'text': message,
+        'parse_mode': parse_mode,
+    }
+    _apply_link_preview_payload(payload, disable_preview, preview_url, preview_small)
     if reply_markup is not None:
         payload['reply_markup'] = reply_markup
     result = _telegram_post('sendMessage', payload, timeout=10, max_attempts=3)
+    ok = bool(result and result.get('ok', True))
+    if return_message_id:
+        if not ok:
+            return None
+        try:
+            return int((result.get('result') or {}).get('message_id'))
+        except Exception:
+            return None
+    return ok
+
+
+def edit_telegram_message(
+    message_id,
+    message,
+    parse_mode='HTML',
+    reply_markup=None,
+    disable_preview=False,
+    preview_url=None,
+    preview_small=True,
+):
+    """Безопасно заменяет собственное status-сообщение бота новым содержимым."""
+    if not message_id:
+        return False
+    payload = {
+        'chat_id': TELEGRAM_CHAT_ID,
+        'message_id': int(message_id),
+        'text': message,
+        'parse_mode': parse_mode,
+    }
+    _apply_link_preview_payload(payload, disable_preview, preview_url, preview_small)
+    if reply_markup is not None:
+        payload['reply_markup'] = reply_markup
+    result = _telegram_post('editMessageText', payload, timeout=10, max_attempts=2)
     return bool(result and result.get('ok', True))
+
+
+def delete_telegram_message(message_id):
+    if not message_id:
+        return False
+    result = _telegram_post(
+        'deleteMessage',
+        {'chat_id': TELEGRAM_CHAT_ID, 'message_id': int(message_id)},
+        timeout=8,
+        max_attempts=2,
+    )
+    return bool(result and result.get('ok', True))
+
+
+def publish_auction_status(
+    item_id,
+    message,
+    reply_markup=None,
+    disable_preview=False,
+    preview_url=None,
+    preview_small=True,
+    existing_message_id=None,
+    persist_pending=False,
+):
+    """Обновляет одно status-сообщение вместо накопления нескольких в чате.
+
+    Сначала пытаемся отредактировать уже показанное жёлтое сообщение. Если Telegram
+    не позволяет edit, отправляем новое и только после успешной отправки удаляем старое.
+    """
+    old_id = existing_message_id
+    if not old_id:
+        try:
+            old_id = get_pending_status_message(item_id) or get_auction_link_status_message(item_id)
+        except Exception as e:
+            logging.warning(f"Не удалось прочитать status_message_id auction {item_id}: {e}")
+            old_id = None
+
+    if old_id and edit_telegram_message(
+        old_id,
+        message,
+        reply_markup=reply_markup,
+        disable_preview=disable_preview,
+        preview_url=preview_url,
+        preview_small=preview_small,
+    ):
+        if persist_pending:
+            try:
+                set_pending_status_message(item_id, old_id)
+            except Exception as e:
+                logging.warning(f"Не удалось сохранить pending status_message_id={old_id}: {e}")
+        return True, old_id
+
+    new_id = send_telegram_message(
+        message,
+        reply_markup=reply_markup,
+        disable_preview=disable_preview,
+        preview_url=preview_url,
+        preview_small=preview_small,
+        return_message_id=True,
+    )
+    if not new_id:
+        return False, None
+    if old_id and old_id != new_id:
+        delete_telegram_message(old_id)
+    if persist_pending:
+        try:
+            set_pending_status_message(item_id, new_id)
+        except Exception as e:
+            logging.warning(f"Не удалось сохранить pending status_message_id={new_id}: {e}")
+    return True, new_id
 
 
 def answer_callback_query(callback_query_id, text=None, show_alert=False):
@@ -1946,6 +2292,10 @@ def auction_message_keyboard(item_id, url, include_list=False):
 
 def auction_list_only_keyboard():
     return {'inline_keyboard': [[{'text': '📋 Все аукционы', 'callback_data': 'auclist'}]]}
+
+
+def auction_queue_keyboard(url):
+    return {'inline_keyboard': [[{'text': '🔗 Открыть eBay', 'url': url}]]}
 
 
 def auction_open_list_keyboard(url):
@@ -3635,7 +3985,8 @@ def _save_pending_from_observation(observation, original_url, notify=True, refin
     existing_exact = get_exact_auction_by_id(item_id)
     if existing_exact:
         if notify:
-            send_telegram_message(
+            publish_auction_status(
+                item_id,
                 "ℹ️ <b>Аукцион уже сохранён</b> 🇬🇧\n\n"
                 f"📦 <b>{html_lib.escape(_clean_auction_title(existing_exact[2], item_id))}</b>\n\n"
                 f"🕒 Окончание по Киеву: {format_kyiv_datetime(existing_exact[3])}",
@@ -3674,13 +4025,15 @@ def _save_pending_from_observation(observation, original_url, notify=True, refin
     if notify:
         safe_title = html_lib.escape(title)
         shown_remaining = _format_pending_remaining_ru(observation.get('remaining_text'))
-        send_telegram_message(
+        publish_auction_status(
+            item_id,
             "🟡 <b>Аукцион сохранён</b> 🇬🇧\n\n"
             f"📦 <b>{safe_title}</b>\n\n"
             f"⏳ Сейчас по eBay: <b>{html_lib.escape(shown_remaining)}</b>\n\n"
             "🔄 Точное время окончания уточню автоматически.",
             reply_markup=auction_message_keyboard(item_id, canonical_url),
             preview_url=canonical_url,
+            persist_pending=True,
         )
     return 'pending'
 
@@ -3691,24 +4044,36 @@ def _finish_exact_auction_save(item_id, title, end_time_utc, parse_source, notif
     canonical_url = f"https://www.ebay.co.uk/itm/{item_id}"
     title = _clean_auction_title(title, item_id)
     safe_title = html_lib.escape(title)
+    # Берём message_id ДО save_auction_reminder(), потому что exact save удаляет pending row.
+    try:
+        status_message_id = get_pending_status_message(item_id) or get_auction_link_status_message(item_id)
+    except Exception:
+        status_message_id = None
+
     if remaining <= 0:
         delete_pending_auction(item_id, wake=False)
         if notify:
-            send_telegram_message(
+            publish_auction_status(
+                item_id,
                 "⌛ <b>Этот аукцион уже завершён.</b>\n\n"
-                f"🕒 Окончание по Киеву: {format_kyiv_datetime(end_time_utc)}"
+                f"🕒 Окончание по Киеву: {format_kyiv_datetime(end_time_utc)}",
+                existing_message_id=status_message_id,
+                disable_preview=True,
             )
         return False
+
     if remaining <= 5 * 60:
         delete_pending_auction(item_id, wake=False)
         if notify:
-            send_telegram_message(
+            publish_auction_status(
+                item_id,
                 "‼️ <b>До конца аукциона меньше 5 минут</b>\n\n"
                 f"📦 <b>{safe_title}</b>\n\n"
                 f"⏳ Осталось: {format_remaining(remaining, with_seconds=False)}\n\n"
                 f"🕒 Окончание по Киеву: {format_kyiv_datetime(end_time_utc)}",
                 reply_markup=auction_open_list_keyboard(canonical_url),
                 preview_url=canonical_url,
+                existing_message_id=status_message_id,
             )
         return False
 
@@ -3716,7 +4081,8 @@ def _finish_exact_auction_save(item_id, title, end_time_utc, parse_source, notif
     mark_auction_status_checked(item_id)
     if notify:
         header = "✅ <b>Время аукциона уточнено</b> 🇬🇧" if refined else "✅ <b>Аукцион сохранён</b> 🇬🇧"
-        send_telegram_message(
+        publish_auction_status(
+            item_id,
             header + "\n\n"
             f"📦 <b>{safe_title}</b>\n\n"
             f"🕒 Окончание по Киеву: {format_kyiv_datetime(end_time_utc)}\n\n"
@@ -3724,6 +4090,7 @@ def _finish_exact_auction_save(item_id, title, end_time_utc, parse_source, notif
             "🔔 Напоминания: <b>60 / 30 / 10 / 5 мин.</b>",
             reply_markup=auction_message_keyboard(item_id, canonical_url),
             preview_url=canonical_url,
+            existing_message_id=status_message_id,
         )
     logging.info(
         f"⏰ Auction reminder сохранён: item={item_id}, end_utc={end_time_utc.isoformat()}, "
@@ -3797,7 +4164,7 @@ def _fetch_exact_item_search_pages(item_id, reserve_if_needed=True):
 
 def process_auction_link(url):
     if not _is_allowed_ebay_url(url):
-        return
+        return 'ignored'
 
     expected_item_id = extract_ebay_item_id_any(url or '')
 
@@ -3872,73 +4239,103 @@ def process_auction_link(url):
         return _save_pending_from_observation(coarse_page_observation, url, notify=True)
 
     if not pages:
-        send_telegram_message(
-            "❌ <b>Не удалось проверить аукцион</b>\n\n"
-            "eBay сейчас не дал открыть ни точную search-card, ни карточку товара через доступные proxy. "
-            "Основной мониторинг продолжает работать. Попробуйте отправить ссылку ещё раз немного позже."
+        logging.warning(
+            f"Auction item={expected_item_id}: ни search-card, ни item-page сейчас не получены; "
+            "оставляем ссылку в надёжной очереди без отказа пользователю"
         )
-        return
+        return 'retry'
 
     statuses = [result[4] for result, _ in parsed_results]
     if 'time_conflict' in statuses:
-        send_telegram_message(
-            "⚠️ <b>eBay показал противоречивое время окончания.</b>\n\n"
-            "Я не сохраняю случайную минуту. Лот можно отправить ещё раз чуть позже."
+        # Конфликт времени может быть кратковременным из-за разных eBay edge/proxy шаблонов.
+        # Не тревожим пользователя и не угадываем: повторяем job позже.
+        logging.warning(
+            f"Auction item={expected_item_id}: временный time_conflict; оставляем в очереди"
         )
-        return
+        return 'retry'
     if 'ended' in statuses:
         ended_result = next(r for r, _ in parsed_results if r[4] == 'ended')
         line = (
-            f"\n🕒 Окончание по Киеву: {format_kyiv_datetime(ended_result[2])}"
+            f"\n\n🕒 Окончание по Киеву: {format_kyiv_datetime(ended_result[2])}"
             if ended_result[2] else ''
         )
-        send_telegram_message("⌛ <b>Этот аукцион уже завершён.</b>" + line)
-        return
-    if 'not_auction' in statuses:
-        send_telegram_message(
-            "ℹ️ <b>Это не активный аукцион со ставками.</b>\n\n"
-            "Buy It Now / Best Offer без режима торгов не сохраняется."
+        msg = "⌛ <b>Этот аукцион уже завершён.</b>" + line
+        publish_auction_status(
+            expected_item_id or ended_result[0], msg,
+            disable_preview=True,
         )
-        return
+        return 'ended'
+    if 'not_auction' in statuses:
+        publish_auction_status(
+            expected_item_id,
+            "ℹ️ <b>Это не активный аукцион со ставками.</b>\n\n"
+            "Buy It Now / Best Offer без режима торгов не сохраняется.",
+            disable_preview=True,
+        )
+        return 'not_auction'
 
     logging.warning(
         f"Auction не подтверждён после lightweight search и {len(pages)} item-page вариантов; "
-        f"item={expected_item_id}, statuses={statuses}. Bid History намеренно не используется."
+        f"item={expected_item_id}, statuses={statuses}. Оставляем job в очереди и повторим позже."
     )
-    send_telegram_message(
-        "❌ <b>Не удалось получить даже надёжный остаток времени этого аукциона.</b>\n\n"
-        "Bid History/Sign In больше не открываю. Если eBay даст хотя бы дни+часы, лот будет сохранён как pending "
-        "и автоматически уточнён позже; точную минуту я не угадываю."
-    )
+    return 'retry'
 
 
 def auction_link_worker():
-    logging.info("🔗 Worker ссылок на eBay-аукционы запущен")
+    logging.info("🔗 Worker надёжной очереди eBay-аукционов запущен")
     db_ready_event.wait()
     while True:
-        url = auction_add_queue.get()
         try:
-            process_auction_link(url)
+            jobs = get_due_auction_link_jobs(limit=1)
+            if not jobs:
+                auction_link_wakeup_event.wait(timeout=AUCTION_LINK_WORKER_IDLE)
+                auction_link_wakeup_event.clear()
+                continue
+
+            queue_key, item_id, url, status_message_id, attempt_count, created_at = jobs[0]
+            try:
+                result = process_auction_link(url)
+            except Exception as e:
+                logging.error(f"Ошибка обработки auction URL {url}: {e}", exc_info=True)
+                postpone_auction_link_job(queue_key, attempt_count, 'internal_error')
+                continue
+
+            if result == 'retry':
+                postpone_auction_link_job(queue_key, attempt_count, 'proxy_or_html_temporarily_unavailable')
+                continue
+
+            if result == 'pending' and item_id:
+                # Перед удалением queue-row ещё раз переносим его Telegram message_id
+                # в pending. Это страхует редкий DB-сбой во время publish/edit.
+                try:
+                    transfer_auction_link_status_to_pending(item_id)
+                except Exception as e:
+                    logging.warning(f"Не удалось перенести auction status_message_id в pending: {e}")
+
+            delete_auction_link_job(queue_key)
+            logging.info(f"✅ Auction queue job завершён: key={queue_key}, result={result!r}")
         except Exception as e:
-            logging.error(f"Ошибка обработки auction URL {url}: {e}", exc_info=True)
-            send_telegram_message(
-                "❌ Не удалось обработать ссылку на аукцион из-за временной внутренней ошибки. "
-                "Основной мониторинг продолжает работать."
-            )
-        finally:
-            auction_add_queue.task_done()
+            logging.error(f"Ошибка auction link queue worker: {e}", exc_info=True)
+            time.sleep(5)
 
 
 def send_auction_list():
     try:
         exact_rows = list_active_auctions(limit=20)
         pending_rows = list_pending_auctions(limit=20)
+        queued_rows = list_queued_auction_links(limit=20)
     except Exception as e:
         logging.error(f"Не удалось получить список аукционов: {e}")
         send_telegram_message("❌ Не удалось сейчас прочитать список аукционов из базы.")
         return
 
-    if not exact_rows and not pending_rows:
+    exact_ids = {str(row[0]) for row in exact_rows}
+    pending_ids = {str(row[0]) for row in pending_rows}
+    # На границе успешной обработки queue-row может существовать ещё долю секунды;
+    # не показываем один ItemID дважды.
+    queued_rows = [row for row in queued_rows if str(row[0]) not in exact_ids | pending_ids]
+
+    if not exact_rows and not pending_rows and not queued_rows:
         send_telegram_message("📭 <b>Активных аукционов сейчас нет.</b>")
         return
 
@@ -3948,40 +4345,54 @@ def send_auction_list():
         entries.append(('exact', _ensure_aware_utc(row[3]), row))
     for row in pending_rows:
         entries.append(('pending', _ensure_aware_utc(row[3]), row))
+    # Ещё не проверенные ссылки идут после подтверждённых аукционов.
+    for row in queued_rows:
+        entries.append(('queued', datetime.max.replace(tzinfo=timezone.utc), row))
     entries.sort(key=lambda x: x[1])
     entries = entries[:20]
 
     parts = ["⏰ <b>Мои аукционы UK</b> 🇬🇧\n"]
-    keyboard = []
+    delete_buttons = []
     for idx, (kind, _sort_time, row) in enumerate(entries, 1):
         if kind == 'exact':
             item_id, url, title, end_time = row
             end_time = _ensure_aware_utc(end_time)
             remaining = max(0, (end_time - now).total_seconds())
             title = _clean_auction_title(title, item_id)
-            title = _clean_auction_title(title, item_id)
-            short_title = title if len(title) <= 70 else title[:67] + '…'
+            short_title = title if len(title) <= 100 else title[:97] + '…'
             parts.append(
-                f"\n<b>{idx}.</b> {html_lib.escape(short_title)}\n"
-                f"🟢 {format_kyiv_datetime(end_time)} · "
-                f"{format_remaining(remaining, with_seconds=False)}"
+                f"\n{idx}) <b>{html_lib.escape(short_title)}</b>\n\n"
+                f"⏳ Осталось: {format_remaining(remaining, with_seconds=False)}\n"
+                f"🕒 По Киеву: {format_kyiv_datetime(end_time)}\n"
+                f"🔗 {html_lib.escape(url)}\n"
             )
-        else:
+        elif kind == 'pending':
             item_id, url, title, earliest, latest, remaining_text, clock_text, next_check = row
-            short_title = title if len(title) <= 70 else title[:67] + '…'
+            title = _clean_auction_title(title, item_id)
+            short_title = title if len(title) <= 100 else title[:97] + '…'
             shown = _format_pending_remaining_ru(remaining_text)
             parts.append(
-                f"\n<b>{idx}.</b> {html_lib.escape(short_title)}\n"
-                f"🟡 Уточняется · eBay: <b>{html_lib.escape(shown)}</b>"
+                f"\n{idx}) <b>{html_lib.escape(short_title)}</b>\n\n"
+                f"⏳ Осталось: {html_lib.escape(shown)}\n"
+                f"🕒 По Киеву: уточняется\n"
+                f"🔗 {html_lib.escape(url)}\n"
             )
-        keyboard.append([
-            {'text': f'🔗 Открыть #{idx}', 'url': url},
-            {'text': f'❌ Удалить #{idx}', 'callback_data': f'aucdel:{item_id}'},
-        ])
+        else:
+            item_id, url, created_at, next_attempt = row
+            parts.append(
+                f"\n{idx}) <b>Название уточняется</b>\n\n"
+                f"⏳ Осталось: проверяется\n"
+                f"🕒 По Киеву: уточняется\n"
+                f"🔗 {html_lib.escape(url)}\n"
+            )
+        delete_buttons.append(
+            {'text': f'❌ Удалить #{idx}', 'callback_data': f'aucdel:{item_id}'}
+        )
 
-    keyboard.append([
-        {'text': '🗑 Удалить все', 'callback_data': 'aucdelall:ask'},
-    ])
+    keyboard = []
+    for i in range(0, len(delete_buttons), 2):
+        keyboard.append(delete_buttons[i:i + 2])
+    keyboard.append([{'text': '🗑 Удалить все', 'callback_data': 'aucdelall:ask'}])
 
     send_telegram_message(
         ''.join(parts),
@@ -4314,8 +4725,8 @@ def handle_telegram_callback(callback):
                 show_alert=True,
             )
             return
-        exact_count, pending_count = delete_all_auctions()
-        total = exact_count + pending_count
+        exact_count, pending_count, queued_count = delete_all_auctions()
+        total = exact_count + pending_count + queued_count
         answer_callback_query(callback_id, "Все аукционы удалены ✅")
         edit_message_reply_markup(message.get('message_id'), {'inline_keyboard': []})
         send_telegram_message(
@@ -4323,7 +4734,7 @@ def handle_telegram_callback(callback):
         )
         logging.info(
             f"🗑 Удалены все аукционы по подтверждению пользователя: "
-            f"exact={exact_count}, pending={pending_count}"
+            f"exact={exact_count}, pending={pending_count}, queued={queued_count}"
         )
         return
 
@@ -4450,11 +4861,13 @@ def auction_reminder_worker():
                 # поэтому дальше никаких status-check и reminders этот аукцион не создаёт.
                 is_final_five = latest_minutes == 5
                 urgent = '‼️ ' if is_final_five else ''
+                # V6.14: сам порог (например «за 30 минут») обычным шрифтом;
+                # фактический остаток времени выделяем жирным, чтобы быстрее считывался.
                 msg = (
                     f"{urgent}⏰ <b>Напоминание об аукционе UK</b> 🇬🇧\n\n"
-                    f"🔔 Плановое напоминание за <b>{label}</b>\n\n"
+                    f"🔔 Плановое напоминание за {label}\n\n"
                     f"📦 <b>{safe_title}</b>\n\n"
-                    f"⏳ До окончания сейчас: {format_remaining(remaining_send, with_seconds=False)}\n\n"
+                    f"⏳ До окончания сейчас: <b>{format_remaining(remaining_send, with_seconds=False)}</b>\n\n"
                     f"🕒 Окончание по Киеву: {format_kyiv_datetime(current_end)}"
                 )
                 keyboard = (
@@ -4559,19 +4972,20 @@ def telegram_listener():
                             else:
                                 ebay_urls = extract_ebay_urls(text)
                                 if ebay_urls:
-                                    accepted = 0
                                     for ebay_url in ebay_urls[:20]:
-                                        try:
-                                            auction_add_queue.put_nowait(ebay_url)
-                                            accepted += 1
-                                        except queue.Full:
-                                            break
-                                    # Не засоряем чат промежуточным "Проверяю…":
-                                    # следующий ответ будет уже результатом проверки.
-                                    if accepted < len(ebay_urls[:20]):
-                                        send_telegram_message(
-                                            "⚠️ Очередь ссылок заполнена. Остальные ссылки отправьте немного позже."
-                                        )
+                                        key, item_id, canonical_url, existing_message_id, is_new = enqueue_auction_link(ebay_url)
+                                        # Одно компактное жёлтое status-сообщение. Оно не накапливается:
+                                        # после получения результата бот отредактирует ЭТО ЖЕ сообщение в pending/exact.
+                                        if not existing_message_id:
+                                            msg_id = send_telegram_message(
+                                                "🟡 <b>Аукцион добавлен</b> 🇬🇧\n\n"
+                                                "⏳ Проверяю время окончания автоматически.",
+                                                reply_markup=auction_queue_keyboard(canonical_url),
+                                                preview_url=canonical_url,
+                                                return_message_id=True,
+                                            )
+                                            if msg_id:
+                                                set_auction_link_status_message(key, msg_id)
                 except Exception as e:
                     logging.error(f"Ошибка обработки Telegram update {update_id}: {e}", exc_info=True)
                 finally:
@@ -5913,7 +6327,7 @@ def bot_worker():
     seen_line = f"\n📚 В базе: {seen_total} товаров." if seen_total is not None else ""
     send_telegram_message(
         startup_line +
-        "\n🇬🇧 eBay UK monitor v6.12 работает." +
+        "\n🇬🇧 eBay UK monitor v6.14 работает." +
         seen_line +
         "\nКоманды: /stop /start /list (/auctions) /delauction НОМЕР_ЛОТА"
         "\nМожно отправить ссылку на eBay-аукцион — сохраню точное время и напомню заранее.",
@@ -5997,7 +6411,7 @@ def leader_supervisor():
 @app.route('/')
 def index():
     role = "leader" if leader_active_event.is_set() else "standby"
-    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.12, {role})"
+    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.14, {role})"
 
 
 @app.route('/health')
