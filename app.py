@@ -138,6 +138,17 @@ AUCTION_FETCH_MAX_PROXIES = max(3, min(int(os.getenv("AUCTION_FETCH_MAX_PROXIES"
 AUCTION_FETCH_PARALLEL = max(2, min(int(os.getenv("AUCTION_FETCH_PARALLEL", "3")), 4))
 AUCTION_FETCH_CONNECT_TIMEOUT = float(os.getenv("AUCTION_FETCH_CONNECT_TIMEOUT", "5"))
 AUCTION_FETCH_READ_TIMEOUT = float(os.getenv("AUCTION_FETCH_READ_TIMEOUT", "16"))
+# V6.16: пользовательская auction-ссылка сначала ждёт короткое безопасное окно и
+# использует ИМЕННО уже открытую fixed Session основного монитора. Это важнее, чем
+# просто повторно открыть тот же proxy новым CONNECT: по реальным логам новый CONNECT
+# мог падать/получать 403, пока существующая fixed Session продолжала давать HTTP 200.
+# Lock по-прежнему сериализует доступ, поэтому одна Session никогда не используется
+# двумя потоками одновременно. Новых обязательных ENV нет.
+AUCTION_MAIN_PROXY_WAIT = max(0.0, min(float(os.getenv("AUCTION_MAIN_PROXY_WAIT", "12")), 20.0))
+# Отдельная короткая память только для auction-fetch. Она НЕ штрафует основной monitor.
+# Нужна, чтобы queue не выбирала на каждом retry одни и те же reserve IP, которые уже
+# доказанно дали 403/timeout/challenge именно на auction/search URL.
+AUCTION_PROXY_GOOD_MEMORY = max(60, int(os.getenv("AUCTION_PROXY_GOOD_MEMORY", "900")))
 # Для подтверждения пользовательской ссылки пробуем несколько независимых HTML-вариантов:
 # eBay иногда отдаёт одному proxy урезанный/иной шаблон без itemEndDate.
 AUCTION_VERIFY_MAX_PAGES = max(2, min(int(os.getenv("AUCTION_VERIFY_MAX_PAGES", "4")), 4))
@@ -1158,10 +1169,19 @@ proxy_manager = ProxyManager(PROXY_LIST_URL)
 fixed_proxy = None
 fixed_profile = None
 fixed_session = None
-# Auction-refinement может аккуратно воспользоваться текущим рабочим proxy, но не
-# одновременно с основным search request. Main request берёт этот lock блокирующе;
-# auction берёт его только non-blocking и при занятости сразу использует reserve IP.
+# Auction-refinement может аккуратно воспользоваться текущей рабочей fixed Session,
+# но НИКОГДА не одновременно с основным search request. Оба пути сериализованы одним
+# lock; auction ждёт только ограниченное окно и затем уходит на reserve IP.
 main_fixed_request_lock = threading.Lock()
+
+# V6.16: отдельная репутация reserve-proxy только для auction fetch.
+# Основной ProxyManager намеренно не загрязняем: proxy может прекрасно работать на
+# общей выдаче и одновременно получать challenge на item/search auction URL.
+auction_proxy_state_lock = threading.Lock()
+auction_proxy_bad_until = {}
+auction_proxy_host_bad_until = {}
+auction_proxy_fail_streak = {}
+auction_proxy_success_at = {}
 
 
 def close_session(session):
@@ -2409,7 +2429,171 @@ def extract_ebay_item_id_any(url, html=None):
     return None
 
 
+def _auction_proxy_cleanup_locked(now=None):
+    now = time.time() if now is None else float(now)
+    stale = [p for p, until in auction_proxy_bad_until.items() if until <= now]
+    for p in stale:
+        auction_proxy_bad_until.pop(p, None)
+    stale_hosts = [h for h, until in auction_proxy_host_bad_until.items() if until <= now]
+    for h in stale_hosts:
+        auction_proxy_host_bad_until.pop(h, None)
+    stale_success = [p for p, ts in auction_proxy_success_at.items() if now - ts > AUCTION_PROXY_GOOD_MEMORY]
+    for p in stale_success:
+        auction_proxy_success_at.pop(p, None)
+
+
+def _auction_proxy_is_available(proxy, now=None):
+    if not proxy:
+        return False
+    now = time.time() if now is None else float(now)
+    host = _proxy_host(proxy)
+    with auction_proxy_state_lock:
+        _auction_proxy_cleanup_locked(now)
+        if auction_proxy_bad_until.get(proxy, 0) > now:
+            return False
+        if host and auction_proxy_host_bad_until.get(host, 0) > now:
+            return False
+    return True
+
+
+def _auction_proxy_blocked_hosts(now=None):
+    now = time.time() if now is None else float(now)
+    with auction_proxy_state_lock:
+        _auction_proxy_cleanup_locked(now)
+        return {h for h, until in auction_proxy_host_bad_until.items() if until > now}
+
+
+def _auction_recent_good_proxies(limit=2, excluded_hosts=None):
+    limit = max(0, int(limit))
+    if limit <= 0:
+        return []
+    excluded_hosts = set(excluded_hosts or ())
+    now = time.time()
+    with auction_proxy_state_lock:
+        _auction_proxy_cleanup_locked(now)
+        rows = sorted(auction_proxy_success_at.items(), key=lambda kv: kv[1], reverse=True)
+        result = []
+        used_hosts = set(excluded_hosts)
+        for proxy, _ts in rows:
+            host = _proxy_host(proxy)
+            if not host or host in used_hosts:
+                continue
+            if auction_proxy_bad_until.get(proxy, 0) > now:
+                continue
+            if auction_proxy_host_bad_until.get(host, 0) > now:
+                continue
+            result.append(proxy)
+            used_hosts.add(host)
+            if len(result) >= limit:
+                break
+        return result
+
+
+def _auction_proxy_mark_success(proxy):
+    if not proxy:
+        return
+    host = _proxy_host(proxy)
+    now = time.time()
+    with auction_proxy_state_lock:
+        auction_proxy_bad_until.pop(proxy, None)
+        auction_proxy_fail_streak[proxy] = 0
+        auction_proxy_success_at[proxy] = now
+        # Реальный HTTP success доказывает, что этот exit-host сейчас пригоден для auction.
+        if host:
+            auction_proxy_host_bad_until.pop(host, None)
+
+
+def _auction_proxy_mark_failure(proxy, reason):
+    """Auction-only cooldown. Основной proxy_manager здесь НЕ трогаем."""
+    if not proxy or reason in (None, '', 'main_busy', 'main_unavailable', 'auction_cooldown', 'fixed_changed'):
+        return 0
+    reason = str(reason)
+    now = time.time()
+    host = _proxy_host(proxy)
+    with auction_proxy_state_lock:
+        _auction_proxy_cleanup_locked(now)
+        streak = int(auction_proxy_fail_streak.get(proxy, 0)) + 1
+        auction_proxy_fail_streak[proxy] = streak
+
+        if reason == 'proxy_ssl':
+            cooldown = 3600
+            host_cooldown = 3600
+        elif reason in ('blocked', 'rate_limited'):
+            cooldown = (300, 600, 900, 1800)[min(streak - 1, 3)]
+            host_cooldown = cooldown
+        elif reason == 'proxy_rejected':
+            cooldown = (600, 900, 1800)[min(streak - 1, 2)]
+            host_cooldown = min(cooldown, 600)
+        elif reason in ('proxy_timeout', 'proxy_error'):
+            cooldown = (45, 90, 180, 300)[min(streak - 1, 3)]
+            # Короткий host-cooldown не даёт сразу взять соседний порт того же IP,
+            # но не вычёркивает весь host надолго из-за одного transient-сбоя.
+            host_cooldown = min(cooldown, 90)
+        else:
+            cooldown = (120, 300, 600)[min(streak - 1, 2)]
+            host_cooldown = min(cooldown, 300)
+
+        auction_proxy_bad_until[proxy] = max(auction_proxy_bad_until.get(proxy, 0), now + cooldown)
+        if host and host_cooldown:
+            auction_proxy_host_bad_until[host] = max(
+                auction_proxy_host_bad_until.get(host, 0), now + host_cooldown
+            )
+        logging.info(
+            f"Auction-only cooldown {proxy}: {cooldown} сек., причина={reason}, "
+            f"fail_streak={streak}; основной monitor не штрафуется"
+        )
+        return cooldown
+
+
+def _auction_transport_result(exc):
+    low = str(exc).lower()
+    if 'curl: (28)' in low or 'timed out' in low:
+        return 'proxy_timeout'
+    if 'curl: (60)' in low or 'certificate' in low or 'self signed' in low:
+        return 'proxy_ssl'
+    if (
+        'connect tunnel failed' in low or
+        'proxy connect aborted' in low or
+        'wrong_version_number' in low or
+        'wrong version number' in low or
+        re.search(r'connect[^\n]*(?:response )?(?:400|405|500|501|502|503)', low)
+    ):
+        return 'proxy_rejected'
+    return 'proxy_error'
+
+
+def _classify_auction_response(response, proxy):
+    final_url = str(getattr(response, 'url', '') or '')
+    status = int(getattr(response, 'status_code', 0) or 0)
+    if status not in (200, 404, 410):
+        logging.info(f"Auction page через {proxy}: HTTP {status}, url={final_url[:160]}")
+        if status == 403:
+            return None, final_url, 'blocked'
+        if status == 429:
+            return None, final_url, 'rate_limited'
+        return None, final_url, 'http_error'
+
+    blocked, reason = _is_ebay_block_page(response)
+    if blocked:
+        logging.info(f"Auction page через {proxy}: eBay block/challenge ({reason})")
+        return None, final_url, 'blocked'
+    if final_url and not _is_allowed_ebay_url(final_url):
+        logging.info(f"Auction page через {proxy}: неожиданный redirect {final_url[:160]}")
+        return None, final_url, 'unexpected_redirect'
+    final_lower = final_url.lower()
+    if ('signin.ebay.' in final_lower or 'ebayisapi.dll?signin' in final_lower or '/signin/' in final_lower):
+        logging.info(f"Auction page через {proxy}: eBay перенаправил на Sign In; этот HTML не используем")
+        return None, final_url, 'sign_in'
+
+    logging.info(
+        f"✅ Auction page получена через {proxy}: HTTP {status}, "
+        f"bytes={len(response.content or b'')}, url={final_url[:160]}"
+    )
+    return response.text, final_url, 'success'
+
+
 def _request_auction_page_once(url, proxy, profile, connect_timeout=None, read_timeout=None):
+    """Один reserve-request в собственной Session; возвращает html, final_url, result."""
     session = None
     connect_timeout = AUCTION_FETCH_CONNECT_TIMEOUT if connect_timeout is None else connect_timeout
     read_timeout = AUCTION_FETCH_READ_TIMEOUT if read_timeout is None else read_timeout
@@ -2420,33 +2604,64 @@ def _request_auction_page_once(url, proxy, profile, connect_timeout=None, read_t
             timeout=(connect_timeout, read_timeout),
             allow_redirects=True,
         )
-        final_url = str(getattr(response, 'url', '') or '')
-        if response.status_code not in (200, 404, 410):
-            logging.info(
-                f"Auction page через {proxy}: HTTP {response.status_code}, url={final_url[:160]}"
-            )
-            return None, final_url
-        blocked, reason = _is_ebay_block_page(response)
-        if blocked:
-            logging.info(f"Auction page через {proxy}: eBay block/challenge ({reason})")
-            return None, final_url
-        if final_url and not _is_allowed_ebay_url(final_url):
-            logging.info(f"Auction page через {proxy}: неожиданный redirect {final_url[:160]}")
-            return None, final_url
-        final_lower = final_url.lower()
-        if ('signin.ebay.' in final_lower or 'ebayisapi.dll?signin' in final_lower or '/signin/' in final_lower):
-            logging.info(f"Auction page через {proxy}: eBay перенаправил на Sign In; этот HTML не используем")
-            return None, final_url
-        logging.info(
-            f"✅ Auction page получена через {proxy}: HTTP {response.status_code}, "
-            f"bytes={len(response.content or b'')}, url={final_url[:160]}"
-        )
-        return response.text, final_url
+        return _classify_auction_response(response, proxy)
     except Exception as e:
         logging.info(f"Auction page через {proxy} не получена: {e}")
-        return None, ''
+        return None, '', _auction_transport_result(e)
     finally:
         close_session(session)
+
+
+def _request_auction_via_main_session(url, connect_timeout=None, read_timeout=None, wait_timeout=None):
+    """Пробует auction search через РЕАЛЬНУЮ fixed Session основного monitor.
+
+    Никакой новой Session/CONNECT для того же proxy не создаётся. Доступ сериализован
+    main_fixed_request_lock, поэтому curl_cffi Session не используется параллельно.
+    Возвращает (html, final_url, result, proxy_used).
+    """
+    connect_timeout = AUCTION_FETCH_CONNECT_TIMEOUT if connect_timeout is None else connect_timeout
+    read_timeout = AUCTION_FETCH_READ_TIMEOUT if read_timeout is None else read_timeout
+    wait_timeout = AUCTION_MAIN_PROXY_WAIT if wait_timeout is None else max(0.0, float(wait_timeout))
+
+    acquired = main_fixed_request_lock.acquire(timeout=wait_timeout)
+    if not acquired:
+        current = fixed_proxy
+        if current:
+            logging.info(
+                f"Auction: main fixed Session {current} занята; ждали {wait_timeout:.1f} сек., "
+                "переходим к reserve без вмешательства в основной monitor"
+            )
+        return None, '', 'main_busy', current
+
+    try:
+        proxy = fixed_proxy
+        profile = fixed_profile
+        session = fixed_session
+        if not proxy or profile is None or session is None:
+            return None, '', 'main_unavailable', proxy
+        if not _auction_proxy_is_available(proxy):
+            logging.info(f"Auction: main proxy {proxy} временно в auction-only cooldown")
+            return None, '', 'auction_cooldown', proxy
+
+        try:
+            logging.info(f"🎯 Auction: используем текущую fixed Session {proxy}")
+            response = session.get(
+                url,
+                timeout=(connect_timeout, read_timeout),
+                allow_redirects=True,
+            )
+            html, final_url, result = _classify_auction_response(response, proxy)
+        except Exception as e:
+            logging.info(f"Auction page через main fixed Session {proxy} не получена: {e}")
+            html, final_url, result = None, '', _auction_transport_result(e)
+
+        if result == 'success':
+            _auction_proxy_mark_success(proxy)
+        elif result not in ('main_busy', 'main_unavailable'):
+            _auction_proxy_mark_failure(proxy, result)
+        return html, final_url, result, proxy
+    finally:
+        main_fixed_request_lock.release()
 
 
 def _canonical_auction_url(url):
@@ -2464,14 +2679,19 @@ def fetch_auction_pages(
     max_pages=1,
     canonicalize_item=True,
     prefer_current_fixed=False,
+    exclude_hosts=None,
 ):
     """Получает auction/search HTML без полного proxy-discovery.
 
-    V6.12: для редкого пользовательского auction search можно сначала попробовать
-    ТЕКУЩИЙ уже доказанный main fixed proxy. Он используется только если main request
-    сейчас не держит ``main_fixed_request_lock``. Поэтому auction не запускает новый
-    полный discovery и не делает одновременный запрос тем же IP. При неудаче быстро
-    переходим к небольшому reserve-набору.
+    V6.16:
+    1) lightweight exact-item search сначала использует настоящую уже открытую fixed
+       Session основного monitor (под тем же lock), а не новый CONNECT через тот же IP;
+    2) reserve-proxy имеют отдельный auction-only cooldown, поэтому один и тот же 403/
+       timeout/challenge не повторяется на каждом queue retry;
+    3) если пока шёл reserve-fetch основной monitor нашёл НОВЫЙ рабочий proxy, перед
+       возвратом retry делается один late-main шанс через новую fixed Session.
+
+    Основной ProxyManager/его cooldown не меняются auction-запросами.
     """
     if not _is_allowed_ebay_url(url):
         return []
@@ -2487,126 +2707,159 @@ def fetch_auction_pages(
 
     canonical_url = _canonical_auction_url(url) if canonicalize_item else url
     urls_to_try = [canonical_url]
-    current_fixed = fixed_proxy
-    current_fixed_profile = fixed_profile or profile
     pages = []
+    main_proxy_tried = None
 
-    def request_with_optional_fixed_guard(candidate_url, proxy, use_profile):
-        if current_fixed and proxy == current_fixed:
-            acquired = main_fixed_request_lock.acquire(blocking=False)
-            if not acquired:
-                logging.info(
-                    f"Auction: текущий main proxy {proxy} сейчас занят основной проверкой; "
-                    "не мешаем ему и используем reserve"
-                )
-                return None, ''
-            try:
-                return _request_auction_page_once(
-                    candidate_url, proxy, use_profile,
-                    connect_timeout=connect_timeout,
-                    read_timeout=read_timeout,
-                )
-            finally:
-                main_fixed_request_lock.release()
-        return _request_auction_page_once(
-            candidate_url, proxy, use_profile,
-            connect_timeout=connect_timeout,
-            read_timeout=read_timeout,
-        )
-
-    # Для lightweight exact-item search это самый быстрый/стабильный путь: уже рабочий
-    # proxy сначала, но только если main monitor в этот момент им не пользуется.
-    if prefer_current_fixed and current_fixed:
+    # Для exact search сначала немного ждём свободное окно между main requests и
+    # используем уже живую fixed Session. Это не создаёт второй CONNECT через тот же IP.
+    if prefer_current_fixed:
         for candidate_url in urls_to_try:
-            html, final_url = request_with_optional_fixed_guard(
-                candidate_url, current_fixed, current_fixed_profile
+            html, final_url, result, proxy_used = _request_auction_via_main_session(
+                candidate_url,
+                connect_timeout=connect_timeout,
+                read_timeout=read_timeout,
+                wait_timeout=AUCTION_MAIN_PROXY_WAIT,
             )
+            main_proxy_tried = proxy_used or main_proxy_tried
             if html:
-                pages.append((html, final_url or candidate_url, current_fixed))
+                pages.append((html, final_url or candidate_url, proxy_used))
                 if len(pages) >= max_pages:
                     return pages
                 break
 
-    excluded_hosts = {_proxy_host(current_fixed)} if current_fixed else set()
-    reserve = proxy_manager.get_candidate_batch(max_reserve_proxies, tried_hosts=excluded_hosts)
+    # Reserve не использует текущий fixed host свежей Session: по реальному логу это
+    # как раз давало CONNECT aborted/403 при продолжающей работать persistent Session.
+    current_fixed_now = fixed_proxy
+    excluded_hosts = set(exclude_hosts or ()) | _auction_proxy_blocked_hosts()
+    if current_fixed_now:
+        excluded_hosts.add(_proxy_host(current_fixed_now))
+    if main_proxy_tried:
+        excluded_hosts.add(_proxy_host(main_proxy_tried))
+
     candidates = []
-    for candidate in reserve:
-        if candidate and candidate not in candidates:
-            candidates.append(candidate)
+    candidate_hosts = set()
 
-    # Старое поведение сохраняем для callers, которые не просили fixed-first:
-    # current fixed остаётся последним fallback, но тоже под lock.
-    if not prefer_current_fixed and current_fixed and current_fixed not in candidates:
-        candidates.append(current_fixed)
+    def add_candidate(candidate):
+        if not candidate or not _auction_proxy_is_available(candidate):
+            return False
+        host = _proxy_host(candidate)
+        if not host or host in excluded_hosts or host in candidate_hosts:
+            return False
+        candidates.append(candidate)
+        candidate_hosts.add(host)
+        return True
 
-    # Только если reserve действительно мал/истощён — один emergency merge. Это НЕ
-    # main discovery и не меняет рабочую fixed-пару.
-    if len(candidates) < 2 and max_reserve_proxies > len(candidates):
-        proxy_manager.refresh_proxies(force=True, emergency=True)
-        tried_hosts = {_proxy_host(p) for p in candidates if p}
-        if current_fixed:
-            tried_hosts.add(_proxy_host(current_fixed))
-        extra = proxy_manager.get_candidate_batch(
-            max(0, max_reserve_proxies - len(candidates)),
-            tried_hosts=tried_hosts,
+    # Сначала один-два reserve, которые уже реально отдавали auction HTML раньше.
+    for candidate in _auction_recent_good_proxies(
+        limit=min(2, max_reserve_proxies), excluded_hosts=excluded_hosts
+    ):
+        add_candidate(candidate)
+
+    need = max(0, max_reserve_proxies - len(candidates))
+    if need:
+        reserve = proxy_manager.get_candidate_batch(
+            need,
+            tried_hosts=excluded_hosts | candidate_hosts,
         )
-        for candidate in extra:
-            if candidate and candidate not in candidates:
-                candidates.append(candidate)
+        for candidate in reserve:
+            add_candidate(candidate)
 
-    if not candidates:
-        return pages
+    # Если после auction-only cooldown кандидатов мало, один emergency merge расширяет
+    # список, но не запускает полный main discovery и не меняет fixed_proxy.
+    if len(candidates) < min(2, max_reserve_proxies) and max_reserve_proxies > len(candidates):
+        proxy_manager.refresh_proxies(force=True, emergency=True)
+        extra_need = max(0, max_reserve_proxies - len(candidates))
+        if extra_need:
+            extra = proxy_manager.get_candidate_batch(
+                extra_need,
+                tried_hosts=excluded_hosts | candidate_hosts | _auction_proxy_blocked_hosts(),
+            )
+            for candidate in extra:
+                add_candidate(candidate)
 
     def worker(proxy):
-        use_profile = current_fixed_profile if current_fixed and proxy == current_fixed else profile
+        last_result = None
         for candidate_url in urls_to_try:
-            html, final_url = request_with_optional_fixed_guard(candidate_url, proxy, use_profile)
+            html, final_url, result = _request_auction_page_once(
+                candidate_url,
+                proxy,
+                profile,
+                connect_timeout=connect_timeout,
+                read_timeout=read_timeout,
+            )
+            last_result = result
             if html:
-                return html, final_url or candidate_url, proxy
-        return None, None, proxy
+                _auction_proxy_mark_success(proxy)
+                return html, final_url or candidate_url, proxy, result
+            _auction_proxy_mark_failure(proxy, result)
+        return None, None, proxy, last_result
 
-    pending_candidates = list(candidates[:max_reserve_proxies + (0 if prefer_current_fixed else 1)])
-    if not pending_candidates:
+    pending_candidates = list(candidates[:max_reserve_proxies])
+    if pending_candidates:
+        executor = ThreadPoolExecutor(
+            max_workers=min(AUCTION_FETCH_PARALLEL, len(pending_candidates)),
+            thread_name_prefix='auction-fetch',
+        )
+        future_to_proxy = {}
+
+        def submit_next():
+            while pending_candidates and len(future_to_proxy) < AUCTION_FETCH_PARALLEL:
+                proxy = pending_candidates.pop(0)
+                future_to_proxy[executor.submit(worker, proxy)] = proxy
+
+        submit_next()
+        try:
+            while future_to_proxy and len(pages) < max_pages:
+                done, _ = wait(tuple(future_to_proxy.keys()), timeout=1.0, return_when=FIRST_COMPLETED)
+                if not done:
+                    continue
+                for future in done:
+                    proxy = future_to_proxy.pop(future, None)
+                    try:
+                        html, final_url, proxy_used, _result = future.result()
+                    except Exception as e:
+                        logging.info(f"Auction fetch worker {proxy} завершился ошибкой: {e}")
+                        html, final_url, proxy_used = None, None, proxy
+                        _auction_proxy_mark_failure(proxy, 'proxy_error')
+                    if html:
+                        pages.append((html, final_url, proxy_used))
+                        if len(pages) >= max_pages:
+                            break
+                submit_next()
+        finally:
+            for future in list(future_to_proxy):
+                future.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
+
+    if pages:
         return pages
-    executor = ThreadPoolExecutor(
-        max_workers=min(AUCTION_FETCH_PARALLEL, len(pending_candidates)),
-        thread_name_prefix='auction-fetch',
-    )
-    future_to_proxy = {}
 
-    def submit_next():
-        while pending_candidates and len(future_to_proxy) < AUCTION_FETCH_PARALLEL:
-            proxy = pending_candidates.pop(0)
-            future_to_proxy[executor.submit(worker, proxy)] = proxy
-
-    submit_next()
-    try:
-        while future_to_proxy and len(pages) < max_pages:
-            done, _ = wait(tuple(future_to_proxy.keys()), timeout=1.0, return_when=FIRST_COMPLETED)
-            if not done:
-                continue
-            for future in done:
-                proxy = future_to_proxy.pop(future, None)
-                try:
-                    html, final_url, proxy_used = future.result()
-                except Exception as e:
-                    logging.info(f"Auction fetch worker {proxy} завершился ошибкой: {e}")
-                    html, final_url, proxy_used = None, None, proxy
+    # Ключевой race из реального лога: auction attempt мог начаться во время main
+    # discovery, а через несколько секунд monitor уже нашёл новый хороший fixed proxy.
+    # Старый код этого нового proxy не видел до следующего queue retry. Теперь перед
+    # возвратом 'retry' даём РОВНО один шанс новой/current fixed Session.
+    if prefer_current_fixed:
+        latest_proxy = fixed_proxy
+        if latest_proxy and latest_proxy != main_proxy_tried and _auction_proxy_is_available(latest_proxy):
+            logging.info(
+                f"Auction: появился новый main proxy {latest_proxy}; "
+                "даём один late-main шанс до переноса ссылки на следующий retry"
+            )
+            for candidate_url in urls_to_try:
+                html, final_url, _result, proxy_used = _request_auction_via_main_session(
+                    candidate_url,
+                    connect_timeout=connect_timeout,
+                    read_timeout=read_timeout,
+                    wait_timeout=min(4.0, AUCTION_MAIN_PROXY_WAIT),
+                )
                 if html:
-                    # Не смешиваем репутацию auction page и main search proxy.
-                    pages.append((html, final_url, proxy_used))
-                    if len(pages) >= max_pages:
-                        break
-            submit_next()
-    finally:
-        for future in list(future_to_proxy):
-            future.cancel()
-        executor.shutdown(wait=False, cancel_futures=True)
+                    pages.append((html, final_url or candidate_url, proxy_used))
+                    break
 
     return pages
 
 
-def fetch_auction_page(url, max_reserve_proxies=None, connect_timeout=None, read_timeout=None, canonicalize_item=True, prefer_current_fixed=False):
+def fetch_auction_page(url, max_reserve_proxies=None, connect_timeout=None, read_timeout=None, canonicalize_item=True, prefer_current_fixed=False, exclude_hosts=None):
     """Совместимый wrapper: возвращает первую полученную auction page."""
     pages = fetch_auction_pages(
         url,
@@ -2616,6 +2869,7 @@ def fetch_auction_page(url, max_reserve_proxies=None, connect_timeout=None, read
         max_pages=1,
         canonicalize_item=canonicalize_item,
         prefer_current_fixed=prefer_current_fixed,
+        exclude_hosts=exclude_hosts,
     )
     if not pages:
         return None, None, None
@@ -4170,6 +4424,7 @@ def _fetch_exact_item_search_pages(item_id, reserve_if_needed=True):
 
     # Только если первая HTML вообще не дала target-card/timing — максимум две reserve
     # страницы. Это существенно легче старого 8-proxy item-page + Bid History пути.
+    first_pass_hosts = {_proxy_host(p) for _html, _url, p in pages if p}
     reserve_pages = fetch_auction_pages(
         search_url,
         max_reserve_proxies=2,
@@ -4178,6 +4433,7 @@ def _fetch_exact_item_search_pages(item_id, reserve_if_needed=True):
         max_pages=2,
         canonicalize_item=False,
         prefer_current_fixed=False,
+        exclude_hosts=first_pass_hosts,
     )
     exact2, coarse2, had_target2 = _evaluate_search_pages_for_auction(reserve_pages, item_id)
     return exact2, coarse2, had_target or had_target2, pages + reserve_pages
@@ -4191,8 +4447,9 @@ def process_auction_link(url):
 
     # 1) Самый лёгкий и полезный путь — exact search-card по ItemID. Именно здесь
     # в реальном логе была строка ``Time left 4d 14h left (Sat, 14:26)``.
+    search_pages = []
     if expected_item_id:
-        exact, coarse, had_target, _ = _fetch_exact_item_search_pages(expected_item_id)
+        exact, coarse, had_target, search_pages = _fetch_exact_item_search_pages(expected_item_id)
         if exact:
             item_id, title, end_time_utc, source, status = exact
             return _finish_exact_auction_save(item_id, title, end_time_utc, source, notify=True)
@@ -4202,11 +4459,13 @@ def process_auction_link(url):
     # 2) Если search-card недоступна/изменилась, оставляем консервативный item-page
     # fallback. Bid History больше НЕ вызываем: логи доказали redirect на Sign In и
     # лишний proxy-трафик без полезного end time.
+    search_hosts = {_proxy_host(p) for _html, _url, p in search_pages if p}
     pages = fetch_auction_pages(
         url,
         max_reserve_proxies=min(3, AUCTION_FETCH_MAX_PROXIES),
         max_pages=min(2, AUCTION_VERIFY_MAX_PAGES),
         prefer_current_fixed=False,
+        exclude_hosts=search_hosts,
     )
 
     parsed_results = []
@@ -6363,7 +6622,7 @@ def bot_worker():
     seen_line = f"\n📚 В базе: {seen_total} товаров." if seen_total is not None else ""
     send_telegram_message(
         startup_line +
-        "\n🇬🇧 eBay UK monitor v6.15 работает." +
+        "\n🇬🇧 eBay UK monitor v6.16 работает." +
         seen_line +
         "\nКоманды: /stop /start /list (/auctions) /delauction НОМЕР_ЛОТА"
         "\nМожно отправить ссылку на eBay-аукцион — сохраню точное время и напомню заранее.",
@@ -6447,7 +6706,7 @@ def leader_supervisor():
 @app.route('/')
 def index():
     role = "leader" if leader_active_event.is_set() else "standby"
-    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.15, {role})"
+    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.16, {role})"
 
 
 @app.route('/health')
