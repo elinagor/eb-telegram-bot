@@ -170,7 +170,12 @@ AUCTION_PENDING_MINUTE_MARGIN = max(5, int(os.getenv("AUCTION_PENDING_MINUTE_MAR
 # worker откладывает её с мягким backoff и параллельно может обработать следующие ссылки.
 AUCTION_LINK_RETRY_BASE = max(10, int(os.getenv("AUCTION_LINK_RETRY_BASE", "15")))
 AUCTION_LINK_RETRY_MAX = max(AUCTION_LINK_RETRY_BASE, int(os.getenv("AUCTION_LINK_RETRY_MAX", "60")))
-AUCTION_LINK_WORKER_IDLE = max(2, int(os.getenv("AUCTION_LINK_WORKER_IDLE", "5")))
+# Очередь хранится в PostgreSQL, а enqueue всегда будит worker через Event.
+# Поэтому нет смысла открывать новый TLS-сеанс к Aiven каждые 5 секунд, когда очередь пуста.
+# 60 сек. — только страховочный max-poll; новая ссылка всё равно будит worker мгновенно,
+# а запланированный retry ждёт ровно до next_attempt (с cap этим значением).
+AUCTION_LINK_WORKER_IDLE = max(30, int(os.getenv("AUCTION_LINK_WORKER_IDLE", "60")))
+AUCTION_LINK_DB_ERROR_WAIT = max(10, int(os.getenv("AUCTION_LINK_DB_ERROR_WAIT", "15")))
 
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 LONDON_TZ = ZoneInfo("Europe/London")
@@ -1579,20 +1584,36 @@ def set_auction_link_status_message(queue_key, message_id):
     return changed
 
 
-def get_due_auction_link_jobs(limit=1):
+def get_next_auction_link_job_state():
+    """Возвращает один due-job либо сколько секунд безопасно ждать до следующего.
+
+    V6.15: раньше пустая очередь опрашивала Aiven каждые ~5 сек. отдельным TLS-
+    соединением. Теперь одним SELECT смотрим ближайший next_attempt и спим до него;
+    новая ссылка всё равно мгновенно будит worker через auction_link_wakeup_event.
+    Это резко уменьшает connection churn, не замедляя пользовательские ссылки.
+    """
     with get_db_connection('ebay_uk_auction_link_due') as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT queue_key, item_id, url, status_message_id, attempt_count, created_at
+                SELECT queue_key, item_id, url, status_message_id, attempt_count, created_at,
+                       next_attempt,
+                       GREATEST(EXTRACT(EPOCH FROM (next_attempt - NOW())), 0)
                 FROM auction_link_queue
-                WHERE next_attempt <= NOW()
                 ORDER BY next_attempt ASC, created_at ASC
-                LIMIT %s
-                """,
-                (max(1, int(limit)),),
+                LIMIT 1
+                """
             )
-            return cur.fetchall()
+            row = cur.fetchone()
+
+    if not row:
+        return None, float(AUCTION_LINK_WORKER_IDLE)
+
+    wait_seconds = max(0.0, float(row[7] or 0.0))
+    if wait_seconds > 0.25:
+        return None, min(wait_seconds, float(AUCTION_LINK_WORKER_IDLE))
+
+    return row[:6], 0.0
 
 
 def list_queued_auction_links(limit=20):
@@ -4286,13 +4307,17 @@ def auction_link_worker():
     db_ready_event.wait()
     while True:
         try:
-            jobs = get_due_auction_link_jobs(limit=1)
-            if not jobs:
-                auction_link_wakeup_event.wait(timeout=AUCTION_LINK_WORKER_IDLE)
-                auction_link_wakeup_event.clear()
+            # Clear ДО чтения БД: если enqueue случится после этого момента,
+            # Event останется установленным и последующий wait завершится сразу.
+            auction_link_wakeup_event.clear()
+            job, wait_seconds = get_next_auction_link_job_state()
+            if job is None:
+                auction_link_wakeup_event.wait(
+                    timeout=max(1.0, min(float(wait_seconds), float(AUCTION_LINK_WORKER_IDLE)))
+                )
                 continue
 
-            queue_key, item_id, url, status_message_id, attempt_count, created_at = jobs[0]
+            queue_key, item_id, url, status_message_id, attempt_count, created_at = job
             try:
                 result = process_auction_link(url)
             except Exception as e:
@@ -4314,9 +4339,20 @@ def auction_link_worker():
 
             delete_auction_link_job(queue_key)
             logging.info(f"✅ Auction queue job завершён: key={queue_key}, result={result!r}")
+
+        except psycopg2.OperationalError as e:
+            # Job хранится в PostgreSQL, поэтому при временном сетевом сбое ничего
+            # не теряется. Не спамим полным traceback каждые несколько секунд:
+            # ждём немного или просыпаемся мгновенно по новой пользовательской ссылке.
+            logging.warning(
+                f"⚠️ Aiven временно недоступен для auction queue: {e}. "
+                f"Очередь сохранена; повтор через ≤{AUCTION_LINK_DB_ERROR_WAIT} сек."
+            )
+            auction_link_wakeup_event.wait(timeout=AUCTION_LINK_DB_ERROR_WAIT)
+
         except Exception as e:
             logging.error(f"Ошибка auction link queue worker: {e}", exc_info=True)
-            time.sleep(5)
+            auction_link_wakeup_event.wait(timeout=AUCTION_LINK_DB_ERROR_WAIT)
 
 
 def send_auction_list():
@@ -4861,7 +4897,7 @@ def auction_reminder_worker():
                 # поэтому дальше никаких status-check и reminders этот аукцион не создаёт.
                 is_final_five = latest_minutes == 5
                 urgent = '‼️ ' if is_final_five else ''
-                # V6.14: сам порог (например «за 30 минут») обычным шрифтом;
+                # V6.15: сам порог (например «за 30 минут») обычным шрифтом;
                 # фактический остаток времени выделяем жирным, чтобы быстрее считывался.
                 msg = (
                     f"{urgent}⏰ <b>Напоминание об аукционе UK</b> 🇬🇧\n\n"
@@ -6327,7 +6363,7 @@ def bot_worker():
     seen_line = f"\n📚 В базе: {seen_total} товаров." if seen_total is not None else ""
     send_telegram_message(
         startup_line +
-        "\n🇬🇧 eBay UK monitor v6.14 работает." +
+        "\n🇬🇧 eBay UK monitor v6.15 работает." +
         seen_line +
         "\nКоманды: /stop /start /list (/auctions) /delauction НОМЕР_ЛОТА"
         "\nМожно отправить ссылку на eBay-аукцион — сохраню точное время и напомню заранее.",
@@ -6411,7 +6447,7 @@ def leader_supervisor():
 @app.route('/')
 def index():
     role = "leader" if leader_active_event.is_set() else "standby"
-    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.14, {role})"
+    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.15, {role})"
 
 
 @app.route('/health')
