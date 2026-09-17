@@ -9,6 +9,7 @@ import threading
 import logging
 import html as html_lib
 import hashlib
+import socket
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 import requests
 from datetime import datetime, timezone, timedelta
@@ -102,7 +103,7 @@ PROXY_EMERGENCY_TRIGGER_AFTER = max(15.0, float(os.getenv("PROXY_EMERGENCY_TRIGG
 PROXY_EMERGENCY_TRIGGER_ATTEMPTS = max(20, int(os.getenv("PROXY_EMERGENCY_TRIGGER_ATTEMPTS", "50")))
 PROXY_EMERGENCY_MIN_AVAILABLE = max(20, int(os.getenv("PROXY_EMERGENCY_MIN_AVAILABLE", "60")))
 PROXY_EMERGENCY_MIN_RATIO = min(0.50, max(0.05, float(os.getenv("PROXY_EMERGENCY_MIN_RATIO", "0.20"))))
-PROXY_EMERGENCY_TRANSIENT_REPROBES = max(0, min(int(os.getenv("PROXY_EMERGENCY_TRANSIENT_REPROBES", "2")), 3))
+PROXY_EMERGENCY_TRANSIENT_REPROBES = max(0, min(int(os.getenv("PROXY_EMERGENCY_TRANSIENT_REPROBES", "0")), 3))
 PROXY_EMERGENCY_TRANSIENT_MIN_AGE = max(30.0, float(os.getenv("PROXY_EMERGENCY_TRANSIENT_MIN_AGE", "45")))
 FINAL_KNOWN_GOOD_REPROBES = max(0, min(int(os.getenv("FINAL_KNOWN_GOOD_REPROBES", "1")), 1))
 PROXY_DEEP_EMERGENCY_TIMEOUT_MS = max(
@@ -210,6 +211,25 @@ SEARCH_TIME_BUDGET = max(45, int(os.getenv("SEARCH_TIME_BUDGET", "75")))
 MAX_SEARCH_ATTEMPTS = max(60, int(os.getenv("MAX_SEARCH_ATTEMPTS", "180")))
 FAILED_SEARCH_RETRY_MIN = max(2.0, float(os.getenv("FAILED_SEARCH_RETRY_MIN", "3")))
 FAILED_SEARCH_RETRY_MAX = max(FAILED_SEARCH_RETRY_MIN, float(os.getenv("FAILED_SEARCH_RETRY_MAX", "5")))
+
+# V6.18 FAST CONNECT: до тяжёлого запроса eBay быстро проверяем только TCP-доступность
+# самого proxy endpoint. Это НЕ дополнительный запрос к eBay и НЕ зависит от стороннего сайта.
+# Мёртвый proxy отсекается примерно за 1 сек. вместо ожидания 3.5 сек. eBay probe.
+PROXY_PREFLIGHT_ENABLED = (os.getenv("PROXY_PREFLIGHT_ENABLED", "true").strip().lower()
+                           not in ("0", "false", "no", "off"))
+PROXY_PREFLIGHT_CONNECT_TIMEOUT = max(0.5, min(float(os.getenv("PROXY_PREFLIGHT_CONNECT_TIMEOUT", "1.2")), 2.0))
+PROXY_PREFLIGHT_OK_TTL = max(60, int(os.getenv("PROXY_PREFLIGHT_OK_TTL", "300")))
+PROXY_PREFLIGHT_BAD_TTL = max(20, int(os.getenv("PROXY_PREFLIGHT_BAD_TTL", "45")))
+# Пока fixed proxy работает, тихо прогреваем маленькую очередь кандидатов только TCP-connect'ом.
+PROXY_PREFLIGHT_WARM_BATCH = max(0, min(int(os.getenv("PROXY_PREFLIGHT_WARM_BATCH", "8")), 16))
+PROXY_PREFLIGHT_WARM_CONCURRENCY = max(1, min(int(os.getenv("PROXY_PREFLIGHT_WARM_CONCURRENCY", "4")), 6))
+PROXY_PREFLIGHT_WARM_INTERVAL = max(10.0, float(os.getenv("PROXY_PREFLIGHT_WARM_INTERVAL", "20")))
+# Память outage живёт между соседними 75-секундными discovery. Ранее проверенные неизвестные
+# IP не исчезают из пула, но новые IP идут раньше. Known-good всё ещё может получить controlled retry.
+OUTAGE_HOST_MEMORY = max(90, int(os.getenv("OUTAGE_HOST_MEMORY", "240")))
+# 403/challenge на auction URL не должен жёстко банить основной monitor, но на короткое время
+# понижает приоритет того же exit IP для другой eBay-поверхности.
+EBAY_CROSS_SOFT_PENALTY = max(30, int(os.getenv("EBAY_CROSS_SOFT_PENALTY", "120")))
 
 # Успешные proxy запоминаем и относим к ним мягче после единичного сбоя.
 GOOD_PROXY_MEMORY = 60 * 60
@@ -458,12 +478,39 @@ class ProxyManager:
         self.standard_current = set()
         self.standard_first_seen_at = {}
 
+        # V6.18: preflight cache — только доступность TCP-порта proxy, без запроса к eBay.
+        self.preflight_ok_until = {}
+        self.preflight_bad_until = {}
+        self.preflight_last_result = {}
+        self.preflight_latency_ms = {}
+
+        # V6.18: память текущего outage между отдельными discovery-вызовами.
+        # Она не является blacklist: после TTL адрес снова становится обычным кандидатом.
+        self.outage_host_last_probe = {}
+        self.outage_proxy_last_probe = {}
+
+        # Мягкий cross-surface penalty (auction <-> main) после eBay 403/429.
+        self.soft_host_penalty_until = {}
+
     def _cleanup_bad_locked(self):
         now = time.time()
         for p in [p for p, until in self.bad_until.items() if until <= now]:
             self.bad_until.pop(p, None)
         for host in [h for h, until in self.host_bad_until.items() if until <= now]:
             self.host_bad_until.pop(host, None)
+        for p in [p for p, until in self.preflight_ok_until.items() if until <= now]:
+            self.preflight_ok_until.pop(p, None)
+            self.preflight_latency_ms.pop(p, None)
+        for p in [p for p, until in self.preflight_bad_until.items() if until <= now]:
+            self.preflight_bad_until.pop(p, None)
+            self.preflight_last_result.pop(p, None)
+        for host in [h for h, until in self.soft_host_penalty_until.items() if until <= now]:
+            self.soft_host_penalty_until.pop(host, None)
+        outage_cutoff = now - OUTAGE_HOST_MEMORY
+        for host in [h for h, ts in self.outage_host_last_probe.items() if ts < outage_cutoff]:
+            self.outage_host_last_probe.pop(host, None)
+        for p in [p for p, ts in self.outage_proxy_last_probe.items() if ts < outage_cutoff]:
+            self.outage_proxy_last_probe.pop(p, None)
 
         # Возвращаем proxy после cooldown, если он есть в свежем списке.
         current = set(self.proxies)
@@ -763,6 +810,114 @@ class ProxyManager:
         with self.lock:
             return self._is_recent_good_locked(proxy)
 
+    def _preflight_state_locked(self, proxy, now=None):
+        if not PROXY_PREFLIGHT_ENABLED:
+            return 'disabled'
+        if now is None:
+            now = time.time()
+        if self.preflight_ok_until.get(proxy, 0) > now:
+            return 'ok'
+        if self.preflight_bad_until.get(proxy, 0) > now:
+            return 'bad'
+        return 'unknown'
+
+    def preflight_state(self, proxy):
+        # Hot path: здесь не сканируем весь all_proxies через _cleanup_bad_locked().
+        # TTL проверяется непосредственно в _preflight_state_locked.
+        with self.lock:
+            return self._preflight_state_locked(proxy)
+
+    def preflight_failure_result(self, proxy):
+        with self.lock:
+            return self.preflight_last_result.get(proxy, 'proxy_error')
+
+    def preflight_connect_timeout(self, proxy):
+        """Standard 1500-ms pool проверяем быстрее; emergency-only даём чуть больше времени."""
+        with self.lock:
+            if proxy in self.standard_current:
+                return PROXY_PREFLIGHT_CONNECT_TIMEOUT
+        return min(2.0, max(PROXY_PREFLIGHT_CONNECT_TIMEOUT, PROXY_PREFLIGHT_CONNECT_TIMEOUT * 1.6))
+
+    def mark_preflight_result(self, proxy, ok, result=None, latency_ms=None):
+        if not proxy:
+            return
+        now = time.time()
+        with self.lock:
+            if ok:
+                self.preflight_ok_until[proxy] = now + PROXY_PREFLIGHT_OK_TTL
+                self.preflight_bad_until.pop(proxy, None)
+                self.preflight_last_result.pop(proxy, None)
+                if latency_ms is not None:
+                    self.preflight_latency_ms[proxy] = float(latency_ms)
+            else:
+                self.preflight_bad_until[proxy] = now + PROXY_PREFLIGHT_BAD_TTL
+                self.preflight_ok_until.pop(proxy, None)
+                self.preflight_latency_ms.pop(proxy, None)
+                self.preflight_last_result[proxy] = result or 'proxy_error'
+
+    def remember_outage_attempt(self, proxy):
+        if not proxy:
+            return
+        now = time.time()
+        host = _proxy_host(proxy)
+        with self.lock:
+            if host:
+                self.outage_host_last_probe[host] = now
+            self.outage_proxy_last_probe[proxy] = now
+
+    def clear_outage_memory(self):
+        with self.lock:
+            self.outage_host_last_probe.clear()
+            self.outage_proxy_last_probe.clear()
+
+    def _host_recent_outage_locked(self, host, now=None):
+        if not host:
+            return False
+        if now is None:
+            now = time.time()
+        ts = self.outage_host_last_probe.get(host, 0)
+        return bool(ts and (now - ts) < OUTAGE_HOST_MEMORY)
+
+    def mark_soft_host_penalty(self, host, seconds=EBAY_CROSS_SOFT_PENALTY, reason='cross-surface eBay block'):
+        if not host:
+            return
+        now = time.time()
+        with self.lock:
+            until = now + max(1, int(seconds))
+            self.soft_host_penalty_until[host] = max(self.soft_host_penalty_until.get(host, 0), until)
+        logging.info(f"🟠 Мягкий cross-surface penalty для host {host}: {int(seconds)} сек. ({reason})")
+
+    def get_preflight_candidates(self, limit, excluded_hosts=None):
+        """Кандидаты для тихого TCP-прогрева. Никаких запросов к eBay здесь нет."""
+        if not PROXY_PREFLIGHT_ENABLED or limit <= 0:
+            return []
+        excluded_hosts = set(excluded_hosts or ())
+        now = time.time()
+        with self.lock:
+            self._cleanup_bad_locked()
+            rows = []
+            used_hosts = set(excluded_hosts)
+            for p in self.proxies:
+                host = _proxy_host(p)
+                if not host or host in used_hosts:
+                    continue
+                if self.bad_until.get(p, 0) > now or self.host_bad_until.get(host, 0) > now:
+                    continue
+                if self._preflight_state_locked(p, now) != 'unknown':
+                    continue
+                rows.append(p)
+            rows.sort(key=lambda p: self._candidate_score_locked(p, now), reverse=True)
+            result = []
+            for p in rows:
+                host = _proxy_host(p)
+                if host in used_hosts:
+                    continue
+                result.append(p)
+                used_hosts.add(host)
+                if len(result) >= limit:
+                    break
+            return result
+
     def _candidate_score_locked(self, proxy, now):
         # V6.12: recently-good с 0-2 сбоями по-прежнему ценен, но после 3+ подряд
         # ошибок историческая репутация почти обнуляется. В V6.7 proxy с fail_streak=4
@@ -811,10 +966,18 @@ class ProxyManager:
         idle = now - self.last_used.get(proxy, 0)
         idle_bonus = min(4.0, idle / 60.0) if idle < 10**8 else 4.0
 
+        # TCP-preflight success — полезный, но не абсолютный сигнал: eBay всё равно решает окончательно.
+        preflight_bonus = 18.0 if self._preflight_state_locked(proxy, now) == 'ok' else 0.0
+        host = _proxy_host(proxy)
+        soft_penalty = 70.0 if self.soft_host_penalty_until.get(host, 0) > now else 0.0
+        outage_penalty = 0.0
+        if self._host_recent_outage_locked(host, now) and not self._is_recent_good_locked(proxy, now):
+            outage_penalty = 45.0
+
         return (
             recent_bonus + success_bonus + standard_bonus + fresh_standard_bonus
-            + scheme_bonus + idle_bonus
-            - fail_penalty - unstable_penalty - reason_penalty
+            + scheme_bonus + idle_bonus + preflight_bonus
+            - fail_penalty - unstable_penalty - reason_penalty - soft_penalty - outage_penalty
             + random.uniform(0, 2.0)
         )
 
@@ -854,7 +1017,8 @@ class ProxyManager:
                     if self.bad_until.get(p, 0) <= now:
                         candidates.append(p)
 
-            usable = []
+            fresh_usable = []
+            recycled_usable = []
             for p in candidates:
                 if self.bad_until.get(p, 0) > now:
                     continue
@@ -863,9 +1027,25 @@ class ProxyManager:
                     continue
                 if self.host_bad_until.get(host, 0) > now:
                     continue
-                usable.append(p)
+                # Если быстрый TCP-preflight недавно уже доказал, что endpoint мёртв,
+                # не тратим на него eBay worker и обычный attempt-counter до истечения короткого TTL.
+                if self._preflight_state_locked(p, now) == 'bad':
+                    continue
+                soft_penalized = self.soft_host_penalty_until.get(host, 0) > now
+                recent_outage_unknown = (
+                    self._host_recent_outage_locked(host, now)
+                    and not self._is_recent_good_locked(p, now)
+                )
+                if soft_penalized or recent_outage_unknown:
+                    recycled_usable.append(p)
+                else:
+                    fresh_usable.append(p)
 
-            usable.sort(key=lambda p: self._candidate_score_locked(p, now), reverse=True)
+            fresh_usable.sort(key=lambda p: self._candidate_score_locked(p, now), reverse=True)
+            recycled_usable.sort(key=lambda p: self._candidate_score_locked(p, now), reverse=True)
+            # Сначала реально новые IP; ранее проверенные в этом outage остаются fallback,
+            # поэтому мы ничего не теряем даже при небольшом/старом ProxyScrape pool.
+            usable = fresh_usable + recycled_usable
 
             batch = []
             batch_hosts = set()
@@ -886,7 +1066,15 @@ class ProxyManager:
             # конкурирует с остальными по score — это не даёт старой плохой истории
             # занимать все worker-слоты в тяжёлом discovery.
             for p in usable:
-                if self._is_recent_good_locked(p, now) and self.fail_streak.get(p, 0) <= 2:
+                last_reason = self.last_failure_result.get(p)
+                host = _proxy_host(p)
+                transport_retry_ok = last_reason in (None, 'proxy_timeout', 'proxy_error')
+                if (
+                    self._is_recent_good_locked(p, now)
+                    and self.fail_streak.get(p, 0) <= 2
+                    and transport_retry_ok
+                    and self.soft_host_penalty_until.get(host, 0) <= now
+                ):
                     add_candidate(p)
                     if len(batch) >= batch_size:
                         return batch
@@ -1074,8 +1262,16 @@ class ProxyManager:
             self.last_failure_result.pop(proxy, None)
             self.last_failure_at.pop(proxy, None)
             self.bad_until.pop(proxy, None)
-            # Если этот же IP только что доказал работоспособность, снимаем host cooldown.
+            # Реальный eBay success сильнее TCP-preflight: endpoint точно жив.
+            self.preflight_ok_until[proxy] = now + PROXY_PREFLIGHT_OK_TTL
+            self.preflight_bad_until.pop(proxy, None)
+            self.preflight_last_result.pop(proxy, None)
+            # Успех завершает outage — следующий будущий сбой должен начинать с чистой памяти.
+            self.outage_host_last_probe.clear()
+            self.outage_proxy_last_probe.clear()
+            # Если этот же IP только что доказал работоспособность, снимаем host cooldown/soft penalty.
             self.host_bad_until.pop(host, None)
+            self.soft_host_penalty_until.pop(host, None)
             if proxy not in self.proxies:
                 self.proxies.append(proxy)
 
@@ -1191,6 +1387,21 @@ auction_proxy_bad_until = {}
 auction_proxy_host_bad_until = {}
 auction_proxy_fail_streak = {}
 auction_proxy_success_at = {}
+
+
+def _auction_proxy_soft_host_penalty(proxy, reason, seconds=EBAY_CROSS_SOFT_PENALTY):
+    """Мягко понижает host для auction после 403/429 main-monitor, не создавая hard blacklist."""
+    if not proxy or reason not in ('blocked', 'rate_limited'):
+        return
+    host = _proxy_host(proxy)
+    if not host:
+        return
+    now = time.time()
+    with auction_proxy_state_lock:
+        auction_proxy_host_bad_until[host] = max(
+            auction_proxy_host_bad_until.get(host, 0),
+            now + max(1, int(seconds)),
+        )
 
 
 def close_session(session):
@@ -2515,7 +2726,7 @@ def _auction_proxy_mark_success(proxy):
 
 
 def _auction_proxy_mark_failure(proxy, reason):
-    """Auction-only cooldown. Основной proxy_manager здесь НЕ трогаем."""
+    """Auction-only cooldown + мягкий cross-surface signal для main monitor."""
     if not proxy or reason in (None, '', 'main_busy', 'main_unavailable', 'auction_cooldown', 'fixed_changed'):
         return 0
     reason = str(reason)
@@ -2537,8 +2748,6 @@ def _auction_proxy_mark_failure(proxy, reason):
             host_cooldown = min(cooldown, 600)
         elif reason in ('proxy_timeout', 'proxy_error'):
             cooldown = (45, 90, 180, 300)[min(streak - 1, 3)]
-            # Короткий host-cooldown не даёт сразу взять соседний порт того же IP,
-            # но не вычёркивает весь host надолго из-за одного transient-сбоя.
             host_cooldown = min(cooldown, 90)
         else:
             cooldown = (120, 300, 600)[min(streak - 1, 2)]
@@ -2549,11 +2758,19 @@ def _auction_proxy_mark_failure(proxy, reason):
             auction_proxy_host_bad_until[host] = max(
                 auction_proxy_host_bad_until.get(host, 0), now + host_cooldown
             )
-        logging.info(
-            f"Auction-only cooldown {proxy}: {cooldown} сек., причина={reason}, "
-            f"fail_streak={streak}; основной monitor не штрафуется"
+
+    # 403/429 — сигнал именно eBay по exit IP. Не делаем hard-ban main monitor,
+    # а лишь временно понижаем этот host: если альтернатив нет, он всё равно сможет вернуться.
+    if host and reason in ('blocked', 'rate_limited'):
+        proxy_manager.mark_soft_host_penalty(
+            host, EBAY_CROSS_SOFT_PENALTY, reason=f'auction {reason}'
         )
-        return cooldown
+
+    logging.info(
+        f"Auction-only cooldown {proxy}: {cooldown} сек., причина={reason}, "
+        f"fail_streak={streak}; основной monitor получает только soft penalty"
+    )
+    return cooldown
 
 
 def _auction_transport_result(exc):
@@ -5562,8 +5779,59 @@ def _make_request(proxy, profile, session=None, timeout=None):
         return 'proxy_error', None, None if own_session else session
 
 
+def _tcp_preflight_proxy(proxy, force=False):
+    """
+    Быстрая проверка только TCP-доступности proxy endpoint.
+
+    Никаких запросов к eBay/Google/Cloudflare: открываем TCP к ip:port proxy и сразу закрываем.
+    Это специально fail-fast фильтр, а не доказательство, что eBay пропустит данный IP.
+    """
+    if not PROXY_PREFLIGHT_ENABLED or not proxy:
+        return True, None
+
+    if not force:
+        state = proxy_manager.preflight_state(proxy)
+        if state == 'ok':
+            return True, None
+        if state == 'bad':
+            return False, proxy_manager.preflight_failure_result(proxy)
+
+    try:
+        parts = urlsplit(proxy)
+        host = parts.hostname
+        port = parts.port
+        scheme = (parts.scheme or 'http').lower()
+        if not host:
+            proxy_manager.mark_preflight_result(proxy, False, 'proxy_error')
+            return False, 'proxy_error'
+        if port is None:
+            port = 1080 if scheme == 'socks5' else (443 if scheme == 'https' else 80)
+
+        started = time.monotonic()
+        connect_timeout = proxy_manager.preflight_connect_timeout(proxy)
+        sock = socket.create_connection((host, int(port)), timeout=connect_timeout)
+        try:
+            latency_ms = (time.monotonic() - started) * 1000.0
+            proxy_manager.mark_preflight_result(proxy, True, latency_ms=latency_ms)
+            return True, None
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
+    except (socket.timeout, TimeoutError):
+        proxy_manager.mark_preflight_result(proxy, False, 'proxy_timeout')
+        return False, 'proxy_timeout'
+    except Exception:
+        proxy_manager.mark_preflight_result(proxy, False, 'proxy_error')
+        return False, 'proxy_error'
+
+
 def _probe_proxy(proxy, profile, timeout):
-    """Одна discovery-проверка. У каждой задачи своя Session — thread-safe."""
+    """Одна discovery-проверка: быстрый TCP preflight -> только затем eBay."""
+    ok, preflight_result = _tcp_preflight_proxy(proxy, force=False)
+    if not ok:
+        return preflight_result or 'proxy_error', None, None
     return _make_request(
         proxy,
         profile,
@@ -5588,6 +5856,7 @@ def _cleanup_late_probe_future(future, proxy):
             logging.info(f"🟢 Запомнен запасной успешный proxy {proxy} (late probe)")
         elif result != 'profile_error':
             proxy_manager.mark_failure(proxy, result, reason=f'{result} (late probe)')
+            _auction_proxy_soft_host_penalty(proxy, result)
     finally:
         close_session(session)
 
@@ -5676,6 +5945,7 @@ def fetch_ebay_html_with_fixed_pair():
                 result,
                 reason=f'{result} на ранее успешной fixed session',
             )
+            _auction_proxy_soft_host_penalty(old_proxy, result)
 
         logging.info("Ищем новую рабочую пару...")
 
@@ -5912,6 +6182,7 @@ def fetch_ebay_html_with_fixed_pair():
                 break
             tried_hosts.add(_proxy_host(proxy))
             tried_proxies.add(proxy)
+            proxy_manager.remember_outage_attempt(proxy)
             attempts += 1
             kind = batch_kinds.get(proxy, 'Probe')
             limit_label = f"{MAX_SEARCH_ATTEMPTS}+1" if is_final_extra else str(MAX_SEARCH_ATTEMPTS)
@@ -5989,6 +6260,7 @@ def fetch_ebay_html_with_fixed_pair():
                 else:
                     close_session(session)
                     proxy_manager.mark_failure(proxy, result, reason=result)
+                    _auction_proxy_soft_host_penalty(proxy, result)
 
             if winner is not None:
                 for future, proxy in list(future_to_proxy.items()):
@@ -6691,6 +6963,55 @@ def check_and_send_new_items():
     return 'ok'
 
 
+def proxy_preflight_warm_worker():
+    """
+    Пока основной fixed proxy исправен, заранее проверяет TCP-порты маленькой пачки резервов.
+    Работает без eBay-запросов и не мешает main_fixed_request_lock.
+    """
+    db_ready_event.wait()
+    logging.info(
+        f"🧪 TCP preflight worker запущен: batch={PROXY_PREFLIGHT_WARM_BATCH}, "
+        f"timeout={PROXY_PREFLIGHT_CONNECT_TIMEOUT:.1f}s"
+    )
+    while True:
+        try:
+            if (
+                not PROXY_PREFLIGHT_ENABLED
+                or PROXY_PREFLIGHT_WARM_BATCH <= 0
+                or is_paused
+                or fixed_proxy is None
+            ):
+                time.sleep(PROXY_PREFLIGHT_WARM_INTERVAL)
+                continue
+
+            excluded = {_proxy_host(fixed_proxy)} if fixed_proxy else set()
+            candidates = proxy_manager.get_preflight_candidates(
+                PROXY_PREFLIGHT_WARM_BATCH, excluded_hosts=excluded
+            )
+            if candidates:
+                with ThreadPoolExecutor(
+                    max_workers=min(PROXY_PREFLIGHT_WARM_CONCURRENCY, len(candidates)),
+                    thread_name_prefix='proxy-preflight',
+                ) as executor:
+                    futures = [executor.submit(_tcp_preflight_proxy, p, True) for p in candidates]
+                    ok_count = 0
+                    for future in futures:
+                        try:
+                            ok, _reason = future.result()
+                            if ok:
+                                ok_count += 1
+                        except Exception:
+                            pass
+                logging.info(
+                    f"🧪 TCP preflight: живых {ok_count}/{len(candidates)}; "
+                    "они получат приоритет при следующем discovery"
+                )
+            time.sleep(PROXY_PREFLIGHT_WARM_INTERVAL)
+        except Exception as e:
+            logging.warning(f"TCP preflight worker: {e}")
+            time.sleep(PROXY_PREFLIGHT_WARM_INTERVAL)
+
+
 def bot_worker():
     global is_paused
     logging.info("🤖 Бот-воркер запущен")
@@ -6707,7 +7028,7 @@ def bot_worker():
     seen_line = f"\n📚 В базе: {seen_total} товаров." if seen_total is not None else ""
     send_telegram_message(
         startup_line +
-        "\n🇬🇧 eBay UK monitor v6.17 работает." +
+        "\n🇬🇧 eBay UK monitor v6.18 FastConnect работает." +
         seen_line +
         "\nКоманды: /stop /start /list (/auctions) /delauction НОМЕР_ЛОТА"
         "\nМожно отправить ссылку на eBay-аукцион — сохраню точное время и напомню заранее.",
@@ -6750,6 +7071,7 @@ def start_leader_workers():
 
     threading.Thread(target=telegram_listener, daemon=True, name='telegram-listener').start()
     threading.Thread(target=connection_watchdog, daemon=True, name='connection-watchdog').start()
+    threading.Thread(target=proxy_preflight_warm_worker, daemon=True, name='proxy-preflight-worker').start()
     threading.Thread(target=auction_link_worker, daemon=True, name='auction-link-worker').start()
     threading.Thread(target=auction_reminder_worker, daemon=True, name='auction-reminder-worker').start()
     threading.Thread(target=auction_status_worker, daemon=True, name='auction-status-worker').start()
@@ -6791,7 +7113,7 @@ def leader_supervisor():
 @app.route('/')
 def index():
     role = "leader" if leader_active_event.is_set() else "standby"
-    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.17, {role})"
+    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.18 FastConnect, {role})"
 
 
 @app.route('/health')
