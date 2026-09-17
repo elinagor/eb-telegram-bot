@@ -212,18 +212,58 @@ MAX_SEARCH_ATTEMPTS = max(60, int(os.getenv("MAX_SEARCH_ATTEMPTS", "180")))
 FAILED_SEARCH_RETRY_MIN = max(2.0, float(os.getenv("FAILED_SEARCH_RETRY_MIN", "3")))
 FAILED_SEARCH_RETRY_MAX = max(FAILED_SEARCH_RETRY_MIN, float(os.getenv("FAILED_SEARCH_RETRY_MAX", "5")))
 
-# V6.18 FAST CONNECT: до тяжёлого запроса eBay быстро проверяем только TCP-доступность
-# самого proxy endpoint. Это НЕ дополнительный запрос к eBay и НЕ зависит от стороннего сайта.
-# Мёртвый proxy отсекается примерно за 1 сек. вместо ожидания 3.5 сек. eBay probe.
+# V6.19 SMART RESERVE.
+# Уровень 1: очень дешёвый TCP-check самого proxy endpoint.
+# Уровень 2: в фоне, ТОЛЬКО пока fixed proxy работает, проверяем реальную способность proxy
+# провести HTTPS-туннель + валидный TLS к нейтральному example.com. HTTP-запрос к eBay
+# при этом НЕ отправляется. Так отсеиваются CONNECT 400/500/503, SOCKS-ошибки и SSL/MITM,
+# которые обычный TCP-open ошибочно считает "живыми".
 PROXY_PREFLIGHT_ENABLED = (os.getenv("PROXY_PREFLIGHT_ENABLED", "true").strip().lower()
                            not in ("0", "false", "no", "off"))
-PROXY_PREFLIGHT_CONNECT_TIMEOUT = max(0.5, min(float(os.getenv("PROXY_PREFLIGHT_CONNECT_TIMEOUT", "1.2")), 2.0))
-PROXY_PREFLIGHT_OK_TTL = max(60, int(os.getenv("PROXY_PREFLIGHT_OK_TTL", "300")))
-PROXY_PREFLIGHT_BAD_TTL = max(20, int(os.getenv("PROXY_PREFLIGHT_BAD_TTL", "45")))
-# Пока fixed proxy работает, тихо прогреваем маленькую очередь кандидатов только TCP-connect'ом.
-PROXY_PREFLIGHT_WARM_BATCH = max(0, min(int(os.getenv("PROXY_PREFLIGHT_WARM_BATCH", "8")), 16))
-PROXY_PREFLIGHT_WARM_CONCURRENCY = max(1, min(int(os.getenv("PROXY_PREFLIGHT_WARM_CONCURRENCY", "4")), 6))
-PROXY_PREFLIGHT_WARM_INTERVAL = max(10.0, float(os.getenv("PROXY_PREFLIGHT_WARM_INTERVAL", "20")))
+PROXY_PREFLIGHT_CONNECT_TIMEOUT = max(
+    0.5, min(float(os.getenv("PROXY_PREFLIGHT_CONNECT_TIMEOUT", "1.2")), 2.0)
+)
+# TCP-сигнал держим недолго: бесплатный proxy может умереть через минуту.
+PROXY_PREFLIGHT_OK_TTL = max(45, int(os.getenv("PROXY_PREFLIGHT_OK_TTL", "90")))
+PROXY_PREFLIGHT_BAD_TTL = max(15, int(os.getenv("PROXY_PREFLIGHT_BAD_TTL", "30")))
+
+# Более строгая фоновая проверка HTTPS capability. example.com выбран как маленький,
+# стандартный и нейтральный TLS endpoint; после handshake соединение сразу закрывается.
+PROXY_QUALITY_PREFLIGHT_ENABLED = (
+    os.getenv("PROXY_QUALITY_PREFLIGHT_ENABLED", "true").strip().lower()
+    not in ("0", "false", "no", "off")
+)
+PROXY_QUALITY_HOST = (os.getenv("PROXY_QUALITY_HOST", "example.com").strip() or "example.com")
+PROXY_QUALITY_PORT = max(1, min(int(os.getenv("PROXY_QUALITY_PORT", "443")), 65535))
+PROXY_QUALITY_TIMEOUT = max(1.2, min(float(os.getenv("PROXY_QUALITY_TIMEOUT", "3.0")), 4.0))
+PROXY_QUALITY_OK_TTL = max(60, int(os.getenv("PROXY_QUALITY_OK_TTL", "120")))
+PROXY_QUALITY_BAD_TTL = max(20, int(os.getenv("PROXY_QUALITY_BAD_TTL", "45")))
+
+# Не пытаемся "прогреть весь интернет". Цель — постоянно иметь 12-16 СВЕЖИХ
+# HTTPS-capable резервов. 16 кандидатов за проход = 2x прежних 8, но после достижения
+# target worker переключается на маленький maintenance batch.
+PROXY_PREFLIGHT_WARM_BATCH = max(4, min(int(os.getenv("PROXY_PREFLIGHT_WARM_BATCH", "16")), 24))
+PROXY_PREFLIGHT_WARM_CONCURRENCY = max(
+    2, min(int(os.getenv("PROXY_PREFLIGHT_WARM_CONCURRENCY", "6")), 8)
+)
+PROXY_PREFLIGHT_WARM_INTERVAL = max(10.0, float(os.getenv("PROXY_PREFLIGHT_WARM_INTERVAL", "15")))
+PROXY_PREFLIGHT_RESERVE_TARGET = max(
+    4, min(int(os.getenv("PROXY_PREFLIGHT_RESERVE_TARGET", "12")), 24)
+)
+PROXY_PREFLIGHT_MAINTENANCE_BATCH = max(
+    2, min(int(os.getenv("PROXY_PREFLIGHT_MAINTENANCE_BATCH", "4")), 8)
+)
+PROXY_PREFLIGHT_RETAIN_MAX = max(
+    PROXY_PREFLIGHT_RESERVE_TARGET,
+    min(int(os.getenv("PROXY_PREFLIGHT_RETAIN_MAX", "48")), 96),
+)
+
+# Если первый fixed request уже висел очень долго, второй recovery только откладывает failover.
+# Быстрый reset/короткий connect-timeout по-прежнему получает один шанс с новой Session.
+FIXED_RECOVERY_SKIP_AFTER = max(
+    8.0, float(os.getenv("FIXED_RECOVERY_SKIP_AFTER", "18"))
+)
+
 # Память outage живёт между соседними 75-секундными discovery. Ранее проверенные неизвестные
 # IP не исчезают из пула, но новые IP идут раньше. Known-good всё ещё может получить controlled retry.
 OUTAGE_HOST_MEMORY = max(90, int(os.getenv("OUTAGE_HOST_MEMORY", "240")))
@@ -336,6 +376,8 @@ is_paused = False
 auction_link_wakeup_event = threading.Event()
 auction_reminder_wakeup_event = threading.Event()
 auction_status_wakeup_event = threading.Event()
+# Новый fixed proxy будит Smart Reserve немедленно, а не ждёт до 15 сек. polling interval.
+proxy_preflight_wakeup_event = threading.Event()
 db_ready_event = threading.Event()
 leader_active_event = threading.Event()
 
@@ -478,13 +520,17 @@ class ProxyManager:
         self.standard_current = set()
         self.standard_first_seen_at = {}
 
-        # V6.18: preflight cache — только доступность TCP-порта proxy, без запроса к eBay.
+        # V6.19: быстрый TCP cache + отдельный более сильный HTTPS/TLS quality cache.
         self.preflight_ok_until = {}
         self.preflight_bad_until = {}
         self.preflight_last_result = {}
         self.preflight_latency_ms = {}
+        self.quality_ok_until = {}
+        self.quality_bad_until = {}
+        self.quality_last_result = {}
+        self.quality_latency_ms = {}
 
-        # V6.18: память текущего outage между отдельными discovery-вызовами.
+        # V6.19: память текущего outage между отдельными discovery-вызовами.
         # Она не является blacklist: после TTL адрес снова становится обычным кандидатом.
         self.outage_host_last_probe = {}
         self.outage_proxy_last_probe = {}
@@ -504,6 +550,12 @@ class ProxyManager:
         for p in [p for p, until in self.preflight_bad_until.items() if until <= now]:
             self.preflight_bad_until.pop(p, None)
             self.preflight_last_result.pop(p, None)
+        for p in [p for p, until in self.quality_ok_until.items() if until <= now]:
+            self.quality_ok_until.pop(p, None)
+            self.quality_latency_ms.pop(p, None)
+        for p in [p for p, until in self.quality_bad_until.items() if until <= now]:
+            self.quality_bad_until.pop(p, None)
+            self.quality_last_result.pop(p, None)
         for host in [h for h, until in self.soft_host_penalty_until.items() if until <= now]:
             self.soft_host_penalty_until.pop(host, None)
         outage_cutoff = now - OUTAGE_HOST_MEMORY
@@ -622,12 +674,43 @@ class ProxyManager:
                         f"(proxy cooldown: {len(self.bad_until)}, host cooldown: {len(self.host_bad_until)})"
                     )
                 else:
-                    self.all_proxies = new_proxies
                     self.standard_current = set(new_proxies)
                     for p in new_proxies:
                         self.standard_first_seen_at.setdefault(p, now)
+
+                    # V6.19: standard refresh больше НЕ выбрасывает только что прогретый
+                    # резерв. В v6.18 preflight мог найти хорошие TCP endpoint-ы, но через
+                    # минуту новый ProxyScrape snapshot заменял self.proxies целиком прямо
+                    # перед failover. Сохраняем ограниченное число свежих warm/known-good
+                    # endpoint-ов до конца их TTL.
+                    warm_candidates = set()
+                    warm_candidates.update(
+                        p for p, until in self.quality_ok_until.items() if until > now
+                    )
+                    warm_candidates.update(
+                        p for p, until in self.preflight_ok_until.items() if until > now
+                    )
+                    warm_candidates.update(
+                        p for p, ts in self.last_success_at.items()
+                        if (now - ts) <= GOOD_PROXY_MEMORY
+                    )
+                    warm_candidates.difference_update(self.standard_current)
+
+                    def _retain_key(p):
+                        quality = 1 if self.quality_ok_until.get(p, 0) > now else 0
+                        tcp = 1 if self.preflight_ok_until.get(p, 0) > now else 0
+                        ebay = 1 if (now - self.last_success_at.get(p, 0)) <= GOOD_PROXY_MEMORY else 0
+                        latency = self.quality_latency_ms.get(
+                            p, self.preflight_latency_ms.get(p, 999999.0)
+                        )
+                        return (ebay, quality, tcp, -float(latency))
+
+                    retained = sorted(warm_candidates, key=_retain_key, reverse=True)
+                    retained = retained[:PROXY_PREFLIGHT_RETAIN_MAX]
+                    merged_standard = list(dict.fromkeys(new_proxies + retained))
+                    self.all_proxies = merged_standard
                     self.proxies = [
-                        p for p in new_proxies
+                        p for p in merged_standard
                         if self.bad_until.get(p, 0) <= now
                         and self.host_bad_until.get(_proxy_host(p), 0) <= now
                     ]
@@ -647,7 +730,8 @@ class ProxyManager:
 
                     logging.info(
                         f"Пул proxy обновлён: {len(self.proxies)} доступно "
-                        f"(proxy cooldown: {len(self.bad_until)}, host cooldown: {len(self.host_bad_until)})"
+                        f"(standard={len(new_proxies)}, warm retained={len(retained)}, "
+                        f"proxy cooldown: {len(self.bad_until)}, host cooldown: {len(self.host_bad_until)})"
                     )
                 return True
             elif not self.proxies:
@@ -855,6 +939,186 @@ class ProxyManager:
                 self.preflight_latency_ms.pop(proxy, None)
                 self.preflight_last_result[proxy] = result or 'proxy_error'
 
+    def _quality_state_locked(self, proxy, now=None):
+        if not PROXY_QUALITY_PREFLIGHT_ENABLED:
+            return 'disabled'
+        if now is None:
+            now = time.time()
+        if self.quality_ok_until.get(proxy, 0) > now:
+            return 'ok'
+        if self.quality_bad_until.get(proxy, 0) > now:
+            return 'bad'
+        return 'unknown'
+
+    def quality_state(self, proxy):
+        with self.lock:
+            return self._quality_state_locked(proxy)
+
+    def quality_failure_result(self, proxy):
+        with self.lock:
+            return self.quality_last_result.get(proxy, 'proxy_error')
+
+    def mark_quality_result(self, proxy, ok, result=None, latency_ms=None):
+        """Soft cache: quality failure НЕ создаёт main cooldown и не банит endpoint."""
+        if not proxy:
+            return
+        now = time.time()
+        with self.lock:
+            if ok:
+                self.quality_ok_until[proxy] = now + PROXY_QUALITY_OK_TTL
+                self.quality_bad_until.pop(proxy, None)
+                self.quality_last_result.pop(proxy, None)
+                if latency_ms is not None:
+                    self.quality_latency_ms[proxy] = float(latency_ms)
+            else:
+                self.quality_bad_until[proxy] = now + PROXY_QUALITY_BAD_TTL
+                self.quality_ok_until.pop(proxy, None)
+                self.quality_latency_ms.pop(proxy, None)
+                self.quality_last_result[proxy] = result or 'proxy_error'
+
+    def warm_reserve_stats(self):
+        now = time.time()
+        with self.lock:
+            self._cleanup_bad_locked()
+            quality = 0
+            tcp_only = 0
+            used_hosts = set()
+            candidates = list(dict.fromkeys(
+                list(self.proxies)
+                + list(self.quality_ok_until.keys())
+                + list(self.preflight_ok_until.keys())
+            ))
+            for p in candidates:
+                host = _proxy_host(p)
+                if not host or host in used_hosts:
+                    continue
+                if self.bad_until.get(p, 0) > now or self.host_bad_until.get(host, 0) > now:
+                    continue
+                if self._quality_state_locked(p, now) == 'ok':
+                    quality += 1
+                    used_hosts.add(host)
+                elif self._preflight_state_locked(p, now) == 'ok':
+                    tcp_only += 1
+                    used_hosts.add(host)
+            return quality, tcp_only
+
+    def get_quality_preflight_candidates(self, limit, excluded_hosts=None):
+        """Кандидаты, которым ещё не делали свежую HTTPS/TLS quality-проверку."""
+        if not PROXY_PREFLIGHT_ENABLED or limit <= 0:
+            return []
+        excluded_hosts = set(excluded_hosts or ())
+        now = time.time()
+        with self.lock:
+            self._cleanup_bad_locked()
+            rows = []
+            used_hosts = set(excluded_hosts)
+            for p in self.proxies:
+                host = _proxy_host(p)
+                if not host or host in used_hosts:
+                    continue
+                if self.bad_until.get(p, 0) > now or self.host_bad_until.get(host, 0) > now:
+                    continue
+                if self._quality_state_locked(p, now) != 'unknown':
+                    continue
+                if self._preflight_state_locked(p, now) == 'bad':
+                    continue
+                rows.append(p)
+
+            # TCP-open идёт первым, затем ещё неизвестные; внутри — обычный score.
+            rows.sort(
+                key=lambda p: (
+                    1 if self._preflight_state_locked(p, now) == 'ok' else 0,
+                    self._candidate_score_locked(p, now),
+                ),
+                reverse=True,
+            )
+            result = []
+            for p in rows:
+                host = _proxy_host(p)
+                if host in used_hosts:
+                    continue
+                result.append(p)
+                used_hosts.add(host)
+                if len(result) >= limit:
+                    break
+            return result
+
+    def get_warm_standby_candidates(self, limit, excluded_hosts=None):
+        """
+        Возвращает резерв БЕЗ refresh ProxyScrape: сначала HTTPS/TLS-verified,
+        затем максимум несколько свежих TCP-only. Используется сразу после падения fixed proxy.
+        """
+        if limit <= 0:
+            return []
+        excluded_hosts = set(excluded_hosts or ())
+        now = time.time()
+        with self.lock:
+            self._cleanup_bad_locked()
+            universe = list(dict.fromkeys(
+                list(self.proxies)
+                + list(self.quality_ok_until.keys())
+                + list(self.preflight_ok_until.keys())
+                + list(self.last_success_at.keys())
+            ))
+            quality = []
+            tcp = []
+            known = []
+            for p in universe:
+                host = _proxy_host(p)
+                if not host or host in excluded_hosts:
+                    continue
+                if self.bad_until.get(p, 0) > now or self.host_bad_until.get(host, 0) > now:
+                    continue
+                if self.soft_host_penalty_until.get(host, 0) > now:
+                    continue
+                last_reason = self.last_failure_result.get(p)
+                if (
+                    self._is_recent_good_locked(p, now)
+                    and self.fail_streak.get(p, 0) <= 2
+                    and last_reason in (None, 'proxy_timeout', 'proxy_error')
+                ):
+                    known.append(p)
+                elif self._quality_state_locked(p, now) == 'ok':
+                    quality.append(p)
+                elif self._preflight_state_locked(p, now) == 'ok':
+                    tcp.append(p)
+
+            def _standby_key(p):
+                qlat = self.quality_latency_ms.get(p, 999999.0)
+                tlat = self.preflight_latency_ms.get(p, 999999.0)
+                return (
+                    self._candidate_score_locked(p, now),
+                    -min(qlat, tlat),
+                )
+
+            known.sort(key=_standby_key, reverse=True)
+            quality.sort(key=_standby_key, reverse=True)
+            tcp.sort(key=_standby_key, reverse=True)
+
+            result = []
+            used_hosts = set(excluded_hosts)
+
+            def add_group(group, max_from_group=None):
+                added = 0
+                for p in group:
+                    if len(result) >= limit:
+                        break
+                    if max_from_group is not None and added >= max_from_group:
+                        break
+                    host = _proxy_host(p)
+                    if not host or host in used_hosts:
+                        continue
+                    result.append(p)
+                    used_hosts.add(host)
+                    self.last_used[p] = now
+                    added += 1
+
+            add_group(known)
+            add_group(quality)
+            # TCP-only — слабый сигнал. Не заполняем им весь первый batch.
+            add_group(tcp, max_from_group=1)
+            return result
+
     def remember_outage_attempt(self, proxy):
         if not proxy:
             return
@@ -966,8 +1230,15 @@ class ProxyManager:
         idle = now - self.last_used.get(proxy, 0)
         idle_bonus = min(4.0, idle / 60.0) if idle < 10**8 else 4.0
 
-        # TCP-preflight success — полезный, но не абсолютный сигнал: eBay всё равно решает окончательно.
-        preflight_bonus = 18.0 if self._preflight_state_locked(proxy, now) == 'ok' else 0.0
+        # V6.19: TCP-open — слабый сигнал, HTTPS/TLS quality — сильный.
+        # Quality не гарантирует eBay 200 (IP ещё может получить 403), но уже доказывает,
+        # что endpoint реально умеет HTTPS tunnel без MITM/reject.
+        tcp_state = self._preflight_state_locked(proxy, now)
+        quality_state = self._quality_state_locked(proxy, now)
+        preflight_bonus = 12.0 if tcp_state == 'ok' else 0.0
+        quality_bonus = 85.0 if quality_state == 'ok' else 0.0
+        quality_bad_penalty = 28.0 if quality_state == 'bad' else 0.0
+
         host = _proxy_host(proxy)
         soft_penalty = 70.0 if self.soft_host_penalty_until.get(host, 0) > now else 0.0
         outage_penalty = 0.0
@@ -976,8 +1247,9 @@ class ProxyManager:
 
         return (
             recent_bonus + success_bonus + standard_bonus + fresh_standard_bonus
-            + scheme_bonus + idle_bonus + preflight_bonus
-            - fail_penalty - unstable_penalty - reason_penalty - soft_penalty - outage_penalty
+            + scheme_bonus + idle_bonus + preflight_bonus + quality_bonus
+            - fail_penalty - unstable_penalty - reason_penalty
+            - quality_bad_penalty - soft_penalty - outage_penalty
             + random.uniform(0, 2.0)
         )
 
@@ -1010,13 +1282,26 @@ class ProxyManager:
             self._cleanup_bad_locked()
             candidates = list(self.proxies)
 
-            # Недавно успешный proxy можно повторно проверить даже если его временно
-            # нет в текущем снимке ProxyScrape.
-            for p, ts in self.last_success_at.items():
-                if now - ts <= GOOD_PROXY_MEMORY and p not in candidates:
-                    if self.bad_until.get(p, 0) <= now:
-                        candidates.append(p)
+            # Недавно успешный ИЛИ прогретый reserve можно использовать даже если endpoint
+            # исчез из очередного ProxyScrape snapshot. Это устраняет главный недостаток
+            # v6.18: warm cache был, но refresh мог выкинуть сам endpoint из active pool.
+            warm_extra = set()
+            warm_extra.update(
+                p for p, ts in self.last_success_at.items()
+                if now - ts <= GOOD_PROXY_MEMORY
+            )
+            warm_extra.update(
+                p for p, until in self.quality_ok_until.items() if until > now
+            )
+            warm_extra.update(
+                p for p, until in self.preflight_ok_until.items() if until > now
+            )
+            for p in warm_extra:
+                if p not in candidates and self.bad_until.get(p, 0) <= now:
+                    candidates.append(p)
 
+            quality_usable = []
+            tcp_usable = []
             fresh_usable = []
             recycled_usable = []
             for p in candidates:
@@ -1036,16 +1321,26 @@ class ProxyManager:
                     self._host_recent_outage_locked(host, now)
                     and not self._is_recent_good_locked(p, now)
                 )
-                if soft_penalized or recent_outage_unknown:
+                quality_state = self._quality_state_locked(p, now)
+                tcp_state = self._preflight_state_locked(p, now)
+
+                if quality_state == 'ok' and not soft_penalized:
+                    quality_usable.append(p)
+                elif tcp_state == 'ok' and quality_state != 'bad' and not soft_penalized:
+                    tcp_usable.append(p)
+                elif soft_penalized or recent_outage_unknown or quality_state == 'bad':
                     recycled_usable.append(p)
                 else:
                     fresh_usable.append(p)
 
+            quality_usable.sort(key=lambda p: self._candidate_score_locked(p, now), reverse=True)
+            tcp_usable.sort(key=lambda p: self._candidate_score_locked(p, now), reverse=True)
             fresh_usable.sort(key=lambda p: self._candidate_score_locked(p, now), reverse=True)
             recycled_usable.sort(key=lambda p: self._candidate_score_locked(p, now), reverse=True)
-            # Сначала реально новые IP; ранее проверенные в этом outage остаются fallback,
-            # поэтому мы ничего не теряем даже при небольшом/старом ProxyScrape pool.
-            usable = fresh_usable + recycled_usable
+            # HTTPS/TLS-verified reserve идёт раньше неизвестных. TCP-only полезен, но
+            # не должен забить все worker slots — в реальном логе TCP-open было ~71%,
+            # а CONNECT/SSL failures всё равно оставались частыми.
+            usable = quality_usable + tcp_usable + fresh_usable + recycled_usable
 
             batch = []
             batch_hosts = set()
@@ -1079,7 +1374,24 @@ class ProxyManager:
                     if len(batch) >= batch_size:
                         return batch
 
-            # 2) Rolling-discovery иногда просит всего один новый слот. Если текущий
+            # 2) Свежий HTTPS/TLS-verified reserve важнее protocol mix.
+            # Если есть 4 действительно HTTPS-capable endpoint-а, лучше дать им все 4
+            # слота, чем искусственно подмешивать непроверенный SOCKS5.
+            for p in quality_usable:
+                add_candidate(p)
+                if len(batch) >= batch_size:
+                    return batch
+
+            # TCP-only — только один дополнительный слот: лог v6.18 показал, что сам
+            # открытый порт слишком слабый признак и не должен забивать весь batch.
+            tcp_added = 0
+            for p in tcp_usable:
+                if add_candidate(p):
+                    tcp_added += 1
+                    if tcp_added >= 1 or len(batch) >= batch_size:
+                        break
+
+            # 3) Rolling-discovery иногда просит всего один новый слот. Если текущий
             # in-flight набор остался без SOCKS5, preferred_scheme='socks5' не даёт
             # HTTP-бонусу снова вытеснить весь SOCKS5-пул.
             if preferred_scheme and len(batch) < batch_size:
@@ -1091,7 +1403,7 @@ class ProxyManager:
                     if _proxy_scheme(p) == preferred_scheme and add_candidate(p):
                         break
 
-            # 3) Для новых адресов используем примерно 3:1 HTTP:SOCKS5 (2:1 при batch=3).
+            # 4) Для новых адресов используем примерно 3:1 HTTP:SOCKS5 (2:1 при batch=3).
             # Это сохраняет приоритет HTTP по реальным UK-логам, но не оставляет 150-200
             # SOCKS5 вообще непроверенными до истечения discovery budget.
             remaining = batch_size - len(batch)
@@ -1107,7 +1419,7 @@ class ProxyManager:
                             if need_socks <= 0 or len(batch) >= batch_size:
                                 break
 
-            # 4) Остальные слоты в первую очередь HTTP/HTTPS, затем любой protocol.
+            # 5) Остальные слоты в первую очередь HTTP/HTTPS, затем любой protocol.
             if len(batch) < batch_size:
                 for p in usable:
                     if _proxy_scheme(p) in ('http', 'https'):
@@ -1262,10 +1574,13 @@ class ProxyManager:
             self.last_failure_result.pop(proxy, None)
             self.last_failure_at.pop(proxy, None)
             self.bad_until.pop(proxy, None)
-            # Реальный eBay success сильнее TCP-preflight: endpoint точно жив.
+            # Реальный eBay success сильнее любого preflight: endpoint точно проводит HTTPS.
             self.preflight_ok_until[proxy] = now + PROXY_PREFLIGHT_OK_TTL
             self.preflight_bad_until.pop(proxy, None)
             self.preflight_last_result.pop(proxy, None)
+            self.quality_ok_until[proxy] = now + PROXY_QUALITY_OK_TTL
+            self.quality_bad_until.pop(proxy, None)
+            self.quality_last_result.pop(proxy, None)
             # Успех завершает outage — следующий будущий сбой должен начинать с чистой памяти.
             self.outage_host_last_probe.clear()
             self.outage_proxy_last_probe.clear()
@@ -1347,6 +1662,17 @@ class ProxyManager:
                 and reason and 'fixed session' in str(reason)
             ):
                 host_cooldown = max(host_cooldown, 15)
+
+            # Transport/TLS failure означает, что старый warm-quality сигнал уже устарел.
+            # 403/429 сюда не относятся: туннель технически исправен, eBay лишь отклонил IP.
+            if result in ('proxy_ssl', 'proxy_rejected', 'proxy_timeout', 'proxy_error'):
+                self.quality_ok_until.pop(proxy, None)
+                self.quality_latency_ms.pop(proxy, None)
+                self.quality_bad_until[proxy] = max(
+                    self.quality_bad_until.get(proxy, 0),
+                    now + PROXY_QUALITY_BAD_TTL,
+                )
+                self.quality_last_result[proxy] = result
 
             self.bad_until[proxy] = now + cooldown
             if host_cooldown:
@@ -5827,6 +6153,181 @@ def _tcp_preflight_proxy(proxy, force=False):
         return False, 'proxy_error'
 
 
+
+def _quality_recv_exact(sock, size, deadline):
+    data = bytearray()
+    while len(data) < size:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise socket.timeout("quality preflight deadline")
+        sock.settimeout(max(0.05, remaining))
+        chunk = sock.recv(size - len(data))
+        if not chunk:
+            raise ConnectionError("proxy closed connection during quality preflight")
+        data.extend(chunk)
+    return bytes(data)
+
+
+def _quality_recv_headers(sock, deadline, max_bytes=8192):
+    data = bytearray()
+    while b"\r\n\r\n" not in data:
+        if len(data) >= max_bytes:
+            raise ConnectionError("proxy CONNECT response headers too large")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise socket.timeout("quality preflight deadline")
+        sock.settimeout(max(0.05, remaining))
+        chunk = sock.recv(min(2048, max_bytes - len(data)))
+        if not chunk:
+            raise ConnectionError("proxy closed CONNECT response")
+        data.extend(chunk)
+    return bytes(data)
+
+
+def _quality_https_preflight_proxy(proxy):
+    """
+    Строгий ФОНОВЫЙ health-check без HTTP-запроса к eBay:
+      proxy TCP -> HTTP CONNECT/SOCKS5 CONNECT -> TLS handshake к example.com -> close.
+
+    Это значительно сильнее простого TCP-open и ловит типичные ошибки из реального лога:
+    CONNECT 400/500/503, SOCKS connect failure, TLS MITM/self-signed и медленные tunnel timeout.
+    Failure здесь остаётся SOFT cache: основной ProxyManager не получает hard cooldown.
+    """
+    if not PROXY_QUALITY_PREFLIGHT_ENABLED or not proxy:
+        return False, 'disabled'
+
+    state = proxy_manager.quality_state(proxy)
+    if state == 'ok':
+        return True, None
+    if state == 'bad':
+        return False, proxy_manager.quality_failure_result(proxy)
+
+    tcp_ok, tcp_reason = _tcp_preflight_proxy(proxy, force=False)
+    if not tcp_ok:
+        proxy_manager.mark_quality_result(proxy, False, tcp_reason or 'proxy_error')
+        return False, tcp_reason or 'proxy_error'
+
+    parts = urlsplit(proxy)
+    proxy_host = parts.hostname
+    proxy_port = parts.port
+    scheme = (parts.scheme or 'http').lower()
+    if not proxy_host:
+        proxy_manager.mark_quality_result(proxy, False, 'proxy_error')
+        return False, 'proxy_error'
+    if proxy_port is None:
+        proxy_port = 1080 if scheme == 'socks5' else (443 if scheme == 'https' else 80)
+
+    # В текущем ProxyScrape pool реально используются http+socks5. Для редкого "https proxy"
+    # не делаем ложный negative: оставляем только TCP signal и не пишем quality_bad.
+    if scheme not in ('http', 'socks5'):
+        return False, 'unsupported_proxy_scheme'
+
+    started = time.monotonic()
+    deadline = started + PROXY_QUALITY_TIMEOUT
+    sock = None
+    tls_sock = None
+
+    try:
+        remaining = max(0.05, deadline - time.monotonic())
+        sock = socket.create_connection((proxy_host, int(proxy_port)), timeout=remaining)
+        sock.settimeout(max(0.05, deadline - time.monotonic()))
+
+        if scheme == 'http':
+            host_port = f"{PROXY_QUALITY_HOST}:{PROXY_QUALITY_PORT}"
+            request = (
+                f"CONNECT {host_port} HTTP/1.1\r\n"
+                f"Host: {host_port}\r\n"
+                "Proxy-Connection: keep-alive\r\n"
+                "User-Agent: Mozilla/5.0\r\n"
+                "\r\n"
+            ).encode('ascii', 'strict')
+            sock.sendall(request)
+            headers = _quality_recv_headers(sock, deadline)
+            first_line = headers.split(b"\r\n", 1)[0].decode('iso-8859-1', 'replace')
+            m = re.match(r"HTTP/\d(?:\.\d)?\s+(\d{3})", first_line, re.I)
+            status = int(m.group(1)) if m else 0
+            if status != 200:
+                proxy_manager.mark_quality_result(proxy, False, 'proxy_rejected')
+                return False, 'proxy_rejected'
+
+        else:  # socks5
+            sock.sendall(b"\x05\x01\x00")
+            hello = _quality_recv_exact(sock, 2, deadline)
+            if hello[0] != 0x05 or hello[1] != 0x00:
+                proxy_manager.mark_quality_result(proxy, False, 'proxy_rejected')
+                return False, 'proxy_rejected'
+
+            host_bytes = PROXY_QUALITY_HOST.encode('idna')
+            if len(host_bytes) > 255:
+                proxy_manager.mark_quality_result(proxy, False, 'proxy_error')
+                return False, 'proxy_error'
+            req = (
+                b"\x05\x01\x00\x03"
+                + bytes([len(host_bytes)])
+                + host_bytes
+                + int(PROXY_QUALITY_PORT).to_bytes(2, 'big')
+            )
+            sock.sendall(req)
+            reply = _quality_recv_exact(sock, 4, deadline)
+            if reply[0] != 0x05 or reply[1] != 0x00:
+                proxy_manager.mark_quality_result(proxy, False, 'proxy_rejected')
+                return False, 'proxy_rejected'
+
+            atyp = reply[3]
+            if atyp == 0x01:
+                _quality_recv_exact(sock, 4 + 2, deadline)
+            elif atyp == 0x03:
+                ln = _quality_recv_exact(sock, 1, deadline)[0]
+                _quality_recv_exact(sock, ln + 2, deadline)
+            elif atyp == 0x04:
+                _quality_recv_exact(sock, 16 + 2, deadline)
+            else:
+                proxy_manager.mark_quality_result(proxy, False, 'proxy_error')
+                return False, 'proxy_error'
+
+        # Полный TLS handshake нужен именно для отсеивания MITM/self-signed proxy.
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise socket.timeout("quality preflight deadline before TLS")
+        context = ssl.create_default_context()
+        tls_sock = context.wrap_socket(
+            sock,
+            server_hostname=PROXY_QUALITY_HOST,
+            do_handshake_on_connect=False,
+        )
+        sock = None  # ownership moved into tls_sock
+        tls_sock.settimeout(max(0.05, deadline - time.monotonic()))
+        tls_sock.do_handshake()
+
+        latency_ms = (time.monotonic() - started) * 1000.0
+        proxy_manager.mark_quality_result(proxy, True, latency_ms=latency_ms)
+        return True, None
+
+    except (socket.timeout, TimeoutError):
+        proxy_manager.mark_quality_result(proxy, False, 'proxy_timeout')
+        return False, 'proxy_timeout'
+    except ssl.SSLCertVerificationError:
+        proxy_manager.mark_quality_result(proxy, False, 'proxy_ssl')
+        return False, 'proxy_ssl'
+    except ssl.SSLError:
+        proxy_manager.mark_quality_result(proxy, False, 'proxy_ssl')
+        return False, 'proxy_ssl'
+    except Exception:
+        proxy_manager.mark_quality_result(proxy, False, 'proxy_error')
+        return False, 'proxy_error'
+    finally:
+        if tls_sock is not None:
+            try:
+                tls_sock.close()
+            except Exception:
+                pass
+        elif sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+
 def _probe_proxy(proxy, profile, timeout):
     """Одна discovery-проверка: быстрый TCP preflight -> только затем eBay."""
     ok, preflight_result = _tcp_preflight_proxy(proxy, force=False)
@@ -5877,6 +6378,10 @@ def _discovery_replacement_pause(results):
 def fetch_ebay_html_with_fixed_pair():
     global fixed_proxy, fixed_profile, fixed_session
 
+    # Свежий background-резерв используется ПЕРВЫМ после падения fixed proxy.
+    # На холодном старте список пуст: обычный discovery работает как раньше.
+    fast_standby_queue = []
+
     # 1) Максимально долго держим реально рабочую session.
     if fixed_proxy is not None and fixed_profile is not None:
         logging.info(
@@ -5886,6 +6391,7 @@ def fetch_ebay_html_with_fixed_pair():
 
         old_proxy = fixed_proxy
         old_profile = fixed_profile
+        fixed_attempt_started = time.monotonic()
         with main_fixed_request_lock:
             result, html, returned_session = _make_request(
                 old_proxy,
@@ -5893,6 +6399,7 @@ def fetch_ebay_html_with_fixed_pair():
                 session=fixed_session,
                 timeout=(FIXED_CONNECT_TIMEOUT, FIXED_READ_TIMEOUT),
             )
+        fixed_attempt_elapsed = time.monotonic() - fixed_attempt_started
 
         if result == 'success':
             fixed_session = returned_session
@@ -5901,8 +6408,19 @@ def fetch_ebay_html_with_fixed_pair():
             return html
 
         # Частая реальная ситуация: умерло только старое TCP/TLS соединение Session,
-        # а сам proxy всё ещё жив. Для transport-ошибки один раз создаём НОВУЮ session.
-        if result in ('proxy_timeout', 'proxy_error') and proxy_manager.is_recent_good(old_proxy):
+        # а сам proxy всё ещё жив. Быстрый reset получает ОДИН шанс с новой Session.
+        # Но если первая попытка уже висела >= FIXED_RECOVERY_SKIP_AFTER, второй 12-секундный
+        # recovery только откладывает failover. В новом логе это стоило ~36 сек. до discovery.
+        can_recover_fixed = (
+            result in ('proxy_timeout', 'proxy_error')
+            and proxy_manager.is_recent_good(old_proxy)
+        )
+        if can_recover_fixed and fixed_attempt_elapsed >= FIXED_RECOVERY_SKIP_AFTER:
+            logging.info(
+                f"⚡ Fixed proxy уже ждал {fixed_attempt_elapsed:.1f} сек.; "
+                f"recovery пропускаем и сразу переключаемся на reserve/discovery"
+            )
+        elif can_recover_fixed:
             logging.info(
                 f"♻️ Недавно успешный proxy {old_proxy}: "
                 "пересоздаём session и даём один быстрый шанс"
@@ -5947,9 +6465,25 @@ def fetch_ebay_html_with_fixed_pair():
             )
             _auction_proxy_soft_host_penalty(old_proxy, result)
 
+        # Не ждём нового ProxyScrape snapshot, если background worker уже подготовил резерв.
+        # Берём только свежие known-good / HTTPS-TLS-ready endpoint-ы (+ максимум 1 TCP-only).
+        fast_standby_queue = proxy_manager.get_warm_standby_candidates(
+            max(PROXY_PREFLIGHT_RESERVE_TARGET, PROBE_DEEP_CONCURRENCY),
+            excluded_hosts={_proxy_host(old_proxy)},
+        )
+        if fast_standby_queue:
+            quality_ready = sum(
+                1 for p in fast_standby_queue
+                if proxy_manager.quality_state(p) == 'ok'
+            )
+            logging.info(
+                f"⚡ Готов warm reserve: {len(fast_standby_queue)} proxy "
+                f"(HTTPS/TLS-ready={quality_ready}); пробуем его раньше fresh discovery"
+            )
+
         logging.info("Ищем новую рабочую пару...")
 
-    # 2) Rolling discovery V6.12: 4 worker сразу -> 5 после 10 сек.;
+    # 2) Rolling discovery V6.19: warm reserve -> обычные 4 worker -> 5 после 10 сек.;
     # только при затянувшемся outage с уже включённым emergency pool -> максимум 6.
     # Сначала расширяемся до ProxyScrape 3000 ms, а 4000 ms используем только как
     # последний deep-emergency tier. Hard cooldown никогда не снимаются.
@@ -6088,13 +6622,35 @@ def fetch_ebay_html_with_fixed_pair():
         batch_kinds = {}
 
         if need > 0:
+            # 0) Самый быстрый путь после падения fixed-session: background уже доказал,
+            # что эти proxy проводят HTTPS/TLS. Не делаем перед ними новый ProxyScrape refresh.
+            while fast_standby_queue and len(batch) < need:
+                standby = fast_standby_queue.pop(0)
+                standby_host = _proxy_host(standby)
+                if (
+                    not standby_host
+                    or standby_host in tried_hosts
+                    or standby_host in inflight_hosts
+                    or standby_host in {_proxy_host(p) for p in batch}
+                ):
+                    continue
+                # TTL/cooldown могли закончиться между падением fixed proxy и этим слотом.
+                quality_state = proxy_manager.quality_state(standby)
+                preflight_state = proxy_manager.preflight_state(standby)
+                if quality_state != 'ok' and preflight_state != 'ok' and not proxy_manager.is_recent_good(standby):
+                    continue
+                batch.append(standby)
+                batch_kinds[standby] = (
+                    'HTTPS reserve' if quality_state == 'ok' else 'Warm standby'
+                )
+
             # Один re-probe recently-good внутри текущего discovery после окончания cooldown.
             reprobe = proxy_manager.get_due_reprobe_candidate(
                 tried_proxies=tried_proxies,
                 reprobed_proxies=reprobed_proxies,
                 inflight_hosts=inflight_hosts,
             )
-            if reprobe is not None:
+            if reprobe is not None and len(batch) < need:
                 reprobed_proxies.add(reprobe)
                 batch.append(reprobe)
                 batch_kinds[reprobe] = 'Re-probe'
@@ -6278,6 +6834,7 @@ def fetch_ebay_html_with_fixed_pair():
                 fixed_profile = profile
                 fixed_session = winner_session
                 record_ebay_success()
+                proxy_preflight_wakeup_event.set()
                 logging.info(
                     f"✅ Найдена рабочая пара: proxy {winner_proxy}, профиль {profile['name']}; "
                     f"проверено {attempts} proxy за {time.monotonic() - started:.1f} сек."
@@ -6965,14 +7522,21 @@ def check_and_send_new_items():
 
 def proxy_preflight_warm_worker():
     """
-    Пока основной fixed proxy исправен, заранее проверяет TCP-порты маленькой пачки резервов.
-    Работает без eBay-запросов и не мешает main_fixed_request_lock.
+    Пока fixed proxy исправен, поддерживает свежий резерв БЕЗ eBay HTTP-запросов.
+
+    Основной режим V6.19: TCP proxy -> CONNECT/SOCKS tunnel -> валидный TLS handshake
+    к нейтральному endpoint. Это отсекает большую часть CONNECT/SSL/мертвых proxy заранее.
+    Если quality-preflight отключён ENV, остаётся безопасный старый TCP-only fallback.
     """
     db_ready_event.wait()
+    mode = 'HTTPS/TLS quality' if PROXY_QUALITY_PREFLIGHT_ENABLED else 'TCP-only'
     logging.info(
-        f"🧪 TCP preflight worker запущен: batch={PROXY_PREFLIGHT_WARM_BATCH}, "
-        f"timeout={PROXY_PREFLIGHT_CONNECT_TIMEOUT:.1f}s"
+        f"🧪 Smart reserve worker запущен: mode={mode}, "
+        f"batch={PROXY_PREFLIGHT_WARM_BATCH}, target={PROXY_PREFLIGHT_RESERVE_TARGET}, "
+        f"workers={PROXY_PREFLIGHT_WARM_CONCURRENCY}, "
+        f"quality_timeout={PROXY_QUALITY_TIMEOUT:.1f}s, tcp_timeout={PROXY_PREFLIGHT_CONNECT_TIMEOUT:.1f}s"
     )
+
     while True:
         try:
             if (
@@ -6981,35 +7545,92 @@ def proxy_preflight_warm_worker():
                 or is_paused
                 or fixed_proxy is None
             ):
-                time.sleep(PROXY_PREFLIGHT_WARM_INTERVAL)
+                proxy_preflight_wakeup_event.wait(timeout=PROXY_PREFLIGHT_WARM_INTERVAL)
+                proxy_preflight_wakeup_event.clear()
                 continue
 
+            # Пока fixed работает, поддерживаем не только health-cache, но и СВЕЖИЙ
+            # standard ProxyScrape snapshot. Внутренний refresh_interval ограничивает
+            # это примерно одним скачиванием в минуту; warm reserve при refresh сохраняется.
+            proxy_manager.refresh_proxies(force=False, emergency=False)
+
             excluded = {_proxy_host(fixed_proxy)} if fixed_proxy else set()
-            candidates = proxy_manager.get_preflight_candidates(
-                PROXY_PREFLIGHT_WARM_BATCH, excluded_hosts=excluded
-            )
-            if candidates:
-                with ThreadPoolExecutor(
-                    max_workers=min(PROXY_PREFLIGHT_WARM_CONCURRENCY, len(candidates)),
-                    thread_name_prefix='proxy-preflight',
-                ) as executor:
-                    futures = [executor.submit(_tcp_preflight_proxy, p, True) for p in candidates]
-                    ok_count = 0
-                    for future in futures:
-                        try:
-                            ok, _reason = future.result()
+
+            if PROXY_QUALITY_PREFLIGHT_ENABLED:
+                quality_before, tcp_before = proxy_manager.warm_reserve_stats()
+                batch_limit = (
+                    PROXY_PREFLIGHT_WARM_BATCH
+                    if quality_before < PROXY_PREFLIGHT_RESERVE_TARGET
+                    else PROXY_PREFLIGHT_MAINTENANCE_BATCH
+                )
+                candidates = proxy_manager.get_quality_preflight_candidates(
+                    batch_limit,
+                    excluded_hosts=excluded,
+                )
+
+                checked = 0
+                ok_count = 0
+                reason_counts = {}
+                if candidates:
+                    with ThreadPoolExecutor(
+                        max_workers=min(PROXY_PREFLIGHT_WARM_CONCURRENCY, len(candidates)),
+                        thread_name_prefix='proxy-quality-preflight',
+                    ) as executor:
+                        future_map = {
+                            executor.submit(_quality_https_preflight_proxy, p): p
+                            for p in candidates
+                        }
+                        for future in future_map:
+                            checked += 1
+                            try:
+                                ok, reason = future.result()
+                            except Exception:
+                                ok, reason = False, 'proxy_error'
                             if ok:
                                 ok_count += 1
-                        except Exception:
-                            pass
-                logging.info(
-                    f"🧪 TCP preflight: живых {ok_count}/{len(candidates)}; "
-                    "они получат приоритет при следующем discovery"
+                            else:
+                                reason = reason or 'proxy_error'
+                                reason_counts[reason] = reason_counts.get(reason, 0) + 1
+
+                quality_after, tcp_after = proxy_manager.warm_reserve_stats()
+                # Логируем и maintenance-проходы: по нему можно реально оценивать качество пула.
+                if checked:
+                    failure_summary = ', '.join(
+                        f"{k}={v}" for k, v in sorted(reason_counts.items())
+                    ) or 'нет'
+                    logging.info(
+                        f"🧪 Smart reserve: HTTPS-ready={quality_after}, TCP-only={tcp_after}; "
+                        f"проверено={checked}, quality_ok={ok_count}, failures[{failure_summary}]"
+                    )
+            else:
+                candidates = proxy_manager.get_preflight_candidates(
+                    PROXY_PREFLIGHT_WARM_BATCH,
+                    excluded_hosts=excluded,
                 )
-            time.sleep(PROXY_PREFLIGHT_WARM_INTERVAL)
+                if candidates:
+                    with ThreadPoolExecutor(
+                        max_workers=min(PROXY_PREFLIGHT_WARM_CONCURRENCY, len(candidates)),
+                        thread_name_prefix='proxy-preflight',
+                    ) as executor:
+                        futures = [executor.submit(_tcp_preflight_proxy, p, True) for p in candidates]
+                        ok_count = 0
+                        for future in futures:
+                            try:
+                                ok, _reason = future.result()
+                                if ok:
+                                    ok_count += 1
+                            except Exception:
+                                pass
+                    logging.info(
+                        f"🧪 TCP reserve fallback: живых {ok_count}/{len(candidates)}"
+                    )
+
+            proxy_preflight_wakeup_event.wait(timeout=PROXY_PREFLIGHT_WARM_INTERVAL)
+            proxy_preflight_wakeup_event.clear()
         except Exception as e:
-            logging.warning(f"TCP preflight worker: {e}")
-            time.sleep(PROXY_PREFLIGHT_WARM_INTERVAL)
+            logging.warning(f"Smart reserve worker: {e}")
+            proxy_preflight_wakeup_event.wait(timeout=PROXY_PREFLIGHT_WARM_INTERVAL)
+            proxy_preflight_wakeup_event.clear()
 
 
 def bot_worker():
@@ -7028,7 +7649,7 @@ def bot_worker():
     seen_line = f"\n📚 В базе: {seen_total} товаров." if seen_total is not None else ""
     send_telegram_message(
         startup_line +
-        "\n🇬🇧 eBay UK monitor v6.18 FastConnect работает." +
+        "\n🇬🇧 eBay UK monitor v6.19 SmartReserve работает." +
         seen_line +
         "\nКоманды: /stop /start /list (/auctions) /delauction НОМЕР_ЛОТА"
         "\nМожно отправить ссылку на eBay-аукцион — сохраню точное время и напомню заранее.",
@@ -7113,7 +7734,7 @@ def leader_supervisor():
 @app.route('/')
 def index():
     role = "leader" if leader_active_event.is_set() else "standby"
-    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.18 FastConnect, {role})"
+    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.19 SmartReserve, {role})"
 
 
 @app.route('/health')
