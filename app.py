@@ -239,16 +239,16 @@ PROXY_QUALITY_TIMEOUT = max(1.2, min(float(os.getenv("PROXY_QUALITY_TIMEOUT", "3
 PROXY_QUALITY_OK_TTL = max(60, int(os.getenv("PROXY_QUALITY_OK_TTL", "120")))
 PROXY_QUALITY_BAD_TTL = max(20, int(os.getenv("PROXY_QUALITY_BAD_TTL", "45")))
 
-# Не пытаемся "прогреть весь интернет". Цель — постоянно иметь 12-16 СВЕЖИХ
-# HTTPS-capable резервов. 16 кандидатов за проход = 2x прежних 8, но после достижения
-# target worker переключается на маленький maintenance batch.
-PROXY_PREFLIGHT_WARM_BATCH = max(4, min(int(os.getenv("PROXY_PREFLIGHT_WARM_BATCH", "16")), 24))
+# v6.20 за ~53 минуты сделал ~1684 neutral quality-checks; при этом для быстрого failover
+# реально достаточно короткой первой wave из 4 verified-free. Поэтому держим ~8 свежих
+# HTTPS-capable резервов, а не 12+, и уменьшаем тяжёлый background batch без потери fallback.
+PROXY_PREFLIGHT_WARM_BATCH = max(4, min(int(os.getenv("PROXY_PREFLIGHT_WARM_BATCH", "12")), 24))
 PROXY_PREFLIGHT_WARM_CONCURRENCY = max(
     2, min(int(os.getenv("PROXY_PREFLIGHT_WARM_CONCURRENCY", "6")), 8)
 )
-PROXY_PREFLIGHT_WARM_INTERVAL = max(10.0, float(os.getenv("PROXY_PREFLIGHT_WARM_INTERVAL", "15")))
+PROXY_PREFLIGHT_WARM_INTERVAL = max(10.0, float(os.getenv("PROXY_PREFLIGHT_WARM_INTERVAL", "20")))
 PROXY_PREFLIGHT_RESERVE_TARGET = max(
-    4, min(int(os.getenv("PROXY_PREFLIGHT_RESERVE_TARGET", "12")), 24)
+    4, min(int(os.getenv("PROXY_PREFLIGHT_RESERVE_TARGET", "8")), 24)
 )
 PROXY_PREFLIGHT_MAINTENANCE_BATCH = max(
     2, min(int(os.getenv("PROXY_PREFLIGHT_MAINTENANCE_BATCH", "4")), 8)
@@ -265,7 +265,7 @@ FIXED_RECOVERY_SKIP_AFTER = max(
 )
 
 
-# ============ V6.20 MULTI-PROVIDER ============
+# ============ V6.21 MULTI-PROVIDER / PROVIDER-TUNED ============
 # Secrets are read ONLY from Render Environment Variables. Never hard-code API keys.
 WEBSHARE_API_KEY = (os.getenv("WEBSHARE_API_KEY") or "").strip()
 PROXYSCRAPE_PREMIUM_API_KEY = (os.getenv("PROXYSCRAPE_PREMIUM_API_KEY") or "").strip()
@@ -273,10 +273,25 @@ PROXYSCRAPE_PREMIUM_SUBACCOUNT_ID = (os.getenv("PROXYSCRAPE_PREMIUM_SUBACCOUNT_I
 PROVIDER_API_TIMEOUT = max(3.0, min(float(os.getenv("PROVIDER_API_TIMEOUT", "10")), 20.0))
 PROXYSCRAPE_PREMIUM_REFRESH = max(30, int(os.getenv("PROXYSCRAPE_PREMIUM_REFRESH", "60")))
 WEBSHARE_REFRESH = max(60, int(os.getenv("WEBSHARE_REFRESH", "300")))
-# Webshare is metered. Premium/free get the first chance; Webshare is unlocked as rescue.
-WEBSHARE_UNLOCK_AFTER = max(3.0, float(os.getenv("WEBSHARE_UNLOCK_AFTER", "12")))
-WEBSHARE_UNLOCK_ATTEMPTS = max(4, int(os.getenv("WEBSHARE_UNLOCK_ATTEMPTS", "20")))
-WEBSHARE_HARD_RESCUE_AFTER = max(WEBSHARE_UNLOCK_AFTER, float(os.getenv("WEBSHARE_HARD_RESCUE_AFTER", "45")))
+# Webshare is metered. Real v6.20 log showed that waiting 12s/20 attempts was too conservative:
+# the first rescue only reached Webshare at attempt 21 and recovered at 14.3s. We still keep
+# Premium/free first, but allow one Webshare slot earlier once failover is genuinely non-trivial.
+WEBSHARE_UNLOCK_AFTER = max(3.0, float(os.getenv("WEBSHARE_UNLOCK_AFTER", "8")))
+WEBSHARE_UNLOCK_ATTEMPTS = max(4, int(os.getenv("WEBSHARE_UNLOCK_ATTEMPTS", "12")))
+
+# Background SmartReserve may hold 12+ verified free proxies, but the real log showed that
+# draining 10-12 of them before managed providers delayed recovery. Keep a deeper reserve in
+# memory, while using only a short first wave before normal Premium/Webshare discovery.
+WARM_STANDBY_TOTAL_LIMIT = max(4, min(int(os.getenv("WARM_STANDBY_TOTAL_LIMIT", "6")), 10))
+WARM_STANDBY_FREE_QUALITY_LIMIT = max(
+    2, min(int(os.getenv("WARM_STANDBY_FREE_QUALITY_LIMIT", "4")), WARM_STANDBY_TOTAL_LIMIT)
+)
+
+# eBay 403 on managed datacenter IPs usually outlived the old 5-minute cooldown in the real log.
+# Longer provider-specific cooldown prevents wasting scarce Webshare and repeated Premium probes.
+PREMIUM_BLOCK_COOLDOWNS = (1800, 3600, 3600, 3600)
+WEBSHARE_BLOCK_COOLDOWNS = (1200, 1200, 1800, 2700)
+
 # Approximate process-local warning threshold only. It never breaks an already working fixed session.
 WEBSHARE_ESTIMATED_MB_WARN = max(10.0, float(os.getenv("WEBSHARE_ESTIMATED_MB_WARN", "250")))
 PROVIDER_STATS_INTERVAL = max(60, int(os.getenv("PROVIDER_STATS_INTERVAL", "300")))
@@ -537,10 +552,22 @@ class ProviderManager:
         self.last_refresh = {'proxyscrape_premium': 0.0, 'webshare': 0.0}
         self.ps_subaccount_id = PROXYSCRAPE_PREMIUM_SUBACCOUNT_ID
         self.stats = {
-            name: {'probe': 0, 'success': 0, 'blocked': 0, 'rate_limited': 0,
-                   'proxy_timeout': 0, 'proxy_error': 0, 'proxy_rejected': 0,
-                   'proxy_ssl': 0, 'http_error': 0, 'bytes': 0}
+            name: {
+                'requests': 0, 'success': 0, 'blocked': 0, 'rate_limited': 0,
+                'proxy_timeout': 0, 'proxy_error': 0, 'proxy_rejected': 0,
+                'proxy_ssl': 0, 'http_error': 0, 'bytes': 0,
+                'discovery_requests': 0, 'discovery_success': 0,
+                'fixed_requests': 0, 'fixed_success': 0,
+                'recovery_requests': 0, 'recovery_success': 0,
+                'winners': 0, 'winner_seconds_sum': 0.0, 'winner_attempts_sum': 0,
+            }
             for name in ('proxyscrape_premium', 'webshare', 'free')
+        }
+        self.discovery_proxy_seen = {
+            name: set() for name in ('proxyscrape_premium', 'webshare', 'free')
+        }
+        self.success_proxy_seen = {
+            name: set() for name in ('proxyscrape_premium', 'webshare', 'free')
         }
         self.last_stats_log = 0.0
         self._webshare_warned = False
@@ -556,10 +583,9 @@ class ProviderManager:
     def _set_provider_snapshot(self, name, proxies):
         proxies = set(proxies or ())
         with self.lock:
-            old = self.proxy_sets.get(name, set())
-            for p in old - proxies:
-                if self.provider_by_proxy.get(p) == name:
-                    self.provider_by_proxy.pop(p, None)
+            # Keep historical provider ownership for endpoints that disappear from a later
+            # snapshot. A recently-successful fixed/warm proxy may still be reused from
+            # ProxyManager memory; losing its source label would misclassify it as "free".
             self.proxy_sets[name] = proxies
             for p in proxies:
                 self.provider_by_proxy[p] = name
@@ -687,34 +713,86 @@ class ProviderManager:
             webshare = list(self.proxy_sets['webshare']) if include_webshare else []
         return premium + webshare
 
-    def record_result(self, proxy, result, body_bytes=0):
+    def _snapshot_stats_locked(self):
+        snapshot = {k: dict(v) for k, v in self.stats.items()}
+        for name in snapshot:
+            snapshot[name]['unique_discovery'] = len(self.discovery_proxy_seen[name])
+            snapshot[name]['unique_success'] = len(self.success_proxy_seen[name])
+        return snapshot
+
+    def _format_stats(self, snapshot):
+        bits = []
+        for name in ('proxyscrape_premium', 'webshare', 'free'):
+            st = snapshot[name]
+            d = st['discovery_requests']
+            ds = st['discovery_success']
+            unique_d = st.get('unique_discovery', 0)
+            unique_s = st.get('unique_success', 0)
+            endpoint_rate = (100.0 * unique_s / unique_d) if unique_d else 0.0
+            fixed = st['fixed_requests'] + st['recovery_requests']
+            fixed_ok = st['fixed_success'] + st['recovery_success']
+            winners = st['winners']
+            avg_find = (st['winner_seconds_sum'] / winners) if winners else 0.0
+            bits.append(
+                f"{name}: eBay={st['requests']}, discovery={d}/{ds}, "
+                f"unique={unique_d}/{unique_s} ({endpoint_rate:.1f}% endpoints), "
+                f"fixed={fixed}/{fixed_ok}, winners={winners}, avg_find={avg_find:.1f}s, "
+                f"403={st['blocked']}, timeout={st['proxy_timeout']}, "
+                f"reject={st['proxy_rejected']}, ssl={st['proxy_ssl']}, "
+                f"data≈{st['bytes']/1024/1024:.1f}MB"
+            )
+        return '📊 Provider stats | ' + ' | '.join(bits)
+
+    def maybe_log_stats(self, force=False):
+        now = time.time()
+        with self.lock:
+            if not force and (now - self.last_stats_log) < PROVIDER_STATS_INTERVAL:
+                return
+            self.last_stats_log = now
+            snapshot = self._snapshot_stats_locked()
+        logging.info(self._format_stats(snapshot))
+
+    def record_result(self, proxy, result, body_bytes=0, request_kind='unknown'):
         src = self.source_fast(proxy)
         if src not in self.stats:
             src = 'free'
         with self.lock:
             st = self.stats[src]
-            st['probe'] += 1
+            st['requests'] += 1
             if result in st:
                 st[result] += 1
             st['bytes'] += max(0, int(body_bytes or 0))
-            now = time.time()
-            do_log = (now - self.last_stats_log) >= PROVIDER_STATS_INTERVAL
-            if do_log:
-                self.last_stats_log = now
-                snapshot = {k: dict(v) for k, v in self.stats.items()}
-        if do_log:
-            bits = []
-            for name in ('proxyscrape_premium', 'webshare', 'free'):
-                st = snapshot[name]
-                p = st['probe']; s = st['success']
-                rate = (100.0 * s / p) if p else 0.0
-                bits.append(
-                    f"{name}: probes={p}, success={s} ({rate:.1f}%), "
-                    f"403={st['blocked']}, timeout={st['proxy_timeout']}, "
-                    f"reject={st['proxy_rejected']}, ssl={st['proxy_ssl']}, "
-                    f"data≈{st['bytes']/1024/1024:.1f}MB"
-                )
-            logging.info('📊 Provider stats | ' + ' | '.join(bits))
+
+            if request_kind == 'discovery':
+                st['discovery_requests'] += 1
+                self.discovery_proxy_seen[src].add(proxy)
+                if result == 'success':
+                    st['discovery_success'] += 1
+            elif request_kind == 'fixed':
+                st['fixed_requests'] += 1
+                if result == 'success':
+                    st['fixed_success'] += 1
+            elif request_kind == 'recovery':
+                st['recovery_requests'] += 1
+                if result == 'success':
+                    st['recovery_success'] += 1
+
+            if result == 'success':
+                self.success_proxy_seen[src].add(proxy)
+
+        self.maybe_log_stats(force=False)
+
+    def record_winner(self, proxy, elapsed_seconds, attempts):
+        src = self.source_fast(proxy)
+        if src not in self.stats:
+            src = 'free'
+        with self.lock:
+            st = self.stats[src]
+            st['winners'] += 1
+            st['winner_seconds_sum'] += max(0.0, float(elapsed_seconds or 0.0))
+            st['winner_attempts_sum'] += max(0, int(attempts or 0))
+        # A winner is an important boundary: always emit a truthful provider summary.
+        self.maybe_log_stats(force=True)
 
     def webshare_estimated_mb(self):
         with self.lock:
@@ -1231,6 +1309,8 @@ class ProxyManager:
                 + list(self.preflight_ok_until.keys())
             ))
             for p in candidates:
+                if provider_manager.source_fast(p) != 'free':
+                    continue
                 host = _proxy_host(p)
                 if not host or host in used_hosts:
                     continue
@@ -1255,6 +1335,12 @@ class ProxyManager:
             rows = []
             used_hosts = set(excluded_hosts)
             for p in self.proxies:
+                # Managed providers already publish online/valid state and may require
+                # proxy authentication. The neutral raw-socket quality preflight is for
+                # the legacy FREE pool only; testing managed credentials here can create
+                # false proxy_rejected and wastes metered Webshare handshakes.
+                if provider_manager.source_fast(p) != 'free':
+                    continue
                 host = _proxy_host(p)
                 if not host or host in used_hosts:
                     continue
@@ -1356,7 +1442,11 @@ class ProxyManager:
                     added += 1
 
             add_group(known)
-            add_group(quality)
+            # Реальный v6.20 log показал, что 10-12 neutral HTTPS-ready FREE подряд
+            # задерживали managed providers. Держим глубокий reserve в памяти, но первая
+            # failover-wave использует только несколько таких адресов.
+            free_quality = [p for p in quality if provider_manager.source_fast(p) == 'free']
+            add_group(free_quality, max_from_group=WARM_STANDBY_FREE_QUALITY_LIMIT)
             # TCP-only — слабый сигнал. Не заполняем им весь первый batch.
             add_group(tcp, max_from_group=1)
             return result
@@ -1866,7 +1956,10 @@ class ProxyManager:
             # Если этот же IP только что доказал работоспособность, снимаем host cooldown/soft penalty.
             self.host_bad_until.pop(host, None)
             self.soft_host_penalty_until.pop(host, None)
-            if proxy not in self.proxies:
+            # Managed provider endpoints remain in ProviderManager/current snapshot and
+            # last_success memory. Do not mix authenticated Premium/Webshare URLs into the
+            # legacy free pool or background raw-socket SmartReserve.
+            if provider_manager.source_fast(proxy) == 'free' and proxy not in self.proxies:
                 self.proxies.append(proxy)
 
     def mark_failure(self, proxy, result, reason=None):
@@ -1897,9 +1990,15 @@ class ProxyManager:
                     cooldown = [600, 1200, 1800, 1800][min(streak - 1, 3)]
                 host_cooldown = cooldown
             elif result == 'blocked':
-                # 403 / Pardon — это уже сигнал eBay по exit IP, поэтому даже ранее
-                # успешный адрес не возвращаем слишком быстро: минимум 5 минут.
-                if known_good:
+                # 403 / Pardon — eBay signal by exit IP. Managed datacenter IPs in the
+                # v6.20 log often remained blocked well beyond 5 minutes, so do not burn
+                # Webshare/Premium by recycling them too early. Free pool keeps old policy.
+                provider = provider_manager.source_fast(proxy)
+                if provider == 'webshare':
+                    cooldown = WEBSHARE_BLOCK_COOLDOWNS[min(streak - 1, 3)]
+                elif provider == 'proxyscrape_premium':
+                    cooldown = PREMIUM_BLOCK_COOLDOWNS[min(streak - 1, 3)]
+                elif known_good:
                     cooldown = [300, 600, 900, 1200][min(streak - 1, 3)]
                 else:
                     cooldown = [300, 600, 1200, 1800][min(streak - 1, 3)]
@@ -6265,7 +6364,7 @@ def _create_session(proxy, profile, timeout=None):
     return cffi_requests.Session(**kwargs)
 
 
-def _make_request(proxy, profile, session=None, timeout=None):
+def _make_request(proxy, profile, session=None, timeout=None, request_kind="unknown"):
     """
     Возвращает (result, html, session), где result:
       success       - нормальная выдача eBay
@@ -6281,13 +6380,23 @@ def _make_request(proxy, profile, session=None, timeout=None):
     if timeout is None:
         timeout = (FIXED_CONNECT_TIMEOUT, FIXED_READ_TIMEOUT)
 
+    def tracked_return(result, html_value, session_value, body_bytes=0):
+        # One central accounting point prevents the misleading v6.20 stats where only
+        # a fixed-session recovery was counted while discovery/fixed traffic was missing.
+        if result != 'profile_error':
+            provider_manager.record_result(
+                proxy, result, body_bytes=body_bytes, request_kind=request_kind
+            )
+            provider_manager.maybe_warn_webshare_usage()
+        return result, html_value, session_value
+
     own_session = session is None
     if session is None:
         try:
             session = _create_session(proxy, profile, timeout=timeout)
         except Exception as e:
             logging.error(f"Не удалось создать session для {profile['name']}: {e}")
-            return 'profile_error', None, None
+            return tracked_return('profile_error', None, None)
 
     try:
         # Параметр request() переопределяет timeout Session — это позволяет
@@ -6312,7 +6421,7 @@ def _make_request(proxy, profile, session=None, timeout=None):
                 )
                 if own_session:
                     close_session(session)
-                return 'blocked', None, None if own_session else session
+                return tracked_return('blocked', None, None if own_session else session, body_len)
 
             if not _looks_like_search_results(response.text):
                 logging.warning(
@@ -6321,28 +6430,28 @@ def _make_request(proxy, profile, session=None, timeout=None):
                 )
                 if own_session:
                     close_session(session)
-                return 'http_error', None, None if own_session else session
+                return tracked_return('http_error', None, None if own_session else session, body_len)
 
             logging.info(f"✅ УСПЕШНО c прокси {_proxy_log_name(proxy)}, профиль {profile['name']}")
-            return 'success', response.text, session
+            return tracked_return('success', response.text, session, body_len)
 
         if response.status_code == 403:
             logging.warning(f"🚫 eBay HTTP 403 для прокси {_proxy_log_name(proxy)}, профиль {profile['name']}")
             if own_session:
                 close_session(session)
-            return 'blocked', None, None if own_session else session
+            return tracked_return('blocked', None, None if own_session else session, body_len)
 
         if response.status_code == 429:
             logging.warning(f"⏳ eBay HTTP 429 для прокси {_proxy_log_name(proxy)}, профиль {profile['name']}")
             if own_session:
                 close_session(session)
-            return 'rate_limited', None, None if own_session else session
+            return tracked_return('rate_limited', None, None if own_session else session, body_len)
 
         if response.status_code == 407:
             logging.warning(f"🔐 Прокси требует авторизацию: {_proxy_log_name(proxy)}")
             if own_session:
                 close_session(session)
-            return 'proxy_error', None, None if own_session else session
+            return tracked_return('proxy_error', None, None if own_session else session, body_len)
 
         logging.warning(
             f"⚠️ НЕУДАЧА: HTTP {response.status_code} "
@@ -6350,7 +6459,7 @@ def _make_request(proxy, profile, session=None, timeout=None):
         )
         if own_session:
             close_session(session)
-        return 'http_error', None, None if own_session else session
+        return tracked_return('http_error', None, None if own_session else session, body_len)
 
     except Exception as e:
         error_msg = str(e)
@@ -6364,15 +6473,15 @@ def _make_request(proxy, profile, session=None, timeout=None):
             disable_profile(profile['name'])
             if own_session:
                 close_session(session)
-            return 'profile_error', None, None
+            return tracked_return('profile_error', None, None)
 
         if own_session:
             close_session(session)
 
         if 'curl: (28)' in low or 'timed out' in low:
-            return 'proxy_timeout', None, None if own_session else session
+            return tracked_return('proxy_timeout', None, None if own_session else session)
         if 'curl: (60)' in low or 'certificate' in low or 'self signed' in low:
-            return 'proxy_ssl', None, None if own_session else session
+            return tracked_return('proxy_ssl', None, None if own_session else session)
         if (
             'connect tunnel failed' in low or
             'proxy connect aborted' in low or
@@ -6380,8 +6489,8 @@ def _make_request(proxy, profile, session=None, timeout=None):
             'wrong version number' in low or
             re.search(r'connect[^\n]*(?:response )?(?:400|405|500|501|502|503)', low)
         ):
-            return 'proxy_rejected', None, None if own_session else session
-        return 'proxy_error', None, None if own_session else session
+            return tracked_return('proxy_rejected', None, None if own_session else session)
+        return tracked_return('proxy_error', None, None if own_session else session)
 
 
 def _tcp_preflight_proxy(proxy, force=False):
@@ -6617,6 +6726,7 @@ def _probe_proxy(proxy, profile, timeout):
         profile,
         session=None,
         timeout=timeout,
+        request_kind='discovery',
     )
 
 
@@ -6677,6 +6787,7 @@ def fetch_ebay_html_with_fixed_pair():
                 old_profile,
                 session=fixed_session,
                 timeout=(FIXED_CONNECT_TIMEOUT, FIXED_READ_TIMEOUT),
+                request_kind='fixed',
             )
         fixed_attempt_elapsed = time.monotonic() - fixed_attempt_started
 
@@ -6714,12 +6825,8 @@ def fetch_ebay_html_with_fixed_pair():
                     old_profile,
                     session=None,
                     timeout=(FIXED_RECOVERY_CONNECT_TIMEOUT, FIXED_RECOVERY_READ_TIMEOUT),
+                    request_kind='recovery',
                 )
-            provider_manager.record_result(
-                old_proxy, retry_result,
-                len(retry_html.encode('utf-8', errors='ignore')) if retry_html else 0
-            )
-            provider_manager.maybe_warn_webshare_usage()
             if retry_result == 'success':
                 fixed_proxy = old_proxy
                 fixed_profile = old_profile
@@ -6752,7 +6859,7 @@ def fetch_ebay_html_with_fixed_pair():
         # Не ждём нового ProxyScrape snapshot, если background worker уже подготовил резерв.
         # Берём только свежие known-good / HTTPS-TLS-ready endpoint-ы (+ максимум 1 TCP-only).
         fast_standby_queue = proxy_manager.get_warm_standby_candidates(
-            max(PROXY_PREFLIGHT_RESERVE_TARGET, PROBE_DEEP_CONCURRENCY),
+            WARM_STANDBY_TOTAL_LIMIT,
             excluded_hosts={_proxy_host(old_proxy)},
         )
         if fast_standby_queue:
@@ -7134,10 +7241,12 @@ def fetch_ebay_html_with_fixed_pair():
                 fixed_session = winner_session
                 record_ebay_success()
                 proxy_preflight_wakeup_event.set()
+                discovery_elapsed = time.monotonic() - started
+                provider_manager.record_winner(winner_proxy, discovery_elapsed, attempts)
                 logging.info(
                     f"✅ Найдена рабочая пара: proxy {_proxy_log_name(winner_proxy)}, "
                     f"source={provider_manager.source_fast(winner_proxy)}, профиль {profile['name']}; "
-                    f"проверено {attempts} proxy за {time.monotonic() - started:.1f} сек."
+                    f"проверено {attempts} proxy за {discovery_elapsed:.1f} сек."
                 )
                 return winner_html
 
@@ -7952,7 +8061,7 @@ def bot_worker():
     seen_line = f"\n📚 В базе: {seen_total} товаров." if seen_total is not None else ""
     send_telegram_message(
         startup_line +
-        "\n🇬🇧 eBay UK monitor v6.20 SmartReserve работает." +
+        "\n🇬🇧 eBay UK monitor v6.21 ProviderTuned работает." +
         seen_line +
         "\nКоманды: /stop /start /list (/auctions) /delauction НОМЕР_ЛОТА"
         "\nМожно отправить ссылку на eBay-аукцион — сохраню точное время и напомню заранее.",
@@ -7993,10 +8102,11 @@ def start_leader_workers():
     leader_active_event.set()
     logging.info("👑 Эта Render-копия стала leader; запускаем фоновые worker-ы")
     logging.info(
-        "🌐 Multi-provider v6.20: "
+        "🌐 Multi-provider v6.21: "
         f"ProxyScrape Premium={'ON' if PROXYSCRAPE_PREMIUM_API_KEY else 'OFF'}, "
         f"Webshare={'ON (rescue)' if WEBSHARE_API_KEY else 'OFF'}, "
-        f"Webshare unlock={WEBSHARE_UNLOCK_AFTER:.0f}s/{WEBSHARE_UNLOCK_ATTEMPTS} probes"
+        f"Webshare unlock={WEBSHARE_UNLOCK_AFTER:.0f}s/{WEBSHARE_UNLOCK_ATTEMPTS} probes, "
+        f"warm-first-wave={WARM_STANDBY_TOTAL_LIMIT}"
     )
 
     threading.Thread(target=telegram_listener, daemon=True, name='telegram-listener').start()
@@ -8043,7 +8153,7 @@ def leader_supervisor():
 @app.route('/')
 def index():
     role = "leader" if leader_active_event.is_set() else "standby"
-    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.20 SmartReserve, {role})"
+    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.21 ProviderTuned, {role})"
 
 
 @app.route('/health')
