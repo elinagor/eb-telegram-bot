@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 import requests
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
-from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode, quote
 from bs4 import BeautifulSoup, Tag
 from flask import Flask
 from dotenv import load_dotenv
@@ -264,6 +264,23 @@ FIXED_RECOVERY_SKIP_AFTER = max(
     8.0, float(os.getenv("FIXED_RECOVERY_SKIP_AFTER", "18"))
 )
 
+
+# ============ V6.20 MULTI-PROVIDER ============
+# Secrets are read ONLY from Render Environment Variables. Never hard-code API keys.
+WEBSHARE_API_KEY = (os.getenv("WEBSHARE_API_KEY") or "").strip()
+PROXYSCRAPE_PREMIUM_API_KEY = (os.getenv("PROXYSCRAPE_PREMIUM_API_KEY") or "").strip()
+PROXYSCRAPE_PREMIUM_SUBACCOUNT_ID = (os.getenv("PROXYSCRAPE_PREMIUM_SUBACCOUNT_ID") or "").strip()
+PROVIDER_API_TIMEOUT = max(3.0, min(float(os.getenv("PROVIDER_API_TIMEOUT", "10")), 20.0))
+PROXYSCRAPE_PREMIUM_REFRESH = max(30, int(os.getenv("PROXYSCRAPE_PREMIUM_REFRESH", "60")))
+WEBSHARE_REFRESH = max(60, int(os.getenv("WEBSHARE_REFRESH", "300")))
+# Webshare is metered. Premium/free get the first chance; Webshare is unlocked as rescue.
+WEBSHARE_UNLOCK_AFTER = max(3.0, float(os.getenv("WEBSHARE_UNLOCK_AFTER", "12")))
+WEBSHARE_UNLOCK_ATTEMPTS = max(4, int(os.getenv("WEBSHARE_UNLOCK_ATTEMPTS", "20")))
+WEBSHARE_HARD_RESCUE_AFTER = max(WEBSHARE_UNLOCK_AFTER, float(os.getenv("WEBSHARE_HARD_RESCUE_AFTER", "45")))
+# Approximate process-local warning threshold only. It never breaks an already working fixed session.
+WEBSHARE_ESTIMATED_MB_WARN = max(10.0, float(os.getenv("WEBSHARE_ESTIMATED_MB_WARN", "250")))
+PROVIDER_STATS_INTERVAL = max(60, int(os.getenv("PROVIDER_STATS_INTERVAL", "300")))
+
 # Память outage живёт между соседними 75-секундными discovery. Ранее проверенные неизвестные
 # IP не исчезают из пула, но новые IP идут раньше. Known-good всё ещё может получить controlled retry.
 OUTAGE_HOST_MEMORY = max(90, int(os.getenv("OUTAGE_HOST_MEMORY", "240")))
@@ -489,6 +506,231 @@ def _proxy_scheme(proxy):
     except Exception:
         return 'http'
 
+
+
+def _proxy_log_name(proxy):
+    """Safe proxy label for logs: NEVER prints username/password/API secrets."""
+    if not proxy:
+        return '<none>'
+    try:
+        parts = urlsplit(proxy)
+        host = parts.hostname or '?'
+        port = f":{parts.port}" if parts.port else ''
+        scheme = parts.scheme or 'http'
+        source = provider_manager.source_fast(proxy) if 'provider_manager' in globals() else None
+        suffix = f" [{source}]" if source else ''
+        return f"{scheme}://{host}{port}{suffix}"
+    except Exception:
+        return '<proxy>'
+
+
+class ProviderManager:
+    """Small fail-open source layer for managed proxies.
+
+    Provider API failures never affect the legacy free ProxyScrape path.
+    Webshare is intentionally metered/rescue-only; ProxyScrape Premium is priority-1.
+    """
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.provider_by_proxy = {}
+        self.proxy_sets = {'proxyscrape_premium': set(), 'webshare': set()}
+        self.last_refresh = {'proxyscrape_premium': 0.0, 'webshare': 0.0}
+        self.ps_subaccount_id = PROXYSCRAPE_PREMIUM_SUBACCOUNT_ID
+        self.stats = {
+            name: {'probe': 0, 'success': 0, 'blocked': 0, 'rate_limited': 0,
+                   'proxy_timeout': 0, 'proxy_error': 0, 'proxy_rejected': 0,
+                   'proxy_ssl': 0, 'http_error': 0, 'bytes': 0}
+            for name in ('proxyscrape_premium', 'webshare', 'free')
+        }
+        self.last_stats_log = 0.0
+        self._webshare_warned = False
+
+    def source(self, proxy):
+        with self.lock:
+            return self.provider_by_proxy.get(proxy, 'free')
+
+    def source_fast(self, proxy):
+        # Safe lock-free read under CPython for logging/scoring; stale value is harmless.
+        return self.provider_by_proxy.get(proxy, 'free')
+
+    def _set_provider_snapshot(self, name, proxies):
+        proxies = set(proxies or ())
+        with self.lock:
+            old = self.proxy_sets.get(name, set())
+            for p in old - proxies:
+                if self.provider_by_proxy.get(p) == name:
+                    self.provider_by_proxy.pop(p, None)
+            self.proxy_sets[name] = proxies
+            for p in proxies:
+                self.provider_by_proxy[p] = name
+            self.last_refresh[name] = time.time()
+        return len(proxies)
+
+    def _fetch_webshare(self):
+        if not WEBSHARE_API_KEY:
+            return []
+        url = 'https://proxy.webshare.io/api/v2/proxy/list/'
+        headers = {'Authorization': f'Token {WEBSHARE_API_KEY}'}
+        params = {'mode': 'direct', 'valid': 'true', 'page': 1, 'page_size': 100}
+        out = []
+        try:
+            while url and len(out) < 500:
+                resp = requests.get(url, headers=headers, params=params if '?' not in url else None,
+                                    timeout=PROVIDER_API_TIMEOUT)
+                if resp.status_code != 200:
+                    logging.warning(f"Webshare API: HTTP {resp.status_code}; используем старый snapshot")
+                    return None
+                data = resp.json()
+                for row in data.get('results') or []:
+                    if row.get('valid') is not True:
+                        continue
+                    host = str(row.get('proxy_address') or '').strip()
+                    port = row.get('port')
+                    user = str(row.get('username') or '')
+                    password = str(row.get('password') or '')
+                    if host and port and user and password:
+                        out.append(f"http://{quote(user, safe='')}:{quote(password, safe='')}@{host}:{int(port)}")
+                url = data.get('next')
+                params = None
+            return list(dict.fromkeys(out))
+        except Exception as e:
+            logging.warning(f"Webshare API недоступен: {e}; используем старый snapshot")
+            return None
+
+    def _discover_ps_subaccount(self):
+        if self.ps_subaccount_id or not PROXYSCRAPE_PREMIUM_API_KEY:
+            return self.ps_subaccount_id
+        try:
+            resp = requests.get(
+                'https://api.proxyscrape.com/v4/account/subaccounts',
+                headers={'api-token': PROXYSCRAPE_PREMIUM_API_KEY},
+                timeout=PROVIDER_API_TIMEOUT,
+            )
+            if resp.status_code != 200:
+                logging.warning(
+                    f"ProxyScrape Premium: subaccount auto-discovery HTTP {resp.status_code}. "
+                    "Если API key не имеет subaccount:read, задайте PROXYSCRAPE_PREMIUM_SUBACCOUNT_ID."
+                )
+                return ''
+            data = resp.json().get('data', {}).get('subaccounts', [])
+            rows = [r for r in data if str(r.get('AccountType', '')).lower() == 'datacenter_shared']
+            if not rows:
+                logging.warning('ProxyScrape Premium: datacenter_shared subaccount не найден')
+                return ''
+            # Prefer a visible/non-hidden account and label containing premium/trial when present.
+            rows.sort(key=lambda r: (
+                'premium' in str(r.get('label', '')).lower() or 'trial' in str(r.get('label', '')).lower(),
+                not bool(r.get('is_hidden')),
+            ), reverse=True)
+            self.ps_subaccount_id = str(rows[0].get('AccountID') or '').strip()
+            return self.ps_subaccount_id
+        except Exception as e:
+            logging.warning(f"ProxyScrape Premium: subaccount auto-discovery error: {e}")
+            return ''
+
+    def _fetch_proxyscrape_premium(self):
+        if not PROXYSCRAPE_PREMIUM_API_KEY:
+            return []
+        sid = self._discover_ps_subaccount()
+        if not sid:
+            return None
+        url = f'https://api.proxyscrape.com/v4/account/{sid}/datacenter_shared/proxy-list'
+        params = {
+            'type': 'displayproxies',
+            'protocol': 'http',
+            'format': 'credentials',
+            'credential_format': 3,
+            'status': 'online',
+            'limit': 500,
+        }
+        try:
+            resp = requests.get(url, headers={'api-token': PROXYSCRAPE_PREMIUM_API_KEY},
+                                params=params, timeout=PROVIDER_API_TIMEOUT)
+            if resp.status_code != 200:
+                msg = (resp.text or '')[:180].replace('\n', ' ')
+                logging.warning(f"ProxyScrape Premium API: HTTP {resp.status_code}: {msg}; используем старый snapshot")
+                return None
+            out = []
+            for raw in resp.text.splitlines():
+                line = raw.strip()
+                if not line:
+                    continue
+                if '://' not in line:
+                    line = 'http://' + line
+                if _proxy_scheme(line) in ('http', 'https'):
+                    out.append(line)
+            return list(dict.fromkeys(out))
+        except Exception as e:
+            logging.warning(f"ProxyScrape Premium API недоступен: {e}; используем старый snapshot")
+            return None
+
+    def refresh_all(self, force=False):
+        now = time.time()
+        tasks = []
+        with self.lock:
+            ps_due = force or (now - self.last_refresh['proxyscrape_premium']) >= PROXYSCRAPE_PREMIUM_REFRESH
+            ws_due = force or (now - self.last_refresh['webshare']) >= WEBSHARE_REFRESH
+        if ps_due and PROXYSCRAPE_PREMIUM_API_KEY:
+            rows = self._fetch_proxyscrape_premium()
+            if rows is not None:
+                n = self._set_provider_snapshot('proxyscrape_premium', rows)
+                logging.info(f"🔷 ProxyScrape Premium: {n} online HTTP proxy загружено")
+        if ws_due and WEBSHARE_API_KEY:
+            rows = self._fetch_webshare()
+            if rows is not None:
+                n = self._set_provider_snapshot('webshare', rows)
+                logging.info(f"🟩 Webshare: {n} valid direct proxy загружено (rescue tier)")
+
+    def candidates(self, include_webshare=False):
+        with self.lock:
+            premium = list(self.proxy_sets['proxyscrape_premium'])
+            webshare = list(self.proxy_sets['webshare']) if include_webshare else []
+        return premium + webshare
+
+    def record_result(self, proxy, result, body_bytes=0):
+        src = self.source_fast(proxy)
+        if src not in self.stats:
+            src = 'free'
+        with self.lock:
+            st = self.stats[src]
+            st['probe'] += 1
+            if result in st:
+                st[result] += 1
+            st['bytes'] += max(0, int(body_bytes or 0))
+            now = time.time()
+            do_log = (now - self.last_stats_log) >= PROVIDER_STATS_INTERVAL
+            if do_log:
+                self.last_stats_log = now
+                snapshot = {k: dict(v) for k, v in self.stats.items()}
+        if do_log:
+            bits = []
+            for name in ('proxyscrape_premium', 'webshare', 'free'):
+                st = snapshot[name]
+                p = st['probe']; s = st['success']
+                rate = (100.0 * s / p) if p else 0.0
+                bits.append(
+                    f"{name}: probes={p}, success={s} ({rate:.1f}%), "
+                    f"403={st['blocked']}, timeout={st['proxy_timeout']}, "
+                    f"reject={st['proxy_rejected']}, ssl={st['proxy_ssl']}, "
+                    f"data≈{st['bytes']/1024/1024:.1f}MB"
+                )
+            logging.info('📊 Provider stats | ' + ' | '.join(bits))
+
+    def webshare_estimated_mb(self):
+        with self.lock:
+            return self.stats['webshare']['bytes'] / 1024 / 1024
+
+    def maybe_warn_webshare_usage(self):
+        mb = self.webshare_estimated_mb()
+        if mb >= WEBSHARE_ESTIMATED_MB_WARN and not self._webshare_warned:
+            self._webshare_warned = True
+            logging.warning(
+                f"⚠️ Webshare estimated traffic in this process ≈{mb:.1f}MB. "
+                "Это оценка по HTML body, не billing-данные Webshare."
+            )
+
+
+provider_manager = ProviderManager()
 
 class ProxyManager:
     def __init__(self, proxy_list_url=None):
@@ -1239,6 +1481,12 @@ class ProxyManager:
         quality_bonus = 85.0 if quality_state == 'ok' else 0.0
         quality_bad_penalty = 28.0 if quality_state == 'bad' else 0.0
 
+        provider = provider_manager.source_fast(proxy)
+        # Premium gets immediate priority. Webshare is metered and only enters candidates
+        # after the rescue unlock; once unlocked it must be tried promptly instead of
+        # waiting behind dozens of bad Premium IPs.
+        provider_bonus = 150.0 if provider == 'proxyscrape_premium' else (210.0 if provider == 'webshare' else 0.0)
+
         host = _proxy_host(proxy)
         soft_penalty = 70.0 if self.soft_host_penalty_until.get(host, 0) > now else 0.0
         outage_penalty = 0.0
@@ -1247,13 +1495,13 @@ class ProxyManager:
 
         return (
             recent_bonus + success_bonus + standard_bonus + fresh_standard_bonus
-            + scheme_bonus + idle_bonus + preflight_bonus + quality_bonus
+            + scheme_bonus + idle_bonus + preflight_bonus + quality_bonus + provider_bonus
             - fail_penalty - unstable_penalty - reason_penalty
             - quality_bad_penalty - soft_penalty - outage_penalty
             + random.uniform(0, 2.0)
         )
 
-    def get_candidate_batch(self, batch_size, tried_hosts=None, preferred_scheme=None):
+    def get_candidate_batch(self, batch_size, tried_hosts=None, preferred_scheme=None, allow_webshare=False):
         """Выдаёт несколько proxy с уникальными IP и разумным mix HTTP/SOCKS5.
 
         Раньше небольшой bonus HTTP приводил к тому, что при большом пуле первые десятки
@@ -1280,7 +1528,7 @@ class ProxyManager:
 
         with self.lock:
             self._cleanup_bad_locked()
-            candidates = list(self.proxies)
+            candidates = list(provider_manager.candidates(include_webshare=allow_webshare)) + list(self.proxies)
 
             # Недавно успешный ИЛИ прогретый reserve можно использовать даже если endpoint
             # исчез из очередного ProxyScrape snapshot. Это устраняет главный недостаток
@@ -1374,13 +1622,44 @@ class ProxyManager:
                     if len(batch) >= batch_size:
                         return batch
 
-            # 2) Свежий HTTPS/TLS-verified reserve важнее protocol mix.
-            # Если есть 4 действительно HTTPS-capable endpoint-а, лучше дать им все 4
-            # слота, чем искусственно подмешивать непроверенный SOCKS5.
+            # 2) Managed providers + verified free reserve. Не даём одному источнику
+            # монополизировать весь batch: это одновременно ускоряет поиск и даёт честную
+            # сравнительную статистику. До rescue-unlock Webshare вообще отсутствует.
+            if allow_webshare:
+                for p in usable:
+                    if provider_manager.source_fast(p) == 'webshare':
+                        if add_candidate(p):
+                            break  # metered: максимум один Webshare slot за batch
+
+            premium_limit = max(1, batch_size - 1)
+            premium_added = 0
+            for p in usable:
+                if provider_manager.source_fast(p) != 'proxyscrape_premium':
+                    continue
+                if add_candidate(p):
+                    premium_added += 1
+                    if premium_added >= premium_limit or len(batch) >= batch_size:
+                        break
+
+            # Один слот по возможности оставляем уже доказанному HTTPS/TLS free-reserve.
             for p in quality_usable:
-                add_candidate(p)
-                if len(batch) >= batch_size:
-                    return batch
+                if provider_manager.source_fast(p) == 'free' and add_candidate(p):
+                    break
+
+            # Если verified-free не было, свободные места снова отдаём Premium.
+            if len(batch) < batch_size:
+                for p in usable:
+                    if provider_manager.source_fast(p) == 'proxyscrape_premium':
+                        add_candidate(p)
+                        if len(batch) >= batch_size:
+                            return batch
+
+            # Остальные quality-ready (например future managed source) тоже полезны.
+            if len(batch) < batch_size:
+                for p in quality_usable:
+                    add_candidate(p)
+                    if len(batch) >= batch_size:
+                        return batch
 
             # TCP-only — только один дополнительный слот: лог v6.18 показал, что сам
             # открытый порт слишком слабый признак и не должен забивать весь batch.
@@ -1687,7 +1966,7 @@ class ProxyManager:
                 and self.host_bad_until.get(_proxy_host(p), 0) <= now
             )
             logging.info(
-                f"Proxy {proxy} cooldown {cooldown} сек. "
+                f"Proxy {_proxy_log_name(proxy)} cooldown {cooldown} сек. "
                 f"Причина: {label}; known_good={known_good}, fail_streak={streak}. "
                 f"Осталось {available_now} реально доступных proxy"
             )
@@ -3093,7 +3372,7 @@ def _auction_proxy_mark_failure(proxy, reason):
         )
 
     logging.info(
-        f"Auction-only cooldown {proxy}: {cooldown} сек., причина={reason}, "
+        f"Auction-only cooldown {_proxy_log_name(proxy)}: {cooldown} сек., причина={reason}, "
         f"fail_streak={streak}; основной monitor получает только soft penalty"
     )
     return cooldown
@@ -3120,7 +3399,7 @@ def _classify_auction_response(response, proxy):
     final_url = str(getattr(response, 'url', '') or '')
     status = int(getattr(response, 'status_code', 0) or 0)
     if status not in (200, 404, 410):
-        logging.info(f"Auction page через {proxy}: HTTP {status}, url={final_url[:160]}")
+        logging.info(f"Auction page через {_proxy_log_name(proxy)}: HTTP {status}, url={final_url[:160]}")
         if status == 403:
             return None, final_url, 'blocked'
         if status == 429:
@@ -3129,18 +3408,18 @@ def _classify_auction_response(response, proxy):
 
     blocked, reason = _is_ebay_block_page(response)
     if blocked:
-        logging.info(f"Auction page через {proxy}: eBay block/challenge ({reason})")
+        logging.info(f"Auction page через {_proxy_log_name(proxy)}: eBay block/challenge ({reason})")
         return None, final_url, 'blocked'
     if final_url and not _is_allowed_ebay_url(final_url):
-        logging.info(f"Auction page через {proxy}: неожиданный redirect {final_url[:160]}")
+        logging.info(f"Auction page через {_proxy_log_name(proxy)}: неожиданный redirect {final_url[:160]}")
         return None, final_url, 'unexpected_redirect'
     final_lower = final_url.lower()
     if ('signin.ebay.' in final_lower or 'ebayisapi.dll?signin' in final_lower or '/signin/' in final_lower):
-        logging.info(f"Auction page через {proxy}: eBay перенаправил на Sign In; этот HTML не используем")
+        logging.info(f"Auction page через {_proxy_log_name(proxy)}: eBay перенаправил на Sign In; этот HTML не используем")
         return None, final_url, 'sign_in'
 
     logging.info(
-        f"✅ Auction page получена через {proxy}: HTTP {status}, "
+        f"✅ Auction page получена через {_proxy_log_name(proxy)}: HTTP {status}, "
         f"bytes={len(response.content or b'')}, url={final_url[:160]}"
     )
     return response.text, final_url, 'success'
@@ -3160,7 +3439,7 @@ def _request_auction_page_once(url, proxy, profile, connect_timeout=None, read_t
         )
         return _classify_auction_response(response, proxy)
     except Exception as e:
-        logging.info(f"Auction page через {proxy} не получена: {e}")
+        logging.info(f"Auction page через {_proxy_log_name(proxy)} не получена: {e}")
         return None, '', _auction_transport_result(e)
     finally:
         close_session(session)
@@ -3194,11 +3473,11 @@ def _request_auction_via_main_session(url, connect_timeout=None, read_timeout=No
         if not proxy or profile is None or session is None:
             return None, '', 'main_unavailable', proxy
         if not _auction_proxy_is_available(proxy):
-            logging.info(f"Auction: main proxy {proxy} временно в auction-only cooldown")
+            logging.info(f"Auction: main proxy {_proxy_log_name(proxy)} временно в auction-only cooldown")
             return None, '', 'auction_cooldown', proxy
 
         try:
-            logging.info(f"🎯 Auction: используем текущую fixed Session {proxy}")
+            logging.info(f"🎯 Auction: используем текущую fixed Session {_proxy_log_name(proxy)}")
             response = session.get(
                 url,
                 timeout=(connect_timeout, read_timeout),
@@ -3206,7 +3485,7 @@ def _request_auction_via_main_session(url, connect_timeout=None, read_timeout=No
             )
             html, final_url, result = _classify_auction_response(response, proxy)
         except Exception as e:
-            logging.info(f"Auction page через main fixed Session {proxy} не получена: {e}")
+            logging.info(f"Auction page через main fixed Session {_proxy_log_name(proxy)} не получена: {e}")
             html, final_url, result = None, '', _auction_transport_result(e)
 
         if result == 'success':
@@ -3372,7 +3651,7 @@ def fetch_auction_pages(
                     try:
                         html, final_url, proxy_used, _result = future.result()
                     except Exception as e:
-                        logging.info(f"Auction fetch worker {proxy} завершился ошибкой: {e}")
+                        logging.info(f"Auction fetch worker {_proxy_log_name(proxy)} завершился ошибкой: {e}")
                         html, final_url, proxy_used = None, None, proxy
                         _auction_proxy_mark_failure(proxy, 'proxy_error')
                     if html:
@@ -3396,7 +3675,7 @@ def fetch_auction_pages(
         latest_proxy = fixed_proxy
         if latest_proxy and latest_proxy != main_proxy_tried and _auction_proxy_is_available(latest_proxy):
             logging.info(
-                f"Auction: появился новый main proxy {latest_proxy}; "
+                f"Auction: появился новый main proxy {_proxy_log_name(latest_proxy)}; "
                 "даём один late-main шанс до переноса ссылки на следующий retry"
             )
             for candidate_url in urls_to_try:
@@ -5003,7 +5282,7 @@ def _evaluate_search_pages_for_auction(search_pages, item_id):
         if result:
             logging.info(
                 f"✅ Auction search-card подтвердил item={item_id}, end={result[2].isoformat()}, "
-                f"source={result[3]}, proxy={proxy_used}"
+                f"source={result[3]}, proxy={_proxy_log_name(proxy_used)}"
             )
             exact = result
             break
@@ -5012,7 +5291,7 @@ def _evaluate_search_pages_for_auction(search_pages, item_id):
         )
         if observation:
             logging.info(
-                f"🟡 Auction coarse search-card: item={item_id}, proxy={proxy_used}, "
+                f"🟡 Auction coarse search-card: item={item_id}, proxy={_proxy_log_name(proxy_used)}, "
                 f"remaining={observation['remaining_text']!r}, clock={observation['clock_text']!r}, "
                 f"text='{observation['visible_snippet']}'"
             )
@@ -5092,7 +5371,7 @@ def process_auction_link(url):
         result = parse_auction_page(html, parse_url)
         item_id, title, end_time_utc, parse_source, auction_status = result
         logging.info(
-            f"🧪 Auction parse: proxy={proxy_used}, item={item_id}, status={auction_status}, "
+            f"🧪 Auction parse: proxy={_proxy_log_name(proxy_used)}, item={item_id}, status={auction_status}, "
             f"source={parse_source}, end={end_time_utc.isoformat() if end_time_utc else None}"
         )
         if expected_item_id and item_id and item_id != expected_item_id:
@@ -6029,7 +6308,7 @@ def _make_request(proxy, profile, session=None, timeout=None):
             if blocked:
                 logging.warning(
                     f"🚫 ПОДТВЕРЖДЁННАЯ защита eBay ({reason}) "
-                    f"для прокси {proxy}, профиль {profile['name']}"
+                    f"для прокси {_proxy_log_name(proxy)}, профиль {profile['name']}"
                 )
                 if own_session:
                     close_session(session)
@@ -6044,30 +6323,30 @@ def _make_request(proxy, profile, session=None, timeout=None):
                     close_session(session)
                 return 'http_error', None, None if own_session else session
 
-            logging.info(f"✅ УСПЕШНО c прокси {proxy}, профиль {profile['name']}")
+            logging.info(f"✅ УСПЕШНО c прокси {_proxy_log_name(proxy)}, профиль {profile['name']}")
             return 'success', response.text, session
 
         if response.status_code == 403:
-            logging.warning(f"🚫 eBay HTTP 403 для прокси {proxy}, профиль {profile['name']}")
+            logging.warning(f"🚫 eBay HTTP 403 для прокси {_proxy_log_name(proxy)}, профиль {profile['name']}")
             if own_session:
                 close_session(session)
             return 'blocked', None, None if own_session else session
 
         if response.status_code == 429:
-            logging.warning(f"⏳ eBay HTTP 429 для прокси {proxy}, профиль {profile['name']}")
+            logging.warning(f"⏳ eBay HTTP 429 для прокси {_proxy_log_name(proxy)}, профиль {profile['name']}")
             if own_session:
                 close_session(session)
             return 'rate_limited', None, None if own_session else session
 
         if response.status_code == 407:
-            logging.warning(f"🔐 Прокси требует авторизацию: {proxy}")
+            logging.warning(f"🔐 Прокси требует авторизацию: {_proxy_log_name(proxy)}")
             if own_session:
                 close_session(session)
             return 'proxy_error', None, None if own_session else session
 
         logging.warning(
             f"⚠️ НЕУДАЧА: HTTP {response.status_code} "
-            f"для прокси {proxy}, профиль {profile['name']}"
+            f"для прокси {_proxy_log_name(proxy)}, профиль {profile['name']}"
         )
         if own_session:
             close_session(session)
@@ -6077,7 +6356,7 @@ def _make_request(proxy, profile, session=None, timeout=None):
         error_msg = str(e)
         low = error_msg.lower()
         logging.error(
-            f"❌ ОШИБКА для прокси {proxy}, "
+            f"❌ ОШИБКА для прокси {_proxy_log_name(proxy)}, "
             f"профиль {profile['name']}: {error_msg}"
         )
 
@@ -6348,13 +6627,13 @@ def _cleanup_late_probe_future(future, proxy):
     try:
         result, _, session = future.result()
     except Exception as e:
-        logging.debug(f"Фоновый probe {proxy} завершился исключением: {e}")
+        logging.debug(f"Фоновый probe {_proxy_log_name(proxy)} завершился исключением: {e}")
         return
 
     try:
         if result == 'success':
             proxy_manager.mark_success(proxy)
-            logging.info(f"🟢 Запомнен запасной успешный proxy {proxy} (late probe)")
+            logging.info(f"🟢 Запомнен запасной успешный proxy {_proxy_log_name(proxy)} (late probe)")
         elif result != 'profile_error':
             proxy_manager.mark_failure(proxy, result, reason=f'{result} (late probe)')
             _auction_proxy_soft_host_penalty(proxy, result)
@@ -6386,7 +6665,7 @@ def fetch_ebay_html_with_fixed_pair():
     if fixed_proxy is not None and fixed_profile is not None:
         logging.info(
             f"🔁 Используем зафиксированную пару: "
-            f"proxy {fixed_proxy}, профиль {fixed_profile['name']}"
+            f"proxy {_proxy_log_name(fixed_proxy)}, профиль {fixed_profile['name']}"
         )
 
         old_proxy = fixed_proxy
@@ -6422,7 +6701,7 @@ def fetch_ebay_html_with_fixed_pair():
             )
         elif can_recover_fixed:
             logging.info(
-                f"♻️ Недавно успешный proxy {old_proxy}: "
+                f"♻️ Недавно успешный proxy {_proxy_log_name(old_proxy)}: "
                 "пересоздаём session и даём один быстрый шанс"
             )
             close_session(fixed_session)
@@ -6436,6 +6715,11 @@ def fetch_ebay_html_with_fixed_pair():
                     session=None,
                     timeout=(FIXED_RECOVERY_CONNECT_TIMEOUT, FIXED_RECOVERY_READ_TIMEOUT),
                 )
+            provider_manager.record_result(
+                old_proxy, retry_result,
+                len(retry_html.encode('utf-8', errors='ignore')) if retry_html else 0
+            )
+            provider_manager.maybe_warn_webshare_usage()
             if retry_result == 'success':
                 fixed_proxy = old_proxy
                 fixed_profile = old_profile
@@ -6455,7 +6739,7 @@ def fetch_ebay_html_with_fixed_pair():
 
         if result == 'profile_error':
             logging.warning(
-                f"Профиль {old_profile['name']} недоступен; proxy {old_proxy} не штрафуем"
+                f"Профиль {old_profile['name']} недоступен; proxy {_proxy_log_name(old_proxy)} не штрафуем"
             )
         else:
             proxy_manager.mark_failure(
@@ -6487,6 +6771,10 @@ def fetch_ebay_html_with_fixed_pair():
     # только при затянувшемся outage с уже включённым emergency pool -> максимум 6.
     # Сначала расширяемся до ProxyScrape 3000 ms, а 4000 ms используем только как
     # последний deep-emergency tier. Hard cooldown никогда не снимаются.
+    # V6.20: сначала обновляем управляемые источники. Ошибка их API полностью fail-open:
+    # старый бесплатный ProxyScrape остаётся независимым fallback.
+    provider_manager.refresh_all(force=False)
+
     # На свежем старте сначала ОБЯЗАТЕЛЬНО загружаем обычный Render PROXY_LIST
     # (timeout=1500). Emergency 3000 не имеет права включаться на пустом 0/0 pool.
     if not proxy_manager.standard_pool_loaded():
@@ -6654,7 +6942,7 @@ def fetch_ebay_html_with_fixed_pair():
                 reprobed_proxies.add(reprobe)
                 batch.append(reprobe)
                 batch_kinds[reprobe] = 'Re-probe'
-                logging.info(f"♻️ Re-probe недавно успешного proxy после cooldown: {reprobe}")
+                logging.info(f"♻️ Re-probe недавно успешного proxy после cooldown: {_proxy_log_name(reprobe)}")
 
             # В emergency-mode допускаем максимум 2 вторых шанса только transport-timeout/error.
             while (
@@ -6672,14 +6960,20 @@ def fetch_ebay_html_with_fixed_pair():
                 transient_reprobed_proxies.add(transient)
                 batch.append(transient)
                 batch_kinds[transient] = 'Transient re-probe'
-                logging.info(f"♻️ Emergency transient re-probe после cooldown: {transient}")
+                logging.info(f"♻️ Emergency transient re-probe после cooldown: {_proxy_log_name(transient)}")
 
             remaining_need = need - len(batch)
             if remaining_need > 0:
+                elapsed_for_provider = time.monotonic() - started
+                allow_webshare = (
+                    elapsed_for_provider >= WEBSHARE_UNLOCK_AFTER
+                    or attempts >= WEBSHARE_UNLOCK_ATTEMPTS
+                )
                 normal_batch = proxy_manager.get_candidate_batch(
                     remaining_need,
                     tried_hosts=tried_hosts | {_proxy_host(p) for p in batch},
                     preferred_scheme=preferred_scheme,
+                    allow_webshare=allow_webshare,
                 )
                 for p in normal_batch:
                     batch.append(p)
@@ -6694,6 +6988,7 @@ def fetch_ebay_html_with_fixed_pair():
                     min(free_slots, MAX_SEARCH_ATTEMPTS - attempts),
                     tried_hosts=tried_hosts,
                     preferred_scheme=preferred_scheme,
+                    allow_webshare=True,
                 )
                 for p in batch:
                     batch_kinds[p] = 'Emergency probe'
@@ -6705,6 +7000,7 @@ def fetch_ebay_html_with_fixed_pair():
                     min(free_slots, MAX_SEARCH_ATTEMPTS - attempts),
                     tried_hosts=tried_hosts,
                     preferred_scheme=preferred_scheme,
+                    allow_webshare=True,
                 )
                 for p in batch:
                     batch_kinds[p] = 'Emergency probe'
@@ -6727,7 +7023,7 @@ def fetch_ebay_html_with_fixed_pair():
             if final_proxy is not None:
                 batch = [final_proxy]
                 batch_kinds[final_proxy] = 'Final known-good re-probe'
-                logging.info(f"♻️ Финальный known-good re-probe поверх обычного лимита: {final_proxy}")
+                logging.info(f"♻️ Финальный known-good re-probe поверх обычного лимита: {_proxy_log_name(final_proxy)}")
 
         if not batch:
             return False
@@ -6741,9 +7037,12 @@ def fetch_ebay_html_with_fixed_pair():
             proxy_manager.remember_outage_attempt(proxy)
             attempts += 1
             kind = batch_kinds.get(proxy, 'Probe')
+            source = provider_manager.source_fast(proxy)
+            if source != 'free' and kind == 'Probe':
+                kind = 'Premium probe' if source == 'proxyscrape_premium' else 'Webshare rescue'
             limit_label = f"{MAX_SEARCH_ATTEMPTS}+1" if is_final_extra else str(MAX_SEARCH_ATTEMPTS)
             logging.info(
-                f"🔍 {kind} {attempts}/{limit_label}: proxy {proxy}, профиль {profile['name']}"
+                f"🔍 {kind} {attempts}/{limit_label}: proxy {_proxy_log_name(proxy)}, профиль {profile['name']}"
             )
             future = executor.submit(
                 _probe_proxy,
@@ -6794,7 +7093,7 @@ def fetch_ebay_html_with_fixed_pair():
                 try:
                     result, html, session = future.result()
                 except Exception as e:
-                    logging.error(f"Ошибка probe worker для {proxy}: {e}")
+                    logging.error(f"Ошибка probe worker для {_proxy_log_name(proxy)}: {e}")
                     result, html, session = 'proxy_error', None, None
 
                 completed_results.append(result)
@@ -6806,7 +7105,7 @@ def fetch_ebay_html_with_fixed_pair():
                         # Несколько probes могут завершиться одним wait() одновременно.
                         # В V6.6 второй success ошибочно попадал в mark_failure(..., 'success').
                         # Теперь это корректно запомненный запасной рабочий proxy.
-                        logging.info(f"🟢 Запомнен запасной успешный proxy {proxy} (same batch)")
+                        logging.info(f"🟢 Запомнен запасной успешный proxy {_proxy_log_name(proxy)} (same batch)")
                         close_session(session)
                 elif result == 'profile_error':
                     close_session(session)
@@ -6836,7 +7135,8 @@ def fetch_ebay_html_with_fixed_pair():
                 record_ebay_success()
                 proxy_preflight_wakeup_event.set()
                 logging.info(
-                    f"✅ Найдена рабочая пара: proxy {winner_proxy}, профиль {profile['name']}; "
+                    f"✅ Найдена рабочая пара: proxy {_proxy_log_name(winner_proxy)}, "
+                    f"source={provider_manager.source_fast(winner_proxy)}, профиль {profile['name']}; "
                     f"проверено {attempts} proxy за {time.monotonic() - started:.1f} сек."
                 )
                 return winner_html
@@ -7549,6 +7849,9 @@ def proxy_preflight_warm_worker():
                 proxy_preflight_wakeup_event.clear()
                 continue
 
+            # Managed provider lists are metadata/API calls only; they do not consume proxy bandwidth.
+            provider_manager.refresh_all(force=False)
+
             # Пока fixed работает, поддерживаем не только health-cache, но и СВЕЖИЙ
             # standard ProxyScrape snapshot. Внутренний refresh_interval ограничивает
             # это примерно одним скачиванием в минуту; warm reserve при refresh сохраняется.
@@ -7649,7 +7952,7 @@ def bot_worker():
     seen_line = f"\n📚 В базе: {seen_total} товаров." if seen_total is not None else ""
     send_telegram_message(
         startup_line +
-        "\n🇬🇧 eBay UK monitor v6.19 SmartReserve работает." +
+        "\n🇬🇧 eBay UK monitor v6.20 SmartReserve работает." +
         seen_line +
         "\nКоманды: /stop /start /list (/auctions) /delauction НОМЕР_ЛОТА"
         "\nМожно отправить ссылку на eBay-аукцион — сохраню точное время и напомню заранее.",
@@ -7689,6 +7992,12 @@ def start_leader_workers():
     db_ready_event.set()
     leader_active_event.set()
     logging.info("👑 Эта Render-копия стала leader; запускаем фоновые worker-ы")
+    logging.info(
+        "🌐 Multi-provider v6.20: "
+        f"ProxyScrape Premium={'ON' if PROXYSCRAPE_PREMIUM_API_KEY else 'OFF'}, "
+        f"Webshare={'ON (rescue)' if WEBSHARE_API_KEY else 'OFF'}, "
+        f"Webshare unlock={WEBSHARE_UNLOCK_AFTER:.0f}s/{WEBSHARE_UNLOCK_ATTEMPTS} probes"
+    )
 
     threading.Thread(target=telegram_listener, daemon=True, name='telegram-listener').start()
     threading.Thread(target=connection_watchdog, daemon=True, name='connection-watchdog').start()
@@ -7734,7 +8043,7 @@ def leader_supervisor():
 @app.route('/')
 def index():
     role = "leader" if leader_active_event.is_set() else "standby"
-    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.19 SmartReserve, {role})"
+    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.20 SmartReserve, {role})"
 
 
 @app.route('/health')
