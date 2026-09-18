@@ -51,6 +51,13 @@ PROXY_REFRESH_INTERVAL = 60
 DB_CONNECT_TIMEOUT = max(3, int(os.getenv("DB_CONNECT_TIMEOUT", "5")))
 DB_STATEMENT_TIMEOUT_MS = max(5000, int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "10000")))
 DB_LOCK_TIMEOUT_MS = max(1000, int(os.getenv("DB_LOCK_TIMEOUT_MS", "3000")))
+# V6.23: transient Aiven/network connect failures should not kill a worker on the first
+# failed TCP/SSL handshake. Retry ONLY connection establishment; SQL transactions are
+# intentionally not auto-replayed because an ambiguous COMMIT must never create hidden
+# notification semantics.
+DB_CONNECT_ATTEMPTS = max(1, min(int(os.getenv("DB_CONNECT_ATTEMPTS", "3")), 5))
+DB_CONNECT_RETRY_BASE = max(0.10, float(os.getenv("DB_CONNECT_RETRY_BASE", "0.35")))
+DB_MAIN_RETRY_WAIT = max(3.0, float(os.getenv("DB_MAIN_RETRY_WAIT", "8")))
 
 # Render делает zero-downtime deploy: новая и старая копия некоторое время живут одновременно.
 # Один session-level advisory lock в PostgreSQL гарантирует, что фоновые worker-ы активны
@@ -313,6 +320,17 @@ WEBSHARE_HANDOFF_CONFIRMATIONS = max(1, min(int(os.getenv("WEBSHARE_HANDOFF_CONF
 WEBSHARE_HANDOFF_CONFIRM_DELAY = max(1.0, float(os.getenv("WEBSHARE_HANDOFF_CONFIRM_DELAY", "8")))
 WEBSHARE_HANDOFF_READY_TTL = max(30.0, float(os.getenv("WEBSHARE_HANDOFF_READY_TTL", "90")))
 MANAGED_PROVIDER_CIRCUIT_SECONDS = max(120, int(os.getenv("MANAGED_PROVIDER_CIRCUIT_SECONDS", "300")))
+# V6.23: current production log showed a correlated 403 wall: all Webshare addresses
+# from one account were consumed almost back-to-back, then dozens of Premium IPs were
+# probed before its 32-block circuit opened. Account-level Webshare circuit protects
+# metered traffic; Premium is first THROTTLED (one slot/batch), then circuit-broken only
+# after a longer wall so a late good Premium endpoint can still be discovered.
+WEBSHARE_BLOCK_CIRCUIT_STREAK = max(3, min(int(os.getenv("WEBSHARE_BLOCK_CIRCUIT_STREAK", "4")), 10))
+PREMIUM_BLOCK_THROTTLE_STREAK = max(4, min(int(os.getenv("PREMIUM_BLOCK_THROTTLE_STREAK", "8")), 20))
+PREMIUM_BLOCK_CIRCUIT_STREAK = max(
+    PREMIUM_BLOCK_THROTTLE_STREAK + 4,
+    min(int(os.getenv("PREMIUM_BLOCK_CIRCUIT_STREAK", "20")), 40),
+)
 
 # Background SmartReserve may hold 12+ verified free proxies, but the real log showed that
 # draining 10-12 of them before managed providers delayed recovery. Keep a deeper reserve in
@@ -1181,6 +1199,17 @@ class ProviderManager:
             snapshot, ws_accounts = self._snapshot_stats_locked()
         logging.info(self._format_stats(snapshot, ws_accounts))
 
+    def premium_block_streak(self):
+        """Consecutive discovery 403s at the tail of the Premium provider history."""
+        with self.lock:
+            dq = self.provider_recent.get('proxyscrape_premium') or ()
+            streak = 0
+            for result in reversed(dq):
+                if result != 'blocked':
+                    break
+                streak += 1
+            return streak
+
     def _update_managed_circuit_locked(self, proxy, result, request_kind):
         if request_kind != 'discovery':
             return None
@@ -1189,12 +1218,13 @@ class ProviderManager:
         if src == 'proxyscrape_premium':
             dq = self.provider_recent['proxyscrape_premium']
             dq.append(result)
-            # Do NOT circuit after only 10-12 403s. Real logs found a good Premium
-            # endpoint after long 403 runs (the initial v6.20 winner was around probe 16).
-            # Individual IP cooldowns already protect eBay. Circuit only on a genuine
-            # provider-wide wall: 32 consecutive discovery blocks.
-            if len(dq) >= 32 and all(r == 'blocked' for r in dq):
-                until = now + min(120, MANAGED_PROVIDER_CIRCUIT_SECONDS)
+            # Keep a late-good Premium chance, but do not burn most of the 100-IP pool
+            # during one correlated eBay block wall. Candidate batching starts throttling
+            # after PREMIUM_BLOCK_THROTTLE_STREAK; a longer all-403 tail opens the circuit.
+            if len(dq) >= PREMIUM_BLOCK_CIRCUIT_STREAK and all(
+                r == 'blocked' for r in list(dq)[-PREMIUM_BLOCK_CIRCUIT_STREAK:]
+            ):
+                until = now + MANAGED_PROVIDER_CIRCUIT_SECONDS
                 if self.provider_circuit_until['proxyscrape_premium'] < until - 1:
                     self.provider_circuit_until['proxyscrape_premium'] = until
                     return 'ProxyScrape Premium'
@@ -1204,10 +1234,14 @@ class ProviderManager:
             if state is not None:
                 dq = state['recent']
                 dq.append(result)
-                # A free Webshare account has 10 direct proxies. Allow all ten a chance
-                # once; hiding the last 2 after 8 failures could suppress the only good IP.
-                if len(dq) >= 10 and all(r == 'blocked' for r in dq):
-                    until = now + min(120, MANAGED_PROVIDER_CIRCUIT_SECONDS)
+                # Correlated provider/account walls are common: the production log showed
+                # all ten addresses from one Webshare account returning 403 in a few seconds.
+                # Stop after a short consecutive wall; with multiple accounts each account
+                # has its own independent circuit and the interleaver immediately moves on.
+                if len(dq) >= WEBSHARE_BLOCK_CIRCUIT_STREAK and all(
+                    r == 'blocked' for r in list(dq)[-WEBSHARE_BLOCK_CIRCUIT_STREAK:]
+                ):
+                    until = now + MANAGED_PROVIDER_CIRCUIT_SECONDS
                     if state['circuit_until'] < until - 1:
                         state['circuit_until'] = until
                         return f'Webshare#{idx}'
@@ -2300,7 +2334,12 @@ class ProxyManager:
                         if add_candidate(p):
                             break  # metered: максимум один Webshare slot за batch
 
-            premium_limit = max(1, batch_size - 1)
+            premium_block_streak = provider_manager.premium_block_streak()
+            premium_limit = (
+                1
+                if premium_block_streak >= PREMIUM_BLOCK_THROTTLE_STREAK
+                else max(1, batch_size - 1)
+            )
             premium_added = 0
             for p in usable:
                 if provider_manager.source_fast(p) != 'proxyscrape_premium':
@@ -2705,16 +2744,41 @@ def close_session(session):
 
 # ============ БАЗА ДАННЫХ ============
 def get_db_connection(application_name='ebay_uk_bot'):
-    """Короткие DB-timeout без изменений в панели Aiven."""
-    return psycopg2.connect(
-        DATABASE_URL,
-        connect_timeout=DB_CONNECT_TIMEOUT,
-        application_name=application_name,
-        options=(
-            f"-c statement_timeout={DB_STATEMENT_TIMEOUT_MS} "
-            f"-c lock_timeout={DB_LOCK_TIMEOUT_MS}"
-        ),
-    )
+    """Open a PostgreSQL connection with bounded connect-only retry.
+
+    We deliberately do NOT auto-retry SQL/COMMIT here: after an ambiguous network loss
+    the server may already have committed a transaction. Replaying INSERT/UPDATE blindly
+    could alter notification semantics. Retrying the connection handshake itself is safe.
+    TCP keepalive makes the two long-lived connections (leader lock and reminder scheduler)
+    notice a dead Aiven path promptly instead of remaining half-open for minutes.
+    """
+    last_error = None
+    for attempt in range(1, DB_CONNECT_ATTEMPTS + 1):
+        try:
+            return psycopg2.connect(
+                DATABASE_URL,
+                connect_timeout=DB_CONNECT_TIMEOUT,
+                application_name=application_name,
+                keepalives=1,
+                keepalives_idle=30,
+                keepalives_interval=10,
+                keepalives_count=3,
+                options=(
+                    f"-c statement_timeout={DB_STATEMENT_TIMEOUT_MS} "
+                    f"-c lock_timeout={DB_LOCK_TIMEOUT_MS}"
+                ),
+            )
+        except psycopg2.OperationalError as e:
+            last_error = e
+            if attempt >= DB_CONNECT_ATTEMPTS:
+                raise
+            delay = DB_CONNECT_RETRY_BASE * (2 ** (attempt - 1)) + random.uniform(0.0, 0.15)
+            logging.warning(
+                f"⚠️ Aiven connect failed ({application_name}), "
+                f"retry {attempt}/{DB_CONNECT_ATTEMPTS - 1} in {delay:.2f}s: {e}"
+            )
+            time.sleep(delay)
+    raise last_error
 
 
 def init_db():
@@ -8895,7 +8959,18 @@ def bot_worker():
     global is_paused
     logging.info("🤖 Бот-воркер запущен")
     db_ready_event.wait()
-    if is_db_empty():
+    while True:
+        try:
+            db_empty = is_db_empty()
+            break
+        except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+            logging.warning(
+                f"⚠️ Aiven временно недоступен при старте main worker: {e}; "
+                f"повтор через {DB_MAIN_RETRY_WAIT:.0f} сек."
+            )
+            time.sleep(DB_MAIN_RETRY_WAIT)
+
+    if db_empty:
         if not perform_initial_snapshot():
             send_telegram_message("❌ Ошибка инициализации")
             return
@@ -8907,7 +8982,7 @@ def bot_worker():
     seen_line = f"\n📚 В базе: {seen_total} товаров." if seen_total is not None else ""
     send_telegram_message(
         startup_line +
-        "\n🇬🇧 eBay UK monitor v6.22 WebshareBridge работает." +
+        "\n🇬🇧 eBay UK monitor v6.23 DBProviderGuard работает." +
         seen_line +
         "\nКоманды: /stop /start /list (/auctions) /delauction НОМЕР_ЛОТА"
         "\nМожно отправить ссылку на eBay-аукцион — сохраню точное время и напомню заранее.",
@@ -8936,6 +9011,14 @@ def bot_worker():
                 wait = random.uniform(FAILED_SEARCH_RETRY_MIN, FAILED_SEARCH_RETRY_MAX)
                 logging.info(f"⚠️ Рабочий proxy пока не найден. Новый цикл через {wait:.1f} секунд.")
             time.sleep(wait)
+        except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+            # eBay/proxy may be perfectly healthy. A transient DB outage must not mark or
+            # rotate the fixed proxy; simply wait for Aiven and retry the normal cycle.
+            logging.warning(
+                f"⚠️ Временный сбой Aiven в основном цикле: {e}. "
+                f"Рабочий proxy не меняем; повтор через {DB_MAIN_RETRY_WAIT:.0f} сек."
+            )
+            time.sleep(DB_MAIN_RETRY_WAIT)
         except Exception as e:
             logging.error(f"Ошибка в основном цикле: {e}", exc_info=True)
             time.sleep(5)
@@ -8948,11 +9031,13 @@ def start_leader_workers():
     leader_active_event.set()
     logging.info("👑 Эта Render-копия стала leader; запускаем фоновые worker-ы")
     logging.info(
-        "🌐 Multi-provider v6.22: "
+        "🌐 Multi-provider v6.23: "
         f"ProxyScrape Premium={'ON' if PROXYSCRAPE_PREMIUM_API_KEY else 'OFF'}, "
         f"Webshare={'ON (' + str(len(WEBSHARE_API_KEYS)) + ' account(s))' if WEBSHARE_API_KEYS else 'OFF'}, "
         f"Webshare first-batch={'ON (1 reserved slot)' if WEBSHARE_FIRST_BATCH else 'OFF'}, "
-        f"bridge-handoff={WEBSHARE_HANDOFF_AFTER:.0f}s, warm-first-wave={WARM_STANDBY_TOTAL_LIMIT}"
+        f"bridge-handoff={WEBSHARE_HANDOFF_AFTER:.0f}s, warm-first-wave={WARM_STANDBY_TOTAL_LIMIT}, "
+        f"ws403-circuit={WEBSHARE_BLOCK_CIRCUIT_STREAK}, "
+        f"premium403-throttle/circuit={PREMIUM_BLOCK_THROTTLE_STREAK}/{PREMIUM_BLOCK_CIRCUIT_STREAK}"
     )
 
     threading.Thread(target=telegram_listener, daemon=True, name='telegram-listener').start()
@@ -9000,7 +9085,7 @@ def leader_supervisor():
 @app.route('/')
 def index():
     role = "leader" if leader_active_event.is_set() else "standby"
-    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.22 WebshareBridge, {role})"
+    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.23 DBProviderGuard, {role})"
 
 
 @app.route('/health')
