@@ -10,6 +10,7 @@ import logging
 import html as html_lib
 import hashlib
 import socket
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 import requests
 from datetime import datetime, timezone, timedelta
@@ -265,19 +266,53 @@ FIXED_RECOVERY_SKIP_AFTER = max(
 )
 
 
-# ============ V6.21 MULTI-PROVIDER / PROVIDER-TUNED ============
+# ============ V6.22 MULTI-WEBSHARE / MAKE-BEFORE-BREAK BRIDGE ============
 # Secrets are read ONLY from Render Environment Variables. Never hard-code API keys.
+def _collect_webshare_api_keys():
+    """Backwards-compatible Webshare key list without ever logging secret values."""
+    values = []
+    legacy = (os.getenv("WEBSHARE_API_KEY") or "").strip()
+    if legacy:
+        values.append(legacy)
+    raw = (os.getenv("WEBSHARE_API_KEYS") or "").strip()
+    if raw:
+        for value in re.split(r"[\s,;]+", raw):
+            value = value.strip()
+            if value:
+                values.append(value)
+    for idx in range(2, 9):
+        value = (os.getenv(f"WEBSHARE_API_KEY_{idx}") or "").strip()
+        if value:
+            values.append(value)
+    # Preserve order and silently remove duplicates.
+    return tuple(dict.fromkeys(values))
+
 WEBSHARE_API_KEY = (os.getenv("WEBSHARE_API_KEY") or "").strip()
+WEBSHARE_API_KEYS = _collect_webshare_api_keys()
 PROXYSCRAPE_PREMIUM_API_KEY = (os.getenv("PROXYSCRAPE_PREMIUM_API_KEY") or "").strip()
 PROXYSCRAPE_PREMIUM_SUBACCOUNT_ID = (os.getenv("PROXYSCRAPE_PREMIUM_SUBACCOUNT_ID") or "").strip()
 PROVIDER_API_TIMEOUT = max(3.0, min(float(os.getenv("PROVIDER_API_TIMEOUT", "10")), 20.0))
 PROXYSCRAPE_PREMIUM_REFRESH = max(30, int(os.getenv("PROXYSCRAPE_PREMIUM_REFRESH", "60")))
 WEBSHARE_REFRESH = max(60, int(os.getenv("WEBSHARE_REFRESH", "300")))
-# Webshare is metered. Real v6.20 log showed that waiting 12s/20 attempts was too conservative:
-# the first rescue only reached Webshare at attempt 21 and recovered at 14.3s. We still keep
-# Premium/free first, but allow one Webshare slot earlier once failover is genuinely non-trivial.
-WEBSHARE_UNLOCK_AFTER = max(3.0, float(os.getenv("WEBSHARE_UNLOCK_AFTER", "8")))
-WEBSHARE_UNLOCK_ATTEMPTS = max(4, int(os.getenv("WEBSHARE_UNLOCK_ATTEMPTS", "12")))
+WEBSHARE_STATS_REFRESH = max(300, int(os.getenv("WEBSHARE_STATS_REFRESH", "600")))
+
+# V6.22: one metered Webshare slot is allowed immediately. The real provider billing
+# screenshot showed ~21 MB / 112 requests, so discovery probes are cheap; the expensive
+# scenario is leaving Webshare as fixed for hours. We solve that with make-before-break handoff.
+WEBSHARE_FIRST_BATCH = (os.getenv("WEBSHARE_FIRST_BATCH", "true").strip().lower() not in ("0", "false", "no"))
+WEBSHARE_UNLOCK_AFTER = max(0.0, float(os.getenv("WEBSHARE_UNLOCK_AFTER", "4")))
+WEBSHARE_UNLOCK_ATTEMPTS = max(0, int(os.getenv("WEBSHARE_UNLOCK_ATTEMPTS", "6")))
+WEBSHARE_USAGE_SOFT_LIMIT = min(0.95, max(0.50, float(os.getenv("WEBSHARE_USAGE_SOFT_LIMIT", "0.85"))))
+WEBSHARE_USAGE_HARD_LIMIT = min(0.995, max(WEBSHARE_USAGE_SOFT_LIMIT + 0.02, float(os.getenv("WEBSHARE_USAGE_HARD_LIMIT", "0.98"))))
+WEBSHARE_HANDOFF_AFTER = max(30.0, float(os.getenv("WEBSHARE_HANDOFF_AFTER", "90")))
+WEBSHARE_HANDOFF_HIGH_USAGE_AFTER = max(15.0, float(os.getenv("WEBSHARE_HANDOFF_HIGH_USAGE_AFTER", "30")))
+WEBSHARE_HANDOFF_INTERVAL = max(10.0, float(os.getenv("WEBSHARE_HANDOFF_INTERVAL", "20")))
+WEBSHARE_HANDOFF_BATCH = max(2, min(int(os.getenv("WEBSHARE_HANDOFF_BATCH", "4")), 8))
+WEBSHARE_HANDOFF_CONCURRENCY = max(1, min(int(os.getenv("WEBSHARE_HANDOFF_CONCURRENCY", "2")), 3))
+WEBSHARE_HANDOFF_CONFIRMATIONS = max(1, min(int(os.getenv("WEBSHARE_HANDOFF_CONFIRMATIONS", "2")), 3))
+WEBSHARE_HANDOFF_CONFIRM_DELAY = max(1.0, float(os.getenv("WEBSHARE_HANDOFF_CONFIRM_DELAY", "8")))
+WEBSHARE_HANDOFF_READY_TTL = max(30.0, float(os.getenv("WEBSHARE_HANDOFF_READY_TTL", "90")))
+MANAGED_PROVIDER_CIRCUIT_SECONDS = max(120, int(os.getenv("MANAGED_PROVIDER_CIRCUIT_SECONDS", "300")))
 
 # Background SmartReserve may hold 12+ verified free proxies, but the real log showed that
 # draining 10-12 of them before managed providers delayed recovery. Keep a deeper reserve in
@@ -532,7 +567,7 @@ def _proxy_log_name(proxy):
         host = parts.hostname or '?'
         port = f":{parts.port}" if parts.port else ''
         scheme = parts.scheme or 'http'
-        source = provider_manager.source_fast(proxy) if 'provider_manager' in globals() else None
+        source = provider_manager.source_label_fast(proxy) if 'provider_manager' in globals() else None
         suffix = f" [{source}]" if source else ''
         return f"{scheme}://{host}{port}{suffix}"
     except Exception:
@@ -540,17 +575,56 @@ def _proxy_log_name(proxy):
 
 
 class ProviderManager:
-    """Small fail-open source layer for managed proxies.
+    """Fail-open managed proxy layer with multi-account Webshare balancing.
 
-    Provider API failures never affect the legacy free ProxyScrape path.
-    Webshare is intentionally metered/rescue-only; ProxyScrape Premium is priority-1.
+    Important invariants:
+      * API failures never break the legacy free pool.
+      * API keys / proxy credentials are never logged.
+      * Webshare accounts are balanced by REAL provider bandwidth usage when the
+        stats API is available, not by decompressed HTML bytes seen by Python.
+      * Expired/unauthorized Premium or Webshare accounts are temporarily removed
+        instead of leaving stale authenticated endpoints in the hot path.
     """
     def __init__(self):
         self.lock = threading.Lock()
         self.provider_by_proxy = {}
+        self.webshare_account_by_proxy = {}
         self.proxy_sets = {'proxyscrape_premium': set(), 'webshare': set()}
         self.last_refresh = {'proxyscrape_premium': 0.0, 'webshare': 0.0}
         self.ps_subaccount_id = PROXYSCRAPE_PREMIUM_SUBACCOUNT_ID
+        self.provider_circuit_until = {'proxyscrape_premium': 0.0}
+        self.provider_recent = {'proxyscrape_premium': deque(maxlen=32)}
+
+        self.webshare_accounts = {}
+        for idx, key in enumerate(WEBSHARE_API_KEYS, 1):
+            self.webshare_accounts[idx] = {
+                'key': key,
+                'proxies': set(),
+                'last_proxy_refresh': 0.0,
+                'last_stats_refresh': 0.0,
+                'plan_id': None,
+                'billing_start': None,
+                'billing_end': None,
+                'bandwidth_limit_gb': None,
+                'bandwidth_used_bytes': None,
+                'bandwidth_projected_bytes': None,
+                'circuit_until': 0.0,
+                'recent': deque(maxlen=10),
+                'api_disabled_until': 0.0,
+                'app_body_bytes': 0,
+                # Per-account eBay evidence: useful when 3-4 independent Webshare
+                # accounts are connected. Sets stay tiny (10 proxies/account) and let
+                # logs show which account/IP pool actually helps instead of only aggregate stats.
+                'ebay_requests': 0,
+                'ebay_success': 0,
+                'discovery_requests': 0,
+                'discovery_success': 0,
+                'blocked': 0,
+                'winners': 0,
+                'unique_discovery': set(),
+                'unique_success': set(),
+            }
+
         self.stats = {
             name: {
                 'requests': 0, 'success': 0, 'blocked': 0, 'rate_limited': 0,
@@ -577,34 +651,145 @@ class ProviderManager:
             return self.provider_by_proxy.get(proxy, 'free')
 
     def source_fast(self, proxy):
-        # Safe lock-free read under CPython for logging/scoring; stale value is harmless.
         return self.provider_by_proxy.get(proxy, 'free')
+
+    def source_label_fast(self, proxy):
+        src = self.provider_by_proxy.get(proxy, 'free')
+        if src == 'webshare':
+            idx = self.webshare_account_by_proxy.get(proxy)
+            return f'webshare#{idx}' if idx else 'webshare'
+        return src
+
+    def managed_proxy_available(self, proxy):
+        """True for active managed endpoints only; historical source labels are not enough."""
+        src = self.provider_by_proxy.get(proxy, 'free')
+        if src == 'free':
+            return True
+        now = time.time()
+        with self.lock:
+            if src == 'proxyscrape_premium':
+                return (
+                    self.provider_circuit_until['proxyscrape_premium'] <= now
+                    and proxy in self.proxy_sets['proxyscrape_premium']
+                )
+            if src == 'webshare':
+                idx = self.webshare_account_by_proxy.get(proxy)
+                state = self.webshare_accounts.get(idx)
+                if not state:
+                    return False
+                ratio = self._webshare_usage_ratio_locked(idx)
+                if state.get('api_disabled_until', 0.0) > now or state.get('circuit_until', 0.0) > now:
+                    return False
+                if ratio is not None and ratio >= WEBSHARE_USAGE_HARD_LIMIT:
+                    return False
+                return proxy in state.get('proxies', set())
+        return False
 
     def _set_provider_snapshot(self, name, proxies):
         proxies = set(proxies or ())
         with self.lock:
-            # Keep historical provider ownership for endpoints that disappear from a later
-            # snapshot. A recently-successful fixed/warm proxy may still be reused from
-            # ProxyManager memory; losing its source label would misclassify it as "free".
             self.proxy_sets[name] = proxies
             for p in proxies:
                 self.provider_by_proxy[p] = name
             self.last_refresh[name] = time.time()
         return len(proxies)
 
-    def _fetch_webshare(self):
-        if not WEBSHARE_API_KEY:
-            return []
+    def _rebuild_webshare_snapshot_locked(self):
+        combined = set()
+        for idx, state in self.webshare_accounts.items():
+            for proxy in state['proxies']:
+                combined.add(proxy)
+                self.provider_by_proxy[proxy] = 'webshare'
+                self.webshare_account_by_proxy[proxy] = idx
+        self.proxy_sets['webshare'] = combined
+        self.last_refresh['webshare'] = time.time()
+        return len(combined)
+
+    def _webshare_usage_ratio_locked(self, idx):
+        state = self.webshare_accounts.get(idx)
+        if not state:
+            return None
+        limit_gb = state.get('bandwidth_limit_gb')
+        used = state.get('bandwidth_used_bytes')
+        if limit_gb is None or used is None:
+            return None
+        try:
+            limit_gb = float(limit_gb)
+            if limit_gb <= 0:
+                return 0.0  # Webshare uses 0 for unlimited on paid plans.
+            limit_bytes = limit_gb * 1_000_000_000  # Webshare dashboard/API reports decimal GB
+            return min(10.0, max(0.0, float(used) / limit_bytes))
+        except Exception:
+            return None
+
+    def _webshare_projected_ratio_locked(self, idx):
+        state = self.webshare_accounts.get(idx)
+        if not state:
+            return None
+        limit_gb = state.get('bandwidth_limit_gb')
+        projected = state.get('bandwidth_projected_bytes')
+        if limit_gb is None or projected is None:
+            return None
+        try:
+            limit_gb = float(limit_gb)
+            if limit_gb <= 0:
+                return 0.0
+            return max(0.0, float(projected) / (limit_gb * 1_000_000_000))  # decimal GB
+        except Exception:
+            return None
+
+    def webshare_usage_ratio_for_proxy(self, proxy):
+        with self.lock:
+            idx = self.webshare_account_by_proxy.get(proxy)
+            return self._webshare_usage_ratio_locked(idx) if idx else None
+
+    def webshare_pressure_ratio_for_proxy(self, proxy):
+        """Bandwidth pressure for bridge timing only.
+
+        Hard-disable always uses REAL consumed bytes, never a projection. For deciding
+        whether a working Webshare should hand off sooner we also look at Webshare's
+        projected end-of-cycle usage: a bursty account can then be protected before
+        it actually reaches 85-98% of the monthly allowance.
+        """
+        with self.lock:
+            idx = self.webshare_account_by_proxy.get(proxy)
+            if not idx:
+                return None
+            actual = self._webshare_usage_ratio_locked(idx)
+            projected = self._webshare_projected_ratio_locked(idx)
+        values = [x for x in (actual, projected) if x is not None]
+        return max(values) if values else None
+
+    def webshare_handoff_after_for_proxy(self, proxy):
+        pressure = self.webshare_pressure_ratio_for_proxy(proxy)
+        if pressure is not None and pressure >= WEBSHARE_USAGE_SOFT_LIMIT:
+            return WEBSHARE_HANDOFF_HIGH_USAGE_AFTER
+        return WEBSHARE_HANDOFF_AFTER
+
+    def _fetch_webshare_proxy_list(self, idx, state):
+        key = state['key']
         url = 'https://proxy.webshare.io/api/v2/proxy/list/'
-        headers = {'Authorization': f'Token {WEBSHARE_API_KEY}'}
+        headers = {'Authorization': f'Token {key}'}
         params = {'mode': 'direct', 'valid': 'true', 'page': 1, 'page_size': 100}
         out = []
         try:
             while url and len(out) < 500:
-                resp = requests.get(url, headers=headers, params=params if '?' not in url else None,
-                                    timeout=PROVIDER_API_TIMEOUT)
+                resp = requests.get(
+                    url, headers=headers, params=params if '?' not in url else None,
+                    timeout=PROVIDER_API_TIMEOUT,
+                )
+                if resp.status_code in (401, 403):
+                    logging.warning(f"Webshare#{idx} API: HTTP {resp.status_code}; account paused for 30 min")
+                    with self.lock:
+                        state['api_disabled_until'] = time.time() + 1800
+                        state['proxies'] = set()
+                        self._rebuild_webshare_snapshot_locked()
+                    return None
+                if resp.status_code == 429:
+                    logging.warning(f"Webshare#{idx} API: HTTP 429; keep previous snapshot")
+                    return None
                 if resp.status_code != 200:
-                    logging.warning(f"Webshare API: HTTP {resp.status_code}; используем старый snapshot")
+                    logging.warning(f"Webshare#{idx} API: HTTP {resp.status_code}; keep previous snapshot")
                     return None
                 data = resp.json()
                 for row in data.get('results') or []:
@@ -615,13 +800,164 @@ class ProviderManager:
                     user = str(row.get('username') or '')
                     password = str(row.get('password') or '')
                     if host and port and user and password:
-                        out.append(f"http://{quote(user, safe='')}:{quote(password, safe='')}@{host}:{int(port)}")
+                        out.append(
+                            f"http://{quote(user, safe='')}:{quote(password, safe='')}@{host}:{int(port)}"
+                        )
                 url = data.get('next')
                 params = None
             return list(dict.fromkeys(out))
         except Exception as e:
-            logging.warning(f"Webshare API недоступен: {e}; используем старый snapshot")
+            logging.warning(f"Webshare#{idx} API недоступен: {e}; keep previous snapshot")
             return None
+
+    def _refresh_webshare_usage(self, idx, state, force=False):
+        now = time.time()
+        if not force and (now - state.get('last_stats_refresh', 0.0)) < WEBSHARE_STATS_REFRESH:
+            return
+        key = state['key']
+        headers = {'Authorization': f'Token {key}'}
+        try:
+            sub = requests.get(
+                'https://proxy.webshare.io/api/v2/subscription/',
+                headers=headers, timeout=PROVIDER_API_TIMEOUT,
+            )
+            if sub.status_code != 200:
+                return
+            sub_data = sub.json() or {}
+            plan_id = sub_data.get('plan')
+            billing_start = sub_data.get('start_date')
+            billing_end = sub_data.get('end_date')
+
+            bandwidth_limit_gb = None
+            if plan_id:
+                plan = requests.get(
+                    f'https://proxy.webshare.io/api/v2/subscription/plan/{plan_id}/',
+                    headers=headers, timeout=PROVIDER_API_TIMEOUT,
+                )
+                if plan.status_code == 200:
+                    bandwidth_limit_gb = (plan.json() or {}).get('bandwidth_limit')
+
+            stats_params = {}
+            if plan_id:
+                stats_params['plan_id'] = plan_id
+            if billing_start:
+                stats_params['timestamp__gte'] = billing_start
+            # Request through the current billing end (never beyond it). Webshare's
+            # aggregate endpoint then returns BOTH real bandwidth_total and the provider's
+            # end-of-cycle bandwidth_projected. With only 'now' as LTE the projection is
+            # not useful for proactive traffic protection.
+            now_dt = datetime.now(timezone.utc)
+            lte_dt = now_dt
+            if billing_end:
+                try:
+                    end_dt = datetime.fromisoformat(str(billing_end).replace('Z', '+00:00'))
+                    if end_dt.tzinfo is None:
+                        end_dt = end_dt.replace(tzinfo=timezone.utc)
+                    lte_dt = end_dt
+                except Exception:
+                    pass
+            stats_params['timestamp__lte'] = lte_dt.isoformat()
+            stats = requests.get(
+                'https://proxy.webshare.io/api/v2/stats/aggregate/',
+                headers=headers, params=stats_params, timeout=PROVIDER_API_TIMEOUT,
+            )
+            bandwidth_used = None
+            bandwidth_projected = None
+            if stats.status_code == 200:
+                stat_data = stats.json() or {}
+                bandwidth_used = stat_data.get('bandwidth_total')
+                bandwidth_projected = stat_data.get('bandwidth_projected')
+
+            with self.lock:
+                state['plan_id'] = plan_id
+                state['billing_start'] = billing_start
+                state['billing_end'] = billing_end
+                if bandwidth_limit_gb is not None:
+                    state['bandwidth_limit_gb'] = bandwidth_limit_gb
+                if bandwidth_used is not None:
+                    state['bandwidth_used_bytes'] = int(bandwidth_used)
+                if bandwidth_projected is not None:
+                    state['bandwidth_projected_bytes'] = int(bandwidth_projected)
+                state['last_stats_refresh'] = now
+        except Exception as e:
+            logging.debug(f"Webshare#{idx} stats refresh skipped: {e}")
+
+    def _refresh_webshare_all(self, force=False, include_stats=True):
+        """Refresh independent Webshare accounts in parallel.
+
+        Failover needs the proxy LIST, not three billing/statistics HTTP calls. Discovery
+        therefore calls this with include_stats=False; the background reserve worker keeps
+        real usage fresh while a fixed proxy is online. With 3-4 accounts, list refreshes
+        run concurrently so one slow API does not serialize 4 x provider timeouts.
+        """
+        if not self.webshare_accounts:
+            return
+        now = time.time()
+        jobs = []
+        for idx, state in list(self.webshare_accounts.items()):
+            if state.get('api_disabled_until', 0.0) > now:
+                continue
+            due = force or (now - state.get('last_proxy_refresh', 0.0)) >= WEBSHARE_REFRESH
+            stats_due = bool(
+                include_stats
+                and (force or (now - state.get('last_stats_refresh', 0.0)) >= WEBSHARE_STATS_REFRESH)
+            )
+            if due or stats_due:
+                jobs.append((idx, state, due, stats_due))
+        if not jobs:
+            return
+
+        def _one(job):
+            idx, state, due, stats_due = job
+            rows = self._fetch_webshare_proxy_list(idx, state) if due else '__not_due__'
+            if stats_due:
+                self._refresh_webshare_usage(idx, state, force=force)
+            return idx, state, due, stats_due, rows
+
+        results = []
+        max_workers = min(4, len(jobs))
+        if max_workers <= 1:
+            for job in jobs:
+                results.append(_one(job))
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix='webshare-api') as executor:
+                futures = [executor.submit(_one, job) for job in jobs]
+                for future in futures:
+                    try:
+                        results.append(future.result())
+                    except Exception as e:
+                        logging.warning(f"Webshare API refresh worker skipped: {e}")
+
+        did_refresh = False
+        with self.lock:
+            for idx, state, due, stats_due, rows in results:
+                if due and rows != '__not_due__' and rows is not None:
+                    state['proxies'] = set(rows)
+                    state['last_proxy_refresh'] = now
+                    did_refresh = True
+                if stats_due:
+                    did_refresh = True
+            if did_refresh:
+                self._rebuild_webshare_snapshot_locked()
+                total = len(self.proxy_sets['webshare'])
+                pieces = []
+                for idx, state in self.webshare_accounts.items():
+                    ratio = self._webshare_usage_ratio_locked(idx)
+                    projected = self._webshare_projected_ratio_locked(idx)
+                    count = len(state['proxies'])
+                    if ratio is None:
+                        pieces.append(f"#{idx}:{count} proxy")
+                    else:
+                        tail = f"/{projected*100:.0f}% projected" if projected is not None else ''
+                        pieces.append(f"#{idx}:{count} proxy/{ratio*100:.1f}% used{tail}")
+            else:
+                total = 0
+                pieces = []
+        if total:
+            logging.info(
+                f"🟩 Webshare: {total} valid direct proxy across {len(self.webshare_accounts)} account(s) "
+                f"[{', '.join(pieces)}]"
+            )
 
     def _discover_ps_subaccount(self):
         if self.ps_subaccount_id or not PROXYSCRAPE_PREMIUM_API_KEY:
@@ -635,15 +971,14 @@ class ProviderManager:
             if resp.status_code != 200:
                 logging.warning(
                     f"ProxyScrape Premium: subaccount auto-discovery HTTP {resp.status_code}. "
-                    "Если API key не имеет subaccount:read, задайте PROXYSCRAPE_PREMIUM_SUBACCOUNT_ID."
+                    "If trial expires, Premium will be skipped automatically."
                 )
                 return ''
             data = resp.json().get('data', {}).get('subaccounts', [])
             rows = [r for r in data if str(r.get('AccountType', '')).lower() == 'datacenter_shared']
             if not rows:
-                logging.warning('ProxyScrape Premium: datacenter_shared subaccount не найден')
+                logging.warning('ProxyScrape Premium: datacenter_shared subaccount not found')
                 return ''
-            # Prefer a visible/non-hidden account and label containing premium/trial when present.
             rows.sort(key=lambda r: (
                 'premium' in str(r.get('label', '')).lower() or 'trial' in str(r.get('label', '')).lower(),
                 not bool(r.get('is_hidden')),
@@ -657,24 +992,39 @@ class ProviderManager:
     def _fetch_proxyscrape_premium(self):
         if not PROXYSCRAPE_PREMIUM_API_KEY:
             return []
+        now = time.time()
+        with self.lock:
+            if self.provider_circuit_until['proxyscrape_premium'] > now:
+                return None
         sid = self._discover_ps_subaccount()
         if not sid:
             return None
         url = f'https://api.proxyscrape.com/v4/account/{sid}/datacenter_shared/proxy-list'
         params = {
-            'type': 'displayproxies',
-            'protocol': 'http',
-            'format': 'credentials',
-            'credential_format': 3,
-            'status': 'online',
-            'limit': 500,
+            'type': 'displayproxies', 'protocol': 'http', 'format': 'credentials',
+            'credential_format': 3, 'status': 'online', 'limit': 500,
         }
         try:
-            resp = requests.get(url, headers={'api-token': PROXYSCRAPE_PREMIUM_API_KEY},
-                                params=params, timeout=PROVIDER_API_TIMEOUT)
+            resp = requests.get(
+                url, headers={'api-token': PROXYSCRAPE_PREMIUM_API_KEY},
+                params=params, timeout=PROVIDER_API_TIMEOUT,
+            )
+            if resp.status_code in (401, 403, 404, 410):
+                logging.warning(
+                    f"ProxyScrape Premium API HTTP {resp.status_code}; Premium disabled for 30 min, free/Webshare continue"
+                )
+                with self.lock:
+                    self.proxy_sets['proxyscrape_premium'] = set()
+                    self.provider_circuit_until['proxyscrape_premium'] = time.time() + 1800
+                    self.last_refresh['proxyscrape_premium'] = time.time()
+                return []
+            if resp.status_code == 429:
+                with self.lock:
+                    self.provider_circuit_until['proxyscrape_premium'] = time.time() + 300
+                return None
             if resp.status_code != 200:
                 msg = (resp.text or '')[:180].replace('\n', ' ')
-                logging.warning(f"ProxyScrape Premium API: HTTP {resp.status_code}: {msg}; используем старый snapshot")
+                logging.warning(f"ProxyScrape Premium API: HTTP {resp.status_code}: {msg}; keep old snapshot")
                 return None
             out = []
             for raw in resp.text.splitlines():
@@ -687,40 +1037,100 @@ class ProviderManager:
                     out.append(line)
             return list(dict.fromkeys(out))
         except Exception as e:
-            logging.warning(f"ProxyScrape Premium API недоступен: {e}; используем старый snapshot")
+            logging.warning(f"ProxyScrape Premium API unavailable: {e}; keep old snapshot")
             return None
 
-    def refresh_all(self, force=False):
+    def refresh_all(self, force=False, include_stats=True):
         now = time.time()
-        tasks = []
         with self.lock:
             ps_due = force or (now - self.last_refresh['proxyscrape_premium']) >= PROXYSCRAPE_PREMIUM_REFRESH
-            ws_due = force or (now - self.last_refresh['webshare']) >= WEBSHARE_REFRESH
         if ps_due and PROXYSCRAPE_PREMIUM_API_KEY:
             rows = self._fetch_proxyscrape_premium()
             if rows is not None:
                 n = self._set_provider_snapshot('proxyscrape_premium', rows)
-                logging.info(f"🔷 ProxyScrape Premium: {n} online HTTP proxy загружено")
-        if ws_due and WEBSHARE_API_KEY:
-            rows = self._fetch_webshare()
-            if rows is not None:
-                n = self._set_provider_snapshot('webshare', rows)
-                logging.info(f"🟩 Webshare: {n} valid direct proxy загружено (rescue tier)")
+                if n:
+                    logging.info(f"🔷 ProxyScrape Premium: {n} online HTTP proxy loaded")
+        self._refresh_webshare_all(force=force, include_stats=include_stats)
+
+    def _webshare_candidates_locked(self):
+        now = time.time()
+        accounts = []
+        for idx, state in self.webshare_accounts.items():
+            if state.get('api_disabled_until', 0.0) > now or state.get('circuit_until', 0.0) > now:
+                continue
+            ratio = self._webshare_usage_ratio_locked(idx)
+            if ratio is not None and ratio >= WEBSHARE_USAGE_HARD_LIMIT:
+                continue
+            if state['proxies']:
+                accounts.append((idx, ratio if ratio is not None else 0.50, state))
+        accounts.sort(key=lambda row: (row[1], row[0]))
+
+        # Interleave accounts instead of exhausting #1 before #2/#3/#4.
+        buckets = []
+        for idx, ratio, state in accounts:
+            rows = list(state['proxies'])
+            random.shuffle(rows)
+            buckets.append((idx, ratio, rows))
+        out = []
+        while buckets:
+            next_buckets = []
+            for idx, ratio, rows in buckets:
+                if rows:
+                    out.append(rows.pop())
+                if rows:
+                    next_buckets.append((idx, ratio, rows))
+            buckets = next_buckets
+        return out
 
     def candidates(self, include_webshare=False):
+        now = time.time()
         with self.lock:
-            premium = list(self.proxy_sets['proxyscrape_premium'])
-            webshare = list(self.proxy_sets['webshare']) if include_webshare else []
+            premium = []
+            if self.provider_circuit_until['proxyscrape_premium'] <= now:
+                premium = list(self.proxy_sets['proxyscrape_premium'])
+            webshare = self._webshare_candidates_locked() if include_webshare else []
         return premium + webshare
+
+    def has_usable_webshare(self):
+        with self.lock:
+            return bool(self._webshare_candidates_locked())
+
+    def webshare_balance_bonus(self, proxy):
+        with self.lock:
+            idx = self.webshare_account_by_proxy.get(proxy)
+            ratio = self._webshare_usage_ratio_locked(idx) if idx else None
+        if ratio is None:
+            return 0.0
+        # Lower-used accounts get a small deterministic preference.
+        return max(-50.0, min(35.0, (0.80 - ratio) * 50.0))
 
     def _snapshot_stats_locked(self):
         snapshot = {k: dict(v) for k, v in self.stats.items()}
         for name in snapshot:
             snapshot[name]['unique_discovery'] = len(self.discovery_proxy_seen[name])
             snapshot[name]['unique_success'] = len(self.success_proxy_seen[name])
-        return snapshot
+        ws_accounts = []
+        for idx, state in self.webshare_accounts.items():
+            ratio = self._webshare_usage_ratio_locked(idx)
+            ws_accounts.append({
+                'idx': idx,
+                'proxy_count': len(state['proxies']),
+                'ratio': ratio,
+                'projected_ratio': self._webshare_projected_ratio_locked(idx),
+                'used': state.get('bandwidth_used_bytes'),
+                'limit_gb': state.get('bandwidth_limit_gb'),
+                'ebay_requests': state.get('ebay_requests', 0),
+                'ebay_success': state.get('ebay_success', 0),
+                'discovery_requests': state.get('discovery_requests', 0),
+                'discovery_success': state.get('discovery_success', 0),
+                'blocked': state.get('blocked', 0),
+                'winners': state.get('winners', 0),
+                'unique_discovery': len(state.get('unique_discovery') or ()),
+                'unique_success': len(state.get('unique_success') or ()),
+            })
+        return snapshot, ws_accounts
 
-    def _format_stats(self, snapshot):
+    def _format_stats(self, snapshot, ws_accounts=None):
         bits = []
         for name in ('proxyscrape_premium', 'webshare', 'free'):
             st = snapshot[name]
@@ -739,8 +1149,27 @@ class ProviderManager:
                 f"fixed={fixed}/{fixed_ok}, winners={winners}, avg_find={avg_find:.1f}s, "
                 f"403={st['blocked']}, timeout={st['proxy_timeout']}, "
                 f"reject={st['proxy_rejected']}, ssl={st['proxy_ssl']}, "
-                f"data≈{st['bytes']/1024/1024:.1f}MB"
+                f"body≈{st['bytes']/1024/1024:.1f}MB"
             )
+        if ws_accounts:
+            acct_bits = []
+            for row in ws_accounts:
+                if row['ratio'] is None:
+                    usage = 'usage?n/a'
+                else:
+                    usage = f"used={row['ratio']*100:.1f}%"
+                if row.get('projected_ratio') is not None:
+                    usage += f"/projected={row['projected_ratio']*100:.0f}%"
+                ud = row.get('unique_discovery', 0)
+                us = row.get('unique_success', 0)
+                q = (100.0 * us / ud) if ud else 0.0
+                acct_bits.append(
+                    f"ws#{row['idx']}:{row['proxy_count']}proxy/{usage}/"
+                    f"unique={ud}/{us}({q:.0f}%)/"
+                    f"eBay={row.get('ebay_requests', 0)}/{row.get('ebay_success', 0)}/"
+                    f"winners={row.get('winners', 0)}/403={row.get('blocked', 0)}"
+                )
+            bits.append('Webshare accounts=' + ','.join(acct_bits))
         return '📊 Provider stats | ' + ' | '.join(bits)
 
     def maybe_log_stats(self, force=False):
@@ -749,13 +1178,46 @@ class ProviderManager:
             if not force and (now - self.last_stats_log) < PROVIDER_STATS_INTERVAL:
                 return
             self.last_stats_log = now
-            snapshot = self._snapshot_stats_locked()
-        logging.info(self._format_stats(snapshot))
+            snapshot, ws_accounts = self._snapshot_stats_locked()
+        logging.info(self._format_stats(snapshot, ws_accounts))
+
+    def _update_managed_circuit_locked(self, proxy, result, request_kind):
+        if request_kind != 'discovery':
+            return None
+        now = time.time()
+        src = self.provider_by_proxy.get(proxy, 'free')
+        if src == 'proxyscrape_premium':
+            dq = self.provider_recent['proxyscrape_premium']
+            dq.append(result)
+            # Do NOT circuit after only 10-12 403s. Real logs found a good Premium
+            # endpoint after long 403 runs (the initial v6.20 winner was around probe 16).
+            # Individual IP cooldowns already protect eBay. Circuit only on a genuine
+            # provider-wide wall: 32 consecutive discovery blocks.
+            if len(dq) >= 32 and all(r == 'blocked' for r in dq):
+                until = now + min(120, MANAGED_PROVIDER_CIRCUIT_SECONDS)
+                if self.provider_circuit_until['proxyscrape_premium'] < until - 1:
+                    self.provider_circuit_until['proxyscrape_premium'] = until
+                    return 'ProxyScrape Premium'
+        elif src == 'webshare':
+            idx = self.webshare_account_by_proxy.get(proxy)
+            state = self.webshare_accounts.get(idx)
+            if state is not None:
+                dq = state['recent']
+                dq.append(result)
+                # A free Webshare account has 10 direct proxies. Allow all ten a chance
+                # once; hiding the last 2 after 8 failures could suppress the only good IP.
+                if len(dq) >= 10 and all(r == 'blocked' for r in dq):
+                    until = now + min(120, MANAGED_PROVIDER_CIRCUIT_SECONDS)
+                    if state['circuit_until'] < until - 1:
+                        state['circuit_until'] = until
+                        return f'Webshare#{idx}'
+        return None
 
     def record_result(self, proxy, result, body_bytes=0, request_kind='unknown'):
         src = self.source_fast(proxy)
         if src not in self.stats:
             src = 'free'
+        circuit_label = None
         with self.lock:
             st = self.stats[src]
             st['requests'] += 1
@@ -780,6 +1242,31 @@ class ProviderManager:
             if result == 'success':
                 self.success_proxy_seen[src].add(proxy)
 
+            if src == 'webshare':
+                idx = self.webshare_account_by_proxy.get(proxy)
+                state = self.webshare_accounts.get(idx)
+                if state is not None:
+                    state['app_body_bytes'] += max(0, int(body_bytes or 0))
+                    state['ebay_requests'] += 1
+                    if result == 'success':
+                        state['ebay_success'] += 1
+                    if result == 'blocked':
+                        state['blocked'] += 1
+                    if request_kind == 'discovery':
+                        state['discovery_requests'] += 1
+                        state['unique_discovery'].add(proxy)
+                        if result == 'success':
+                            state['discovery_success'] += 1
+                    if result == 'success':
+                        state['unique_success'].add(proxy)
+
+            circuit_label = self._update_managed_circuit_locked(proxy, result, request_kind)
+
+        if circuit_label:
+            logging.warning(
+                f"🛑 {circuit_label}: temporary 403 circuit opened; "
+                "other providers continue immediately"
+            )
         self.maybe_log_stats(force=False)
 
     def record_winner(self, proxy, elapsed_seconds, attempts):
@@ -791,7 +1278,11 @@ class ProviderManager:
             st['winners'] += 1
             st['winner_seconds_sum'] += max(0.0, float(elapsed_seconds or 0.0))
             st['winner_attempts_sum'] += max(0, int(attempts or 0))
-        # A winner is an important boundary: always emit a truthful provider summary.
+            if src == 'webshare':
+                idx = self.webshare_account_by_proxy.get(proxy)
+                state = self.webshare_accounts.get(idx)
+                if state is not None:
+                    state['winners'] += 1
         self.maybe_log_stats(force=True)
 
     def webshare_estimated_mb(self):
@@ -799,12 +1290,14 @@ class ProviderManager:
             return self.stats['webshare']['bytes'] / 1024 / 1024
 
     def maybe_warn_webshare_usage(self):
+        # Keep the old HTML-body warning as a fallback, but real billing ratios are logged
+        # from Webshare's own stats API and are used for balancing.
         mb = self.webshare_estimated_mb()
         if mb >= WEBSHARE_ESTIMATED_MB_WARN and not self._webshare_warned:
             self._webshare_warned = True
             logging.warning(
-                f"⚠️ Webshare estimated traffic in this process ≈{mb:.1f}MB. "
-                "Это оценка по HTML body, не billing-данные Webshare."
+                f"⚠️ Webshare decompressed HTML body in this process ≈{mb:.1f}MB; "
+                "provider billing is tracked separately through Webshare Stats API."
             )
 
 
@@ -1392,6 +1885,8 @@ class ProxyManager:
             tcp = []
             known = []
             for p in universe:
+                if provider_manager.source_fast(p) != 'free' and not provider_manager.managed_proxy_available(p):
+                    continue
                 host = _proxy_host(p)
                 if not host or host in excluded_hosts:
                     continue
@@ -1449,6 +1944,57 @@ class ProxyManager:
             add_group(free_quality, max_from_group=WARM_STANDBY_FREE_QUALITY_LIMIT)
             # TCP-only — слабый сигнал. Не заполняем им весь первый batch.
             add_group(tcp, max_from_group=1)
+            return result
+
+    def get_free_handoff_candidates(self, limit, excluded_hosts=None):
+        """Free-only candidates for make-before-break Webshare handoff.
+
+        No managed/provider endpoint is returned here: the whole point is to move a
+        working metered Webshare fixed session back to the unmetered pool without any gap.
+        Recently-good and HTTPS/TLS-ready free proxies are preferred, then fresh unknowns.
+        """
+        if limit <= 0:
+            return []
+        excluded_hosts = set(excluded_hosts or ())
+        now = time.time()
+        with self.lock:
+            self._cleanup_bad_locked()
+            universe = list(dict.fromkeys(
+                list(self.proxies)
+                + list(self.quality_ok_until.keys())
+                + list(self.preflight_ok_until.keys())
+                + list(self.last_success_at.keys())
+            ))
+            rows = []
+            for proxy in universe:
+                if provider_manager.source_fast(proxy) != 'free':
+                    continue
+                host = _proxy_host(proxy)
+                if not host or host in excluded_hosts:
+                    continue
+                if self.bad_until.get(proxy, 0) > now or self.host_bad_until.get(host, 0) > now:
+                    continue
+                if self.soft_host_penalty_until.get(host, 0) > now:
+                    continue
+                if self._preflight_state_locked(proxy, now) == 'bad':
+                    continue
+                recent_good = self._is_recent_good_locked(proxy, now)
+                quality_ok = self._quality_state_locked(proxy, now) == 'ok'
+                tcp_ok = self._preflight_state_locked(proxy, now) == 'ok'
+                freshness = 3 if recent_good else (2 if quality_ok else (1 if tcp_ok else 0))
+                rows.append((freshness, self._candidate_score_locked(proxy, now), proxy))
+            rows.sort(key=lambda row: (row[0], row[1]), reverse=True)
+            result = []
+            used_hosts = set(excluded_hosts)
+            for _freshness, _score, proxy in rows:
+                host = _proxy_host(proxy)
+                if host in used_hosts:
+                    continue
+                result.append(proxy)
+                used_hosts.add(host)
+                self.last_used[proxy] = now
+                if len(result) >= limit:
+                    break
             return result
 
     def remember_outage_attempt(self, proxy):
@@ -1575,7 +2121,7 @@ class ProxyManager:
         # Premium gets immediate priority. Webshare is metered and only enters candidates
         # after the rescue unlock; once unlocked it must be tried promptly instead of
         # waiting behind dozens of bad Premium IPs.
-        provider_bonus = 150.0 if provider == 'proxyscrape_premium' else (210.0 if provider == 'webshare' else 0.0)
+        provider_bonus = 150.0 if provider == 'proxyscrape_premium' else ((210.0 + provider_manager.webshare_balance_bonus(proxy)) if provider == 'webshare' else 0.0)
 
         host = _proxy_host(proxy)
         soft_penalty = 70.0 if self.soft_host_penalty_until.get(host, 0) > now else 0.0
@@ -1590,6 +2136,37 @@ class ProxyManager:
             - quality_bad_penalty - soft_penalty - outage_penalty
             + random.uniform(0, 2.0)
         )
+
+    def get_webshare_rescue_candidate(self, excluded_hosts=None):
+        """Return one currently-usable Webshare endpoint for the immediate failover wave.
+
+        This is intentionally separate from the generic batch ranking. In v6.21 a deep
+        warm-free queue could occupy all 4 initial workers, even though Webshare had by
+        far the highest distinct-endpoint success rate. One explicit rescue slot keeps
+        worst-case outages short while still limiting metered Webshare to one request.
+        """
+        excluded_hosts = set(excluded_hosts or ())
+        now = time.time()
+        with self.lock:
+            self._cleanup_bad_locked()
+            rows = []
+            for proxy in provider_manager.candidates(include_webshare=True):
+                if provider_manager.source_fast(proxy) != 'webshare':
+                    continue
+                host = _proxy_host(proxy)
+                if not host or host in excluded_hosts:
+                    continue
+                if self.bad_until.get(proxy, 0) > now or self.host_bad_until.get(host, 0) > now:
+                    continue
+                if self.soft_host_penalty_until.get(host, 0) > now:
+                    continue
+                rows.append(proxy)
+            if not rows:
+                return None
+            rows.sort(key=lambda p: self._candidate_score_locked(p, now), reverse=True)
+            chosen = rows[0]
+            self.last_used[chosen] = now
+            return chosen
 
     def get_candidate_batch(self, batch_size, tried_hosts=None, preferred_scheme=None, allow_webshare=False):
         """Выдаёт несколько proxy с уникальными IP и разумным mix HTTP/SOCKS5.
@@ -1635,6 +2212,8 @@ class ProxyManager:
                 p for p, until in self.preflight_ok_until.items() if until > now
             )
             for p in warm_extra:
+                if provider_manager.source_fast(p) != 'free' and not provider_manager.managed_proxy_available(p):
+                    continue
                 if p not in candidates and self.bad_until.get(p, 0) <= now:
                     candidates.append(p)
 
@@ -2078,6 +2657,14 @@ proxy_manager = ProxyManager(PROXY_LIST_URL)
 fixed_proxy = None
 fixed_profile = None
 fixed_session = None
+fixed_pair_since_monotonic = None
+
+# V6.22 make-before-break: while a metered Webshare fixed session keeps the monitor
+# continuously online, a separate worker scouts FREE proxies. A replacement is adopted
+# only after it already returned a valid eBay HTTP 200 in its own Session.
+webshare_handoff_wakeup_event = threading.Event()
+webshare_handoff_state_lock = threading.Lock()
+webshare_handoff_ready = None  # (proxy, profile, session, monotonic_created)
 # Auction-refinement может аккуратно воспользоваться текущей рабочей fixed Session,
 # но НИКОГДА не одновременно с основным search request. Оба пути сериализованы одним
 # lock; auction ждёт только ограниченное окно и затем уходит на reserve IP.
@@ -5339,7 +5926,8 @@ def _finish_exact_auction_save(item_id, title, end_time_utc, parse_source, notif
                 "‼️ <b>До конца аукциона меньше 5 минут</b>\n\n"
                 f"📦 <b>{safe_title}</b>\n\n"
                 f"⏳ Осталось: {format_remaining(remaining, with_seconds=False)}\n\n"
-                f"🕒 Окончание по Киеву: {format_kyiv_datetime(end_time_utc)}",
+                f"🕒 Окончание по Киеву: {format_kyiv_datetime(end_time_utc)}\n\n"
+                f"🔗 <a href='{html_lib.escape(canonical_url, quote=True)}'>Открыть аукцион на eBay</a>",
                 reply_markup=auction_open_list_keyboard(canonical_url),
                 preview_url=canonical_url,
                 existing_message_id=status_message_id,
@@ -5356,7 +5944,8 @@ def _finish_exact_auction_save(item_id, title, end_time_utc, parse_source, notif
             f"📦 <b>{safe_title}</b>\n\n"
             f"🕒 Окончание по Киеву: {format_kyiv_datetime(end_time_utc)}\n\n"
             f"⏳ Осталось: {format_remaining(remaining, with_seconds=False)}\n\n"
-            "🔔 Напоминания: <b>60 / 30 / 10 / 5 мин.</b>",
+            "🔔 Напоминания: <b>60 / 30 / 10 / 5 мин.</b>\n\n"
+            f"🔗 <a href='{html_lib.escape(canonical_url, quote=True)}'>Открыть аукцион на eBay</a>",
             reply_markup=auction_message_keyboard(item_id, canonical_url),
             preview_url=canonical_url,
             existing_message_id=status_message_id,
@@ -6155,6 +6744,12 @@ def auction_reminder_worker():
 
                 clean_current_title = _clean_auction_title(current_title or title, item_id)
                 safe_title = html_lib.escape(clean_current_title)
+                # Old DB rows may theoretically miss URL. Reconstruct the canonical item
+                # URL so every 60/30/10/5 reminder ALWAYS has a clickable text link,
+                # independently of the inline Telegram button.
+                current_url = str(current_url or f"https://www.ebay.co.uk/itm/{item_id}")
+                safe_current_url = html_lib.escape(current_url, quote=True)
+                text_link = f"\n\n🔗 <a href='{safe_current_url}'>Открыть аукцион на eBay</a>"
 
                 # На 5 мин это последнее сообщение: после успешной доставки удаляем запись,
                 # поэтому дальше никаких status-check и reminders этот аукцион не создаёт.
@@ -6168,6 +6763,7 @@ def auction_reminder_worker():
                     f"📦 <b>{safe_title}</b>\n\n"
                     f"⏳ До окончания сейчас: <b>{format_remaining(remaining_send, with_seconds=False)}</b>\n\n"
                     f"🕒 Окончание по Киеву: {format_kyiv_datetime(current_end)}"
+                    f"{text_link}"
                 )
                 keyboard = (
                     auction_open_list_keyboard(current_url)
@@ -6764,8 +7360,234 @@ def _discovery_replacement_pause(results):
     return random.uniform(PROBE_OTHER_PAUSE_MIN, PROBE_OTHER_PAUSE_MAX)
 
 
+
+def _discard_webshare_handoff_ready(reason='stale'):
+    global webshare_handoff_ready
+    ready = None
+    with webshare_handoff_state_lock:
+        ready = webshare_handoff_ready
+        webshare_handoff_ready = None
+    if ready:
+        close_session(ready[2])
+        logging.debug(f"Webshare handoff candidate discarded: {reason}")
+
+
+def _store_webshare_handoff_ready(proxy, profile, session):
+    """Store one already-proven FREE Session for atomic adoption by main worker."""
+    global webshare_handoff_ready
+    if not proxy or session is None:
+        close_session(session)
+        return False
+    current = fixed_proxy
+    if not current or provider_manager.source_fast(current) != 'webshare':
+        close_session(session)
+        return False
+    if provider_manager.source_fast(proxy) != 'free':
+        close_session(session)
+        return False
+    with webshare_handoff_state_lock:
+        old = webshare_handoff_ready
+        webshare_handoff_ready = (proxy, profile, session, time.monotonic())
+    if old:
+        close_session(old[2])
+    webshare_handoff_wakeup_event.set()
+    logging.info(
+        f"🟢 Webshare bridge: FREE replacement already proved eBay 200: {_proxy_log_name(proxy)}; "
+        "switching before next main check"
+    )
+    return True
+
+
+def _adopt_webshare_handoff_if_ready():
+    """Make-before-break swap; never drops working Webshare before FREE is proven."""
+    global fixed_proxy, fixed_profile, fixed_session, fixed_pair_since_monotonic, webshare_handoff_ready
+    with webshare_handoff_state_lock:
+        ready = webshare_handoff_ready
+        if ready is None:
+            return False
+        webshare_handoff_ready = None
+    proxy, profile, session, created = ready
+    if (time.monotonic() - created) > WEBSHARE_HANDOFF_READY_TTL:
+        close_session(session)
+        return False
+
+    adopted = False
+    old_session = None
+    with main_fixed_request_lock:
+        if (
+            fixed_proxy is not None
+            and provider_manager.source_fast(fixed_proxy) == 'webshare'
+            and provider_manager.source_fast(proxy) == 'free'
+        ):
+            old_session = fixed_session
+            fixed_proxy = proxy
+            fixed_profile = profile
+            fixed_session = session
+            fixed_pair_since_monotonic = time.monotonic()
+            proxy_manager.mark_success(proxy)
+            proxy_manager.clear_outage_memory()
+            adopted = True
+    if adopted:
+        close_session(old_session)
+        logging.info(
+            f"♻️ Webshare bridge handoff complete: now using proven FREE {_proxy_log_name(proxy)}; "
+            "metered Webshare traffic stopped without an outage"
+        )
+        return True
+    close_session(session)
+    return False
+
+
+def webshare_handoff_worker():
+    """Background FREE scout used only while Webshare is the working fixed proxy."""
+    db_ready_event.wait()
+    logging.info(
+        f"🌉 Webshare bridge worker started: handoff after {WEBSHARE_HANDOFF_AFTER:.0f}s "
+        f"(high-usage {WEBSHARE_HANDOFF_HIGH_USAGE_AFTER:.0f}s), "
+        f"batch={WEBSHARE_HANDOFF_BATCH}, concurrency={WEBSHARE_HANDOFF_CONCURRENCY}"
+    )
+    while True:
+        try:
+            current = fixed_proxy
+            if is_paused or current is None or provider_manager.source_fast(current) != 'webshare':
+                if current is None or provider_manager.source_fast(current) != 'webshare':
+                    _discard_webshare_handoff_ready('fixed is not Webshare')
+                webshare_handoff_wakeup_event.wait(timeout=5.0)
+                webshare_handoff_wakeup_event.clear()
+                continue
+
+            started = fixed_pair_since_monotonic or time.monotonic()
+            age = max(0.0, time.monotonic() - started)
+            handoff_after = provider_manager.webshare_handoff_after_for_proxy(current)
+            if age < handoff_after:
+                webshare_handoff_wakeup_event.wait(timeout=min(5.0, handoff_after - age))
+                webshare_handoff_wakeup_event.clear()
+                continue
+
+            with webshare_handoff_state_lock:
+                ready_exists = webshare_handoff_ready is not None
+            if ready_exists:
+                webshare_handoff_wakeup_event.wait(timeout=5.0)
+                webshare_handoff_wakeup_event.clear()
+                continue
+
+            profile = get_preferred_profile()
+            if profile is None:
+                webshare_handoff_wakeup_event.wait(timeout=WEBSHARE_HANDOFF_INTERVAL)
+                webshare_handoff_wakeup_event.clear()
+                continue
+
+            excluded = {_proxy_host(current)}
+            candidates = proxy_manager.get_free_handoff_candidates(
+                WEBSHARE_HANDOFF_BATCH, excluded_hosts=excluded
+            )
+            if not candidates:
+                proxy_manager.refresh_proxies(force=False, emergency=False)
+                candidates = proxy_manager.get_free_handoff_candidates(
+                    WEBSHARE_HANDOFF_BATCH, excluded_hosts=excluded
+                )
+            if not candidates:
+                webshare_handoff_wakeup_event.wait(timeout=WEBSHARE_HANDOFF_INTERVAL)
+                webshare_handoff_wakeup_event.clear()
+                continue
+
+            logging.info(
+                f"🌉 Webshare bridge: quietly checking {len(candidates)} FREE replacement(s); "
+                "current Webshare stays online"
+            )
+            executor = ThreadPoolExecutor(
+                max_workers=min(WEBSHARE_HANDOFF_CONCURRENCY, len(candidates)),
+                thread_name_prefix='webshare-handoff',
+            )
+            future_to_proxy = {
+                executor.submit(
+                    _probe_proxy, candidate, profile,
+                    (PROBE_CONNECT_TIMEOUT, PROBE_READ_TIMEOUT),
+                ): candidate
+                for candidate in candidates
+            }
+            winner = None
+            try:
+                while future_to_proxy and winner is None:
+                    done, _ = wait(tuple(future_to_proxy), timeout=1.0, return_when=FIRST_COMPLETED)
+                    if not done:
+                        if fixed_proxy != current or provider_manager.source_fast(fixed_proxy) != 'webshare':
+                            break
+                        continue
+                    for future in done:
+                        candidate = future_to_proxy.pop(future, None)
+                        try:
+                            result, _html, session = future.result()
+                        except Exception:
+                            result, session = 'proxy_error', None
+                        if result == 'success' and winner is None:
+                            # Do not abandon a stable metered bridge for a FREE proxy that
+                            # happened to answer only once. Require consecutive eBay 200s
+                            # in the SAME Session before make-before-break adoption.
+                            confirmed = True
+                            confirm_result = 'success'
+                            for _confirm_idx in range(1, WEBSHARE_HANDOFF_CONFIRMATIONS):
+                                if fixed_proxy != current or provider_manager.source_fast(fixed_proxy) != 'webshare':
+                                    confirmed = False
+                                    confirm_result = 'profile_error'  # cancellation, do not punish candidate
+                                    break
+                                time.sleep(WEBSHARE_HANDOFF_CONFIRM_DELAY)
+                                if fixed_proxy != current or provider_manager.source_fast(fixed_proxy) != 'webshare':
+                                    confirmed = False
+                                    confirm_result = 'profile_error'
+                                    break
+                                confirm_result, _confirm_html, confirm_session = _make_request(
+                                    candidate, profile, session=session,
+                                    timeout=(PROBE_CONNECT_TIMEOUT, PROBE_READ_TIMEOUT),
+                                    request_kind='discovery',
+                                )
+                                session = confirm_session
+                                if confirm_result != 'success':
+                                    confirmed = False
+                                    break
+                            if confirmed:
+                                proxy_manager.mark_success(candidate)
+                                logging.info(
+                                    f"🟢 Handoff FREE confirmed {WEBSHARE_HANDOFF_CONFIRMATIONS}x eBay 200: "
+                                    f"{_proxy_log_name(candidate)}"
+                                )
+                                winner = (candidate, profile, session)
+                                break
+                            result = confirm_result
+
+                        close_session(session)
+                        if result != 'profile_error':
+                            proxy_manager.mark_failure(
+                                candidate, result, reason=f'{result} during Webshare handoff scout'
+                            )
+                            _auction_proxy_soft_host_penalty(candidate, result)
+
+                if winner is not None:
+                    candidate, winner_profile, winner_session = winner
+                    if fixed_proxy == current and provider_manager.source_fast(fixed_proxy) == 'webshare':
+                        _store_webshare_handoff_ready(candidate, winner_profile, winner_session)
+                    else:
+                        close_session(winner_session)
+            finally:
+                for future, candidate in list(future_to_proxy.items()):
+                    if not future.cancel():
+                        future.add_done_callback(
+                            lambda fut, p=candidate: _cleanup_late_probe_future(fut, p)
+                        )
+                executor.shutdown(wait=False, cancel_futures=True)
+
+            webshare_handoff_wakeup_event.wait(timeout=WEBSHARE_HANDOFF_INTERVAL)
+            webshare_handoff_wakeup_event.clear()
+        except Exception as e:
+            logging.warning(f"Webshare bridge worker: {e}")
+            webshare_handoff_wakeup_event.wait(timeout=WEBSHARE_HANDOFF_INTERVAL)
+            webshare_handoff_wakeup_event.clear()
+
+
 def fetch_ebay_html_with_fixed_pair():
-    global fixed_proxy, fixed_profile, fixed_session
+    global fixed_proxy, fixed_profile, fixed_session, fixed_pair_since_monotonic
+
+    _adopt_webshare_handoff_if_ready()
 
     # Свежий background-резерв используется ПЕРВЫМ после падения fixed proxy.
     # На холодном старте список пуст: обычный discovery работает как раньше.
@@ -6831,6 +7653,8 @@ def fetch_ebay_html_with_fixed_pair():
                 fixed_proxy = old_proxy
                 fixed_profile = old_profile
                 fixed_session = retry_session
+                if fixed_pair_since_monotonic is None:
+                    fixed_pair_since_monotonic = time.monotonic()
                 proxy_manager.mark_success(old_proxy)
                 record_ebay_success()
                 logging.info("✅ Proxy восстановился после пересоздания session")
@@ -6843,6 +7667,8 @@ def fetch_ebay_html_with_fixed_pair():
         fixed_session = None
         fixed_proxy = None
         fixed_profile = None
+        fixed_pair_since_monotonic = None
+        webshare_handoff_wakeup_event.set()
 
         if result == 'profile_error':
             logging.warning(
@@ -6880,7 +7706,7 @@ def fetch_ebay_html_with_fixed_pair():
     # последний deep-emergency tier. Hard cooldown никогда не снимаются.
     # V6.20: сначала обновляем управляемые источники. Ошибка их API полностью fail-open:
     # старый бесплатный ProxyScrape остаётся независимым fallback.
-    provider_manager.refresh_all(force=False)
+    provider_manager.refresh_all(force=False, include_stats=False)
 
     # На свежем старте сначала ОБЯЗАТЕЛЬНО загружаем обычный Render PROXY_LIST
     # (timeout=1500). Emergency 3000 не имеет права включаться на пустом 0/0 pool.
@@ -7017,8 +7843,24 @@ def fetch_ebay_html_with_fixed_pair():
         batch_kinds = {}
 
         if need > 0:
-            # 0) Самый быстрый путь после падения fixed-session: background уже доказал,
-            # что эти proxy проводят HTTPS/TLS. Не делаем перед ними новый ProxyScrape refresh.
+            # 0) V6.22 continuity-first: reserve exactly ONE immediate Webshare slot
+            # before draining warm FREE. The latest log contained two full 75-second
+            # no-winner cycles while managed addresses were unavailable; Webshare had
+            # the best distinct-IP success rate, and a single rescue probe costs little
+            # compared with running it as fixed for hours.
+            if WEBSHARE_FIRST_BATCH and attempts == 0 and len(batch) < need:
+                ws_rescue = proxy_manager.get_webshare_rescue_candidate(
+                    excluded_hosts=(
+                        tried_hosts
+                        | inflight_hosts
+                        | {_proxy_host(p) for p in batch}
+                    )
+                )
+                if ws_rescue is not None:
+                    batch.append(ws_rescue)
+                    batch_kinds[ws_rescue] = 'Webshare bridge'
+
+            # Fill the remaining first-wave workers from already proven warm reserve.
             while fast_standby_queue and len(batch) < need:
                 standby = fast_standby_queue.pop(0)
                 standby_host = _proxy_host(standby)
@@ -7073,7 +7915,8 @@ def fetch_ebay_html_with_fixed_pair():
             if remaining_need > 0:
                 elapsed_for_provider = time.monotonic() - started
                 allow_webshare = (
-                    elapsed_for_provider >= WEBSHARE_UNLOCK_AFTER
+                    (WEBSHARE_FIRST_BATCH and provider_manager.has_usable_webshare())
+                    or elapsed_for_provider >= WEBSHARE_UNLOCK_AFTER
                     or attempts >= WEBSHARE_UNLOCK_ATTEMPTS
                 )
                 normal_batch = proxy_manager.get_candidate_batch(
@@ -7239,8 +8082,11 @@ def fetch_ebay_html_with_fixed_pair():
                 fixed_proxy = winner_proxy
                 fixed_profile = profile
                 fixed_session = winner_session
+                fixed_pair_since_monotonic = time.monotonic()
                 record_ebay_success()
                 proxy_preflight_wakeup_event.set()
+                if provider_manager.source_fast(winner_proxy) == 'webshare':
+                    webshare_handoff_wakeup_event.set()
                 discovery_elapsed = time.monotonic() - started
                 provider_manager.record_winner(winner_proxy, discovery_elapsed, attempts)
                 logging.info(
@@ -8061,7 +8907,7 @@ def bot_worker():
     seen_line = f"\n📚 В базе: {seen_total} товаров." if seen_total is not None else ""
     send_telegram_message(
         startup_line +
-        "\n🇬🇧 eBay UK monitor v6.21 ProviderTuned работает." +
+        "\n🇬🇧 eBay UK monitor v6.22 WebshareBridge работает." +
         seen_line +
         "\nКоманды: /stop /start /list (/auctions) /delauction НОМЕР_ЛОТА"
         "\nМожно отправить ссылку на eBay-аукцион — сохраню точное время и напомню заранее.",
@@ -8102,16 +8948,17 @@ def start_leader_workers():
     leader_active_event.set()
     logging.info("👑 Эта Render-копия стала leader; запускаем фоновые worker-ы")
     logging.info(
-        "🌐 Multi-provider v6.21: "
+        "🌐 Multi-provider v6.22: "
         f"ProxyScrape Premium={'ON' if PROXYSCRAPE_PREMIUM_API_KEY else 'OFF'}, "
-        f"Webshare={'ON (rescue)' if WEBSHARE_API_KEY else 'OFF'}, "
-        f"Webshare unlock={WEBSHARE_UNLOCK_AFTER:.0f}s/{WEBSHARE_UNLOCK_ATTEMPTS} probes, "
-        f"warm-first-wave={WARM_STANDBY_TOTAL_LIMIT}"
+        f"Webshare={'ON (' + str(len(WEBSHARE_API_KEYS)) + ' account(s))' if WEBSHARE_API_KEYS else 'OFF'}, "
+        f"Webshare first-batch={'ON (1 reserved slot)' if WEBSHARE_FIRST_BATCH else 'OFF'}, "
+        f"bridge-handoff={WEBSHARE_HANDOFF_AFTER:.0f}s, warm-first-wave={WARM_STANDBY_TOTAL_LIMIT}"
     )
 
     threading.Thread(target=telegram_listener, daemon=True, name='telegram-listener').start()
     threading.Thread(target=connection_watchdog, daemon=True, name='connection-watchdog').start()
     threading.Thread(target=proxy_preflight_warm_worker, daemon=True, name='proxy-preflight-worker').start()
+    threading.Thread(target=webshare_handoff_worker, daemon=True, name='webshare-handoff-worker').start()
     threading.Thread(target=auction_link_worker, daemon=True, name='auction-link-worker').start()
     threading.Thread(target=auction_reminder_worker, daemon=True, name='auction-reminder-worker').start()
     threading.Thread(target=auction_status_worker, daemon=True, name='auction-status-worker').start()
@@ -8153,7 +9000,7 @@ def leader_supervisor():
 @app.route('/')
 def index():
     role = "leader" if leader_active_event.is_set() else "standby"
-    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.21 ProviderTuned, {role})"
+    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.22 WebshareBridge, {role})"
 
 
 @app.route('/health')
