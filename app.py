@@ -72,8 +72,8 @@ LEADER_RETRY_INTERVAL = max(2, int(os.getenv("LEADER_RETRY_INTERVAL", "5")))
 LEADER_HEALTH_INTERVAL = max(5, int(os.getenv("LEADER_HEALTH_INTERVAL", "10")))
 
 # Discovery запускается только когда уже нет рабочей fixed-session.
-# V6.26: реальные логи V6.25 показали 17.7–55.9 сек. на failover при RSS всего 198–290 MB.
-# Поэтому возвращаем более быстрый безопасный разгон: 4 сразу -> 5 после ~8 сек. -> 6 после
+# V6.27: реальные логи V6.26 показали median failover ~10 сек., но один длинный outlier 44.7 сек.
+# Сохраняем быстрый безопасный разгон: 4 сразу -> 5 после ~8 сек. -> 6 после
 # ~18 сек., не дожидаясь deep-emergency. При живом fixed proxy всё равно выполняется ОДИН
 # обычный eBay request — частота основного мониторинга не меняется. Memory guard ниже может
 # динамически вернуть ширину к 4 только около реального лимита RAM Render.
@@ -115,7 +115,8 @@ PROBE_OTHER_PAUSE_MAX = max(PROBE_OTHER_PAUSE_MIN, float(os.getenv("PROBE_OTHER_
 # один раз подключаем deep-emergency 4000 мс как последний дополнительный источник.
 # Никаких новых обязательных Environment Variables пользователю не нужно.
 PROXY_EMERGENCY_TIMEOUT_MS = max(1500, int(os.getenv("PROXY_EMERGENCY_TIMEOUT_MS", "3000")))
-PROXY_EMERGENCY_TRIGGER_AFTER = max(15.0, float(os.getenv("PROXY_EMERGENCY_TRIGGER_AFTER", "30")))
+# V6.27: widen only a genuinely long search sooner; normal 3–13s failovers never pay this cost.
+PROXY_EMERGENCY_TRIGGER_AFTER = max(15.0, float(os.getenv("PROXY_EMERGENCY_TRIGGER_AFTER", "22")))
 PROXY_EMERGENCY_TRIGGER_ATTEMPTS = max(20, int(os.getenv("PROXY_EMERGENCY_TRIGGER_ATTEMPTS", "50")))
 PROXY_EMERGENCY_MIN_AVAILABLE = max(20, int(os.getenv("PROXY_EMERGENCY_MIN_AVAILABLE", "60")))
 PROXY_EMERGENCY_MIN_RATIO = min(0.50, max(0.05, float(os.getenv("PROXY_EMERGENCY_MIN_RATIO", "0.20"))))
@@ -340,8 +341,11 @@ WEBSHARE_HANDOFF_HIGH_USAGE_AFTER = max(15.0, float(os.getenv("WEBSHARE_HANDOFF_
 WEBSHARE_HANDOFF_INTERVAL = max(10.0, float(os.getenv("WEBSHARE_HANDOFF_INTERVAL", "20")))
 WEBSHARE_HANDOFF_BATCH = max(2, min(int(os.getenv("WEBSHARE_HANDOFF_BATCH", "4")), 8))
 WEBSHARE_HANDOFF_CONCURRENCY = max(1, min(int(os.getenv("WEBSHARE_HANDOFF_CONCURRENCY", "2")), 3))
-WEBSHARE_HANDOFF_CONFIRMATIONS = max(1, min(int(os.getenv("WEBSHARE_HANDOFF_CONFIRMATIONS", "2")), 3))
-WEBSHARE_HANDOFF_CONFIRM_DELAY = max(1.0, float(os.getenv("WEBSHARE_HANDOFF_CONFIRM_DELAY", "8")))
+# V6.27: production showed a FREE handoff candidate that passed 2x HTTP 200 but returned 403
+# immediately after adoption. Three confirmations separated by 10s provide a much stronger
+# stability signal while the metered Webshare fixed session remains online in parallel.
+WEBSHARE_HANDOFF_CONFIRMATIONS = max(1, min(int(os.getenv("WEBSHARE_HANDOFF_CONFIRMATIONS", "3")), 3))
+WEBSHARE_HANDOFF_CONFIRM_DELAY = max(1.0, float(os.getenv("WEBSHARE_HANDOFF_CONFIRM_DELAY", "10")))
 WEBSHARE_HANDOFF_READY_TTL = max(30.0, float(os.getenv("WEBSHARE_HANDOFF_READY_TTL", "90")))
 MANAGED_PROVIDER_CIRCUIT_SECONDS = max(120, int(os.getenv("MANAGED_PROVIDER_CIRCUIT_SECONDS", "300")))
 # V6.23: current production log showed a correlated 403 wall: all Webshare addresses
@@ -8770,24 +8774,40 @@ def fetch_ebay_html_with_fixed_pair():
     )
     main_discovery_active_event.set()
     future_to_proxy = {}
+    last_concurrency_logged = None
 
     def desired_concurrency():
+        nonlocal last_concurrency_logged
         elapsed_now = time.monotonic() - started
         rss_now = _memory_rss_mb() if MEMORY_GUARD_ENABLED else None
         # Hard safety margin: if RSS is already extremely close to Render's 512 MB cap,
         # do not create more simultaneous full-page curl responses. Existing in-flight work
         # can still finish; this does NOT stop the main failover.
         if rss_now is not None and rss_now >= MEMORY_EMERGENCY_MB:
-            return 2
+            desired = 2
+            reason = f'emergency-memory RSS≈{rss_now:.0f}MB'
         # Real protective mode starts at 450 MB by default. Check RSS directly as well as
         # the background Event so a fast discovery spike cannot wait for the next 10-sec guard tick.
-        if (rss_now is not None and rss_now >= MEMORY_HIGH_MB) or memory_pressure_event.is_set():
-            return PROBE_CONCURRENCY
-        if elapsed_now >= PROBE_DEEP_ESCALATE_AFTER:
-            return PROBE_DEEP_CONCURRENCY
-        if elapsed_now >= PROBE_ESCALATE_AFTER:
-            return PROBE_ESCALATED_CONCURRENCY
-        return PROBE_CONCURRENCY
+        elif (rss_now is not None and rss_now >= MEMORY_HIGH_MB) or memory_pressure_event.is_set():
+            desired = PROBE_CONCURRENCY
+            reason = f'high-memory RSS≈{rss_now:.0f}MB' if rss_now is not None else 'memory-pressure'
+        elif elapsed_now >= PROBE_DEEP_ESCALATE_AFTER:
+            desired = PROBE_DEEP_CONCURRENCY
+            reason = f'elapsed={elapsed_now:.1f}s'
+        elif elapsed_now >= PROBE_ESCALATE_AFTER:
+            desired = PROBE_ESCALATED_CONCURRENCY
+            reason = f'elapsed={elapsed_now:.1f}s'
+        else:
+            desired = PROBE_CONCURRENCY
+            reason = f'elapsed={elapsed_now:.1f}s'
+
+        if desired != last_concurrency_logged:
+            if last_concurrency_logged is not None:
+                logging.info(
+                    f"⚡ Discovery concurrency {last_concurrency_logged}→{desired} ({reason})"
+                )
+            last_concurrency_logged = desired
+        return desired
 
     def maybe_mid_refresh_standard():
         nonlocal standard_mid_refresh_used
@@ -10070,7 +10090,7 @@ def start_leader_workers():
     leader_active_event.set()
     logging.info("👑 Эта Render-копия стала leader; запускаем фоновые worker-ы")
     logging.info(
-        "🌐 Multi-provider v6.26: "
+        "🌐 Multi-provider v6.27: "
         f"ProxyScrape Premium={'ON' if PROXYSCRAPE_PREMIUM_API_KEY else 'OFF'}, "
         f"Webshare={'ON (' + str(len(WEBSHARE_API_KEYS)) + ' account(s))' if WEBSHARE_API_KEYS else 'OFF'}, "
         f"Webshare first-batch={'ON (1-2 unique-host slots; extra keys=bandwidth)' if WEBSHARE_FIRST_BATCH else 'OFF'}, "
