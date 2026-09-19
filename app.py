@@ -144,6 +144,11 @@ PROXY_STANDARD_MID_REFRESH_ATTEMPTS = max(30, int(os.getenv("PROXY_STANDARD_MID_
 # Если eBay UK не дал ни одного успешного ответа более 10 минут, один раз
 # уведомляем в Telegram. После следующего успеха аварийный флаг сбрасывается.
 CONNECTION_ALERT_AFTER = max(60, int(os.getenv("CONNECTION_ALERT_AFTER", "600")))
+# V6.28: log the TOTAL interval between valid eBay HTTP 200 responses after a meaningful
+# outage. Per-discovery timings alone hide multi-cycle outages (e.g. 4x75s + retries).
+CONNECTION_RECOVERY_LOG_AFTER = max(
+    45, int(os.getenv("CONNECTION_RECOVERY_LOG_AFTER", "60"))
+)
 CONNECTION_WATCHDOG_INTERVAL = max(10, int(os.getenv("CONNECTION_WATCHDOG_INTERVAL", "15")))
 
 # ============ НАПОМИНАНИЯ ОБ АУКЦИОНАХ ============
@@ -348,6 +353,16 @@ WEBSHARE_HANDOFF_CONFIRMATIONS = max(1, min(int(os.getenv("WEBSHARE_HANDOFF_CONF
 WEBSHARE_HANDOFF_CONFIRM_DELAY = max(1.0, float(os.getenv("WEBSHARE_HANDOFF_CONFIRM_DELAY", "10")))
 WEBSHARE_HANDOFF_READY_TTL = max(30.0, float(os.getenv("WEBSHARE_HANDOFF_READY_TTL", "90")))
 MANAGED_PROVIDER_CIRCUIT_SECONDS = max(120, int(os.getenv("MANAGED_PROVIDER_CIRCUIT_SECONDS", "300")))
+# V6.28: keep the full provider circuit as a safety net, but do not make a healthy
+# Webshare pool disappear for the whole 5 minutes. During a shared-pool circuit we allow
+# one controlled half-open probe after 60s and then at most once per 60s. A success closes
+# the circuit immediately; another 403 simply leaves the circuit in place.
+WEBSHARE_CIRCUIT_HALF_OPEN_AFTER = max(
+    30.0, float(os.getenv("WEBSHARE_CIRCUIT_HALF_OPEN_AFTER", "60"))
+)
+WEBSHARE_CIRCUIT_HALF_OPEN_INTERVAL = max(
+    30.0, float(os.getenv("WEBSHARE_CIRCUIT_HALF_OPEN_INTERVAL", "60"))
+)
 # V6.23: current production log showed a correlated 403 wall: all Webshare addresses
 # from one account were consumed almost back-to-back, then dozens of Premium IPs were
 # probed before its 32-block circuit opened. Account-level Webshare circuit protects
@@ -379,7 +394,7 @@ PROVIDER_STATS_INTERVAL = max(60, int(os.getenv("PROVIDER_STATS_INTERVAL", "300"
 
 # Память outage живёт между соседними 75-секундными discovery. Ранее проверенные неизвестные
 # IP не исчезают из пула, но новые IP идут раньше. Known-good всё ещё может получить controlled retry.
-OUTAGE_HOST_MEMORY = max(90, int(os.getenv("OUTAGE_HOST_MEMORY", "240")))
+OUTAGE_HOST_MEMORY = max(180, int(os.getenv("OUTAGE_HOST_MEMORY", "600")))
 # 403/challenge на auction URL не должен жёстко банить основной monitor, но на короткое время
 # понижает приоритет того же exit IP для другой eBay-поверхности.
 EBAY_CROSS_SOFT_PENALTY = max(30, int(os.getenv("EBAY_CROSS_SOFT_PENALTY", "120")))
@@ -619,10 +634,17 @@ def record_ebay_success():
     global last_ebay_success_at, connection_alert_sent
     now = time.monotonic()
     with connection_state_lock:
-        first_success = last_ebay_success_at is None
+        previous_success_at = last_ebay_success_at
+        first_success = previous_success_at is None
         was_alerted = connection_alert_sent
+        recovery_gap = (now - previous_success_at) if previous_success_at is not None else None
         last_ebay_success_at = now
         connection_alert_sent = False
+    if recovery_gap is not None and recovery_gap >= CONNECTION_RECOVERY_LOG_AFTER:
+        logging.info(
+            f"🔄 eBay связь восстановлена: между валидными HTTP 200 прошло "
+            f"{recovery_gap:.1f} сек. ({recovery_gap / 60.0:.1f} мин.)"
+        )
     # После deploy/долгого outage не ждём до 60 сек. status-tick: если в PostgreSQL
     # уже есть due pending-аукцион, worker сразу получит шанс его уточнить. На обычных
     # успешных циклах event не ставится, поэтому лишнего DB polling нет.
@@ -744,6 +766,8 @@ class ProviderManager:
         # from immediately retrying the same blocked provider pool after key #1 hits a 403 wall.
         self.webshare_pool_recent = deque(maxlen=12)
         self.webshare_pool_circuit_until = 0.0
+        self.webshare_pool_circuit_opened_at = 0.0
+        self.webshare_pool_half_open_last = 0.0
 
         self.webshare_accounts = {}
         for idx, key in enumerate(WEBSHARE_API_KEYS, 1):
@@ -1282,6 +1306,72 @@ class ProviderManager:
             buckets = next_buckets
         return out
 
+    def webshare_half_open_snapshot(self):
+        """Return Webshare endpoints while the shared circuit is open, without consuming a probe slot.
+
+        This is used only by the main discovery half-open path. Normal candidate APIs still
+        respect the shared circuit and return no Webshare endpoints during it.
+        """
+        now = time.time()
+        with self.lock:
+            if self.webshare_pool_circuit_until <= now:
+                return []
+            opened = self.webshare_pool_circuit_opened_at or (
+                self.webshare_pool_circuit_until - MANAGED_PROVIDER_CIRCUIT_SECONDS
+            )
+            if (now - opened) < WEBSHARE_CIRCUIT_HALF_OPEN_AFTER:
+                return []
+            if self.webshare_pool_half_open_last and (
+                now - self.webshare_pool_half_open_last
+            ) < WEBSHARE_CIRCUIT_HALF_OPEN_INTERVAL:
+                return []
+
+            accounts = []
+            for idx, state in self.webshare_accounts.items():
+                if state.get('api_disabled_until', 0.0) > now or state.get('circuit_until', 0.0) > now:
+                    continue
+                ratio = self._webshare_usage_ratio_locked(idx)
+                if ratio is not None and ratio >= WEBSHARE_USAGE_HARD_LIMIT:
+                    continue
+                if state.get('proxies'):
+                    accounts.append((idx, ratio if ratio is not None else 0.50, list(state['proxies'])))
+            accounts.sort(key=lambda row: (row[1], row[0]))
+
+            out = []
+            for idx, _ratio, rows in accounts:
+                random.shuffle(rows)
+                out.extend(rows)
+            return out
+
+    def claim_webshare_half_open(self):
+        """Atomically reserve the current half-open opportunity for one discovery probe."""
+        now = time.time()
+        with self.lock:
+            if self.webshare_pool_circuit_until <= now:
+                return False
+            opened = self.webshare_pool_circuit_opened_at or (
+                self.webshare_pool_circuit_until - MANAGED_PROVIDER_CIRCUIT_SECONDS
+            )
+            if (now - opened) < WEBSHARE_CIRCUIT_HALF_OPEN_AFTER:
+                return False
+            if self.webshare_pool_half_open_last and (
+                now - self.webshare_pool_half_open_last
+            ) < WEBSHARE_CIRCUIT_HALF_OPEN_INTERVAL:
+                return False
+            self.webshare_pool_half_open_last = now
+            return True
+
+    def _close_webshare_shared_circuit_locked(self):
+        now = time.time()
+        if self.webshare_pool_circuit_until <= now:
+            return False
+        self.webshare_pool_circuit_until = 0.0
+        self.webshare_pool_circuit_opened_at = 0.0
+        self.webshare_pool_half_open_last = 0.0
+        self.webshare_pool_recent.clear()
+        self.webshare_pool_recent.append('success')
+        return True
+
     def candidates(self, include_webshare=False):
         now = time.time()
         with self.lock:
@@ -1455,8 +1545,13 @@ class ProviderManager:
                 ):
                     until = now + MANAGED_PROVIDER_CIRCUIT_SECONDS
                     if shared_pool:
-                        if self.webshare_pool_circuit_until < until - 1:
+                        # Do not keep extending an already-open shared circuit because
+                        # of late in-flight 403s from the same wave. Open it once, then
+                        # let controlled half-open probes test whether the pool recovered.
+                        if self.webshare_pool_circuit_until <= now:
                             self.webshare_pool_circuit_until = until
+                            self.webshare_pool_circuit_opened_at = now
+                            self.webshare_pool_half_open_last = 0.0
                             return 'Webshare shared exit pool'
                     elif state['circuit_until'] < until - 1:
                         state['circuit_until'] = until
@@ -1468,6 +1563,7 @@ class ProviderManager:
         if src not in self.stats:
             src = 'free'
         circuit_label = None
+        webshare_circuit_closed = False
         with self.lock:
             st = self.stats[src]
             st['requests'] += 1
@@ -1509,9 +1605,16 @@ class ProviderManager:
                             state['discovery_success'] += 1
                     if result == 'success':
                         self._bounded_seen_add(state['unique_success'], proxy)
+                        # A successful controlled half-open (or any discovery success that
+                        # somehow arrives while the shared circuit is still active) proves
+                        # the exit pool recovered. Re-open Webshare immediately instead of
+                        # waiting for the original 5-minute timer.
+                        webshare_circuit_closed = self._close_webshare_shared_circuit_locked()
 
             circuit_label = self._update_managed_circuit_locked(proxy, result, request_kind)
 
+        if webshare_circuit_closed:
+            logging.info("🟢 Webshare shared exit pool recovered; circuit closed early after HTTP 200")
         if circuit_label:
             logging.warning(
                 f"🛑 {circuit_label}: temporary 403 circuit opened; "
@@ -2524,6 +2627,40 @@ class ProxyManager:
         rows = self.get_webshare_rescue_candidates(1, excluded_hosts=excluded_hosts)
         return rows[0] if rows else None
 
+    def get_webshare_half_open_candidate(self, excluded_hosts=None):
+        """One controlled Webshare retry while the shared 403 circuit is still open.
+
+        The provider circuit remains the default. This path is intentionally tiny: at most
+        one endpoint per half-open interval, and normal proxy/host cooldowns still apply.
+        """
+        excluded_hosts = set(excluded_hosts or ())
+        raw = provider_manager.webshare_half_open_snapshot()
+        if not raw:
+            return None
+        now = time.time()
+        with self.lock:
+            self._cleanup_bad_locked()
+            rows = []
+            for proxy in raw:
+                host = _proxy_host(proxy)
+                if not host or host in excluded_hosts:
+                    continue
+                if self.bad_until.get(proxy, 0) > now or self.host_bad_until.get(host, 0) > now:
+                    continue
+                if self.soft_host_penalty_until.get(host, 0) > now:
+                    continue
+                rows.append(proxy)
+            if not rows:
+                return None
+            rows.sort(key=lambda p: self._candidate_score_locked(p, now), reverse=True)
+            chosen = rows[0]
+
+        if not provider_manager.claim_webshare_half_open():
+            return None
+        with self.lock:
+            self.last_used[chosen] = now
+        return chosen
+
     def get_candidate_batch(self, batch_size, tried_hosts=None, preferred_scheme=None, allow_webshare=False):
         """Выдаёт несколько proxy с уникальными IP и разумным mix HTTP/SOCKS5.
 
@@ -2597,12 +2734,17 @@ class ProxyManager:
                 quality_state = self._quality_state_locked(p, now)
                 tcp_state = self._preflight_state_locked(p, now)
 
-                if quality_state == 'ok' and not soft_penalized:
-                    quality_usable.append(p)
-                elif tcp_state == 'ok' and quality_state != 'bad' and not soft_penalized:
-                    tcp_usable.append(p)
-                elif soft_penalized or recent_outage_unknown or quality_state == 'bad':
+                # V6.28: a proxy that already failed eBay during the SAME outage must not
+                # jump back ahead merely because TCP/TLS preflight still says "ready".
+                # Preflight proves transport only; the real eBay result is stronger evidence.
+                # Keep recently-good proxies exempt, and keep recycled endpoints available as
+                # a fallback after fresh candidates are exhausted.
+                if soft_penalized or recent_outage_unknown or quality_state == 'bad':
                     recycled_usable.append(p)
+                elif quality_state == 'ok':
+                    quality_usable.append(p)
+                elif tcp_state == 'ok':
+                    tcp_usable.append(p)
                 else:
                     fresh_usable.append(p)
 
@@ -4184,6 +4326,7 @@ def get_auctions_for_status_check(limit=100):
                 SELECT item_id, url, title, end_time_utc, last_status_check
                 FROM auction_reminders
                 WHERE end_time_utc > NOW()
+                  AND end_time_utc <= NOW() + INTERVAL '24 hours'
                 ORDER BY end_time_utc ASC,
                          COALESCE(last_status_check, TIMESTAMPTZ '1970-01-01') ASC
                 LIMIT %s
@@ -4194,21 +4337,30 @@ def get_auctions_for_status_check(limit=100):
 
 
 def _status_check_interval_seconds(remaining):
-    # После 5-минутного reminder запись удаляется, поэтому сверхчастые проверки
-    # в последние минуты больше не нужны. До этого момента контроль остаётся лёгким.
+    """Network re-check cadence for already exact auctions.
+
+    Reminders themselves are DB/time driven and do not require an eBay fetch.  We therefore
+    never poll exact auctions while they are >24h away, and keep only a progressively tighter
+    verification cadence inside the final 24h.  Pending/coarse auctions have their own
+    refinement scheduler and are intentionally unchanged.
+    """
     if remaining <= 5 * 60:
         return None
     if remaining <= 10 * 60:
-        return 120
+        return 120          # final validation window
     if remaining <= 30 * 60:
         return 300
     if remaining <= 60 * 60:
         return 600
+    if remaining <= 2 * 3600:
+        return 1200         # every 20 min
     if remaining <= 6 * 3600:
-        return 900
+        return 3600         # every hour
+    if remaining <= 12 * 3600:
+        return 7200         # every 2 hours
     if remaining <= 24 * 3600:
-        return 1800
-    return 3600
+        return 10800        # every 3 hours
+    return None
 
 
 def _reminder_column(minutes):
@@ -4485,6 +4637,22 @@ def auction_message_keyboard(item_id, url, include_list=False):
 
 def auction_list_only_keyboard():
     return {'inline_keyboard': [[{'text': '📋 Все аукционы', 'callback_data': 'auclist'}]]}
+
+
+def bot_main_reply_keyboard():
+    """Persistent Telegram keyboard next to the message input.
+
+    Telegram reply-keyboard buttons send their visible text as a normal message, so the
+    listener maps "📋 Аукционы" to the exact same handler as /auctions.  Inline keyboards
+    on individual auction messages can coexist with this persistent chat keyboard.
+    """
+    return {
+        'keyboard': [[{'text': '📋 Аукционы'}]],
+        'resize_keyboard': True,
+        'one_time_keyboard': False,
+        'is_persistent': True,
+        'input_field_placeholder': 'Отправьте ссылку eBay или откройте аукционы',
+    }
 
 
 def auction_queue_keyboard(url):
@@ -7758,7 +7926,15 @@ def auction_reminder_worker():
                     else auction_message_keyboard(item_id, current_url)
                 )
 
-                if send_telegram_message(msg, reply_markup=keyboard, disable_preview=True):
+                # Use the same explicit preview path as the successful "Auction saved"
+                # message.  The clickable text link remains in the message, while Telegram
+                # is explicitly asked to build the eBay item preview for all 60/30/10/5 notices.
+                if send_telegram_message(
+                    msg,
+                    reply_markup=keyboard,
+                    preview_url=current_url,
+                    preview_small=True,
+                ):
                     if is_final_five:
                         delete_auction_reminder(item_id)
                         logging.info(f"📨 Auction {item_id}: отправлено финальное reminder 5 мин; запись удалена")
@@ -7838,9 +8014,13 @@ def telegram_listener():
                             elif text == '/start':
                                 is_paused = False
                                 reset_connection_watch_after_manual_resume()
-                                send_telegram_message("▶ Основной мониторинг продолжает работу")
+                                send_telegram_message(
+                                    "▶ Основной мониторинг продолжает работу",
+                                    reply_markup=bot_main_reply_keyboard(),
+                                )
                                 logging.info("Команда /start - продолжение; watchdog-таймер перезапущен")
-                            elif text in ('/auctions', '/list'):
+                            elif text in ('/auctions', '/list', '📋 Аукционы', 'Аукционы'):
+                                # Persistent button and slash command deliberately share one handler.
                                 send_auction_list()
                             elif text.startswith('/delauction'):
                                 parts = text.split(maxsplit=1)
@@ -8946,6 +9126,25 @@ def fetch_ebay_html_with_fixed_pair():
                     batch.append(ws_rescue)
                     batch_kinds[ws_rescue] = 'Webshare bridge'
 
+            # V6.28: while the shared Webshare 403-circuit is active, allow exactly one
+            # controlled half-open probe roughly once per minute. This is intentionally
+            # independent from normal Webshare availability: the whole point is to detect
+            # recovery before the full 5-minute circuit expires.
+            if len(batch) < need:
+                ws_half_open = proxy_manager.get_webshare_half_open_candidate(
+                    excluded_hosts=(
+                        tried_hosts
+                        | inflight_hosts
+                        | {_proxy_host(p) for p in batch}
+                    ),
+                )
+                if ws_half_open is not None:
+                    batch.append(ws_half_open)
+                    batch_kinds[ws_half_open] = 'Webshare half-open'
+                    logging.info(
+                        f"🟡 Webshare half-open recovery probe: {_proxy_log_name(ws_half_open)}"
+                    )
+
             # Fill the remaining first-wave workers from already proven warm reserve.
             while fast_standby_queue and len(batch) < need:
                 standby = fast_standby_queue.pop(0)
@@ -10033,11 +10232,12 @@ def bot_worker():
     seen_line = f"\n📚 В базе: {seen_total} товаров." if seen_total is not None else ""
     send_telegram_message(
         startup_line +
-        "\n🇬🇧 eBay UK monitor v6.26 AdaptiveFastAuction работает." +
+        "\n🇬🇧 eBay UK monitor v6.29 AuctionLiteUI работает." +
         seen_line +
         "\nКоманды: /stop /start /list (/auctions) /delauction НОМЕР_ЛОТА"
-        "\nМожно отправить ссылку на eBay-аукцион — сохраню точное время и напомню заранее.",
-        reply_markup=auction_list_only_keyboard(),
+        "\nМожно отправить ссылку на eBay-аукцион — сохраню точное время и напомню заранее."
+        "\nКнопка «📋 Аукционы» открывает тот же список, что и /auctions.",
+        reply_markup=bot_main_reply_keyboard(),
     )
     while True:
         if is_paused:
@@ -10060,7 +10260,17 @@ def bot_worker():
                 # Реальная проблема загрузки/proxy: после активного discovery оставляем
                 # короткий jitter, чтобы быстро вернуться к поиску, но не крутить busy-loop.
                 wait = random.uniform(FAILED_SEARCH_RETRY_MIN, FAILED_SEARCH_RETRY_MAX)
-                logging.info(f"⚠️ Рабочий proxy пока не найден. Новый цикл через {wait:.1f} секунд.")
+                outage_elapsed, _, had_success = _connection_outage_snapshot()
+                if had_success:
+                    logging.info(
+                        f"⚠️ Рабочий proxy пока не найден. Новый цикл через {wait:.1f} секунд; "
+                        f"суммарно без валидного eBay HTTP 200 уже {outage_elapsed:.1f} сек. "
+                        f"({outage_elapsed / 60.0:.1f} мин.)"
+                    )
+                else:
+                    logging.info(
+                        f"⚠️ Рабочий proxy пока не найден. Новый цикл через {wait:.1f} секунд."
+                    )
             time.sleep(wait)
         except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
             # eBay/proxy may be perfectly healthy. A transient DB outage must not mark or
@@ -10090,7 +10300,7 @@ def start_leader_workers():
     leader_active_event.set()
     logging.info("👑 Эта Render-копия стала leader; запускаем фоновые worker-ы")
     logging.info(
-        "🌐 Multi-provider v6.27: "
+        "🌐 Multi-provider v6.29: "
         f"ProxyScrape Premium={'ON' if PROXYSCRAPE_PREMIUM_API_KEY else 'OFF'}, "
         f"Webshare={'ON (' + str(len(WEBSHARE_API_KEYS)) + ' account(s))' if WEBSHARE_API_KEYS else 'OFF'}, "
         f"Webshare first-batch={'ON (1-2 unique-host slots; extra keys=bandwidth)' if WEBSHARE_FIRST_BATCH else 'OFF'}, "
@@ -10151,7 +10361,7 @@ def leader_supervisor():
 @app.route('/')
 def index():
     role = "leader" if leader_active_event.is_set() else "standby"
-    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.26 AdaptiveFastAuction, {role})"
+    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.29 AuctionLiteUI, {role})"
 
 
 @app.route('/health')
