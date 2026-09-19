@@ -5,6 +5,8 @@ import time
 import random
 import re
 import json
+import gc
+import ctypes
 import threading
 import logging
 import html as html_lib
@@ -92,6 +94,10 @@ PROBE_CONNECT_TIMEOUT = float(os.getenv("PROBE_CONNECT_TIMEOUT", "3.5"))
 # полуживой proxy мог держать целый batch 11+ секунд. При сотнях кандидатов выгоднее
 # продолжать быстро перебирать пул тем же строгим timeout.
 PROBE_READ_TIMEOUT = float(os.getenv("PROBE_READ_TIMEOUT", "8"))
+# Current production log: every observed winner was HTTP, while SOCKS5 produced
+# many timeout/403/SSL failures. Do not BAN SOCKS5; simply stop forcing it into the
+# first seconds of failover when viable HTTP candidates exist.
+SOCKS_MIX_DELAY = max(0.0, float(os.getenv("SOCKS_MIX_DELAY", "15")))
 # Replacement jitter зависит от причины отказа: transport/SSL/reject уже сами дали
 # достаточную задержку, а после 403/429 оставляем более осторожный ритм.
 PROBE_FAST_PAUSE_MIN = max(0.02, float(os.getenv("PROBE_FAST_PAUSE_MIN", "0.05")))
@@ -251,8 +257,10 @@ PROXY_QUALITY_BAD_TTL = max(20, int(os.getenv("PROXY_QUALITY_BAD_TTL", "45")))
 # реально достаточно короткой первой wave из 4 verified-free. Поэтому держим ~8 свежих
 # HTTPS-capable резервов, а не 12+, и уменьшаем тяжёлый background batch без потери fallback.
 PROXY_PREFLIGHT_WARM_BATCH = max(4, min(int(os.getenv("PROXY_PREFLIGHT_WARM_BATCH", "12")), 24))
+# V6.25 MemorySafe: keep the same reserve depth, but limit simultaneous TLS handshakes.
+# This does NOT slow the 15-27 second main eBay checks; it only lowers background peak RAM.
 PROXY_PREFLIGHT_WARM_CONCURRENCY = max(
-    2, min(int(os.getenv("PROXY_PREFLIGHT_WARM_CONCURRENCY", "6")), 8)
+    2, min(int(os.getenv("PROXY_PREFLIGHT_WARM_CONCURRENCY", "4")), 6)
 )
 PROXY_PREFLIGHT_WARM_INTERVAL = max(10.0, float(os.getenv("PROXY_PREFLIGHT_WARM_INTERVAL", "20")))
 PROXY_PREFLIGHT_RESERVE_TARGET = max(
@@ -271,6 +279,18 @@ PROXY_PREFLIGHT_RETAIN_MAX = max(
 FIXED_RECOVERY_SKIP_AFTER = max(
     8.0, float(os.getenv("FIXED_RECOVERY_SKIP_AFTER", "18"))
 )
+
+# V6.25 MemorySafe: Render Free is capped at 512 MB. The main polling cadence stays
+# untouched; only background work / emergency concurrency is reduced when RSS approaches
+# the cap. /proc/self/status is available on Render Linux and needs no extra dependency.
+MEMORY_GUARD_ENABLED = (os.getenv("MEMORY_GUARD_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off"))
+MEMORY_GUARD_INTERVAL = max(5.0, float(os.getenv("MEMORY_GUARD_INTERVAL", "10")))
+MEMORY_SOFT_MB = max(220, int(os.getenv("MEMORY_SOFT_MB", "330")))
+MEMORY_HIGH_MB = max(MEMORY_SOFT_MB + 30, int(os.getenv("MEMORY_HIGH_MB", "400")))
+MEMORY_CLEAR_MB = min(MEMORY_SOFT_MB, max(180, int(os.getenv("MEMORY_CLEAR_MB", "300"))))
+PROXY_REPUTATION_TTL = max(1800, int(os.getenv("PROXY_REPUTATION_TTL", "21600")))
+PROXY_REPUTATION_MAX = max(1000, int(os.getenv("PROXY_REPUTATION_MAX", "7000")))
+PROVIDER_UNIQUE_STATS_CAP = max(500, int(os.getenv("PROVIDER_UNIQUE_STATS_CAP", "4096")))
 
 
 # ============ V6.22 MULTI-WEBSHARE / MAKE-BEFORE-BREAK BRIDGE ============
@@ -463,6 +483,10 @@ auction_reminder_wakeup_event = threading.Event()
 auction_status_wakeup_event = threading.Event()
 # Новый fixed proxy будит Smart Reserve немедленно, а не ждёт до 15 сек. polling interval.
 proxy_preflight_wakeup_event = threading.Event()
+# V6.25: background TLS reserve/handoff pauses while the main worker is already doing
+# an expensive failover. This prevents two independent socket/thread bursts from stacking.
+main_discovery_active_event = threading.Event()
+memory_pressure_event = threading.Event()
 db_ready_event = threading.Event()
 leader_active_event = threading.Event()
 
@@ -477,6 +501,98 @@ def wake_auction_workers():
     # предназначенный другому.
     auction_reminder_wakeup_event.set()
     auction_status_wakeup_event.set()
+
+# ============ MEMORY SAFETY (Render 512 MB) ============
+_malloc_trim = None
+try:
+    _libc = ctypes.CDLL(None)
+    _malloc_trim = getattr(_libc, 'malloc_trim', None)
+    if _malloc_trim is not None:
+        _malloc_trim.argtypes = [ctypes.c_size_t]
+        _malloc_trim.restype = ctypes.c_int
+except Exception:
+    _malloc_trim = None
+
+
+def _memory_rss_mb():
+    """Current resident set size on Linux, or None if unavailable."""
+    try:
+        with open('/proc/self/status', 'r', encoding='utf-8') as fh:
+            for line in fh:
+                if line.startswith('VmRSS:'):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        return float(parts[1]) / 1024.0
+    except Exception:
+        return None
+    return None
+
+
+def _release_python_memory(force_trim=False):
+    """Collect cyclic DOM objects and, on glibc, return free arenas to the OS."""
+    try:
+        gc.collect()
+    except Exception:
+        pass
+    if force_trim and _malloc_trim is not None:
+        try:
+            _malloc_trim(0)
+        except Exception:
+            pass
+
+
+def _memory_maintenance(reason='', force=False):
+    rss = _memory_rss_mb()
+    if rss is None:
+        return None
+    if force or rss >= MEMORY_SOFT_MB:
+        before = rss
+        _release_python_memory(force_trim=True)
+        after = _memory_rss_mb()
+        if after is not None and (force or before >= MEMORY_HIGH_MB):
+            logging.info(
+                f"🧠 Memory cleanup{(' (' + reason + ')') if reason else ''}: "
+                f"RSS {before:.0f}→{after:.0f} MB"
+            )
+        rss = after if after is not None else before
+    if rss is not None:
+        if rss >= MEMORY_HIGH_MB:
+            memory_pressure_event.set()
+        elif rss <= MEMORY_CLEAR_MB:
+            memory_pressure_event.clear()
+    return rss
+
+
+def memory_guard_worker():
+    db_ready_event.wait()
+    if not MEMORY_GUARD_ENABLED:
+        logging.info('🧠 Memory guard disabled by ENV')
+        return
+    last_state = None
+    last_report = 0.0
+    while True:
+        try:
+            rss = _memory_maintenance('guard', force=False)
+            high = memory_pressure_event.is_set()
+            now_mono = time.monotonic()
+            if rss is not None and now_mono - last_report >= 300:
+                logging.info(
+                    f"🧠 RSS≈{rss:.0f} MB; discovery={'ON' if main_discovery_active_event.is_set() else 'OFF'}, "
+                    f"pressure={'HIGH' if high else 'normal'}"
+                )
+                last_report = now_mono
+            if high != last_state and rss is not None:
+                if high:
+                    logging.warning(
+                        f"🧠 High memory pressure: RSS≈{rss:.0f} MB; "
+                        "pause background reserve and cap emergency discovery until memory falls"
+                    )
+                elif last_state is True:
+                    logging.info(f"🧠 Memory pressure cleared: RSS≈{rss:.0f} MB")
+                last_state = high
+        except Exception as e:
+            logging.debug(f"Memory guard skipped: {e}")
+        time.sleep(MEMORY_GUARD_INTERVAL)
 
 # ============ КОНТРОЛЬ ДОСТУПНОСТИ EBAY ============
 # Используем monotonic(): системные часы Render могут корректироваться, а интервал
@@ -612,6 +728,11 @@ class ProviderManager:
         self.ps_subaccount_id = PROXYSCRAPE_PREMIUM_SUBACCOUNT_ID
         self.provider_circuit_until = {'proxyscrape_premium': 0.0}
         self.provider_recent = {'proxyscrape_premium': deque(maxlen=32)}
+        # V6.25: Webshare accounts may expose the SAME exit IP pool. Additional keys then
+        # increase bandwidth allowance but not IP diversity. A shared circuit prevents key #2
+        # from immediately retrying the same blocked provider pool after key #1 hits a 403 wall.
+        self.webshare_pool_recent = deque(maxlen=12)
+        self.webshare_pool_circuit_until = 0.0
 
         self.webshare_accounts = {}
         for idx, key in enumerate(WEBSHARE_API_KEYS, 1):
@@ -630,8 +751,8 @@ class ProviderManager:
                 'recent': deque(maxlen=10),
                 'api_disabled_until': 0.0,
                 'app_body_bytes': 0,
-                # Per-account eBay evidence: useful when 3-4 independent Webshare
-                # accounts are connected. Sets stay tiny (10 proxies/account) and let
+                # Per-account eBay evidence: useful when multiple Webshare billing
+                # accounts are connected, even when they share the same exit IPs. Sets stay tiny (10 proxies/account) and let
                 # logs show which account/IP pool actually helps instead of only aggregate stats.
                 'ebay_requests': 0,
                 'ebay_success': 0,
@@ -664,6 +785,47 @@ class ProviderManager:
         self.last_stats_log = 0.0
         self._webshare_warned = False
 
+    @staticmethod
+    def _bounded_seen_add(bucket, proxy):
+        # Diagnostic uniqueness must never become an unbounded archive of public
+        # proxy credential strings. A stable hash is enough for approximate unique counts.
+        if len(bucket) >= PROVIDER_UNIQUE_STATS_CAP:
+            return
+        try:
+            bucket.add(hash(proxy))
+        except Exception:
+            pass
+
+    def _webshare_unique_hosts_locked(self):
+        hosts = set()
+        for state in self.webshare_accounts.values():
+            for proxy in state.get('proxies', ()):
+                host = _proxy_host(proxy)
+                if host:
+                    hosts.add(host)
+        return hosts
+
+    def _webshare_pool_is_shared_locked(self):
+        active_sets = []
+        for state in self.webshare_accounts.values():
+            hosts = {_proxy_host(p) for p in state.get('proxies', ()) if _proxy_host(p)}
+            if hosts:
+                active_sets.append(hosts)
+        if len(active_sets) <= 1:
+            return True
+        base = active_sets[0]
+        for other in active_sets[1:]:
+            union = base | other
+            if not union:
+                continue
+            if len(base & other) / len(union) < 0.80:
+                return False
+        return True
+
+    def webshare_unique_host_count(self):
+        with self.lock:
+            return len(self._webshare_unique_hosts_locked())
+
     def source(self, proxy):
         with self.lock:
             return self.provider_by_proxy.get(proxy, 'free')
@@ -691,6 +853,8 @@ class ProviderManager:
                     and proxy in self.proxy_sets['proxyscrape_premium']
                 )
             if src == 'webshare':
+                if self.webshare_pool_circuit_until > now:
+                    return False
                 idx = self.webshare_account_by_proxy.get(proxy)
                 state = self.webshare_accounts.get(idx)
                 if not state:
@@ -901,11 +1065,11 @@ class ProviderManager:
             logging.debug(f"Webshare#{idx} stats refresh skipped: {e}")
 
     def _refresh_webshare_all(self, force=False, include_stats=True):
-        """Refresh independent Webshare accounts in parallel.
+        """Refresh Webshare billing accounts in parallel.
 
         Failover needs the proxy LIST, not three billing/statistics HTTP calls. Discovery
         therefore calls this with include_stats=False; the background reserve worker keeps
-        real usage fresh while a fixed proxy is online. With 3-4 accounts, list refreshes
+        real usage fresh while a fixed proxy is online. With multiple accounts, list refreshes
         run concurrently so one slow API does not serialize 4 x provider timeouts.
         """
         if not self.webshare_accounts:
@@ -972,8 +1136,13 @@ class ProviderManager:
                 total = 0
                 pieces = []
         if total:
+            with self.lock:
+                unique_hosts = len(self._webshare_unique_hosts_locked())
+                shared_pool = self._webshare_pool_is_shared_locked()
             logging.info(
-                f"🟩 Webshare: {total} valid direct proxy across {len(self.webshare_accounts)} account(s) "
+                f"🟩 Webshare: {unique_hosts} unique exit IP(s), {total} credential endpoint(s) "
+                f"across {len(self.webshare_accounts)} account(s), "
+                f"pool={'shared/overlapping' if shared_pool else 'partly distinct'} "
                 f"[{', '.join(pieces)}]"
             )
 
@@ -1072,6 +1241,8 @@ class ProviderManager:
 
     def _webshare_candidates_locked(self):
         now = time.time()
+        if self.webshare_pool_circuit_until > now:
+            return []
         accounts = []
         for idx, state in self.webshare_accounts.items():
             if state.get('api_disabled_until', 0.0) > now or state.get('circuit_until', 0.0) > now:
@@ -1112,6 +1283,34 @@ class ProviderManager:
     def has_usable_webshare(self):
         with self.lock:
             return bool(self._webshare_candidates_locked())
+
+    def usable_webshare_account_count(self):
+        """Count usable billing accounts, NOT unique exit-IP pools.
+
+        V6.25 knows several Webshare keys may expose the same 10 exits. Extra accounts
+        increase traffic budget only; host-level cooldown and the shared pool circuit
+        still prevent duplicate-IP retries from masquerading as diversity.
+        """
+        now = time.time()
+        with self.lock:
+            # A shared/overlapping Webshare pool circuit means the exits themselves are
+            # temporarily bad for eBay. Multiple API keys must not be mistaken for
+            # additional usable providers during that period.
+            if self.webshare_pool_circuit_until > now:
+                return 0
+            count = 0
+            for idx, state in self.webshare_accounts.items():
+                if state.get('api_disabled_until', 0.0) > now or state.get('circuit_until', 0.0) > now:
+                    continue
+                ratio = self._webshare_usage_ratio_locked(idx)
+                if ratio is not None and ratio >= WEBSHARE_USAGE_HARD_LIMIT:
+                    continue
+                if state.get('proxies'):
+                    count += 1
+            return count
+
+    def webshare_account_index_fast(self, proxy):
+        return self.webshare_account_by_proxy.get(proxy)
 
     def webshare_balance_bonus(self, proxy):
         with self.lock:
@@ -1234,15 +1433,21 @@ class ProviderManager:
             if state is not None:
                 dq = state['recent']
                 dq.append(result)
-                # Correlated provider/account walls are common: the production log showed
-                # all ten addresses from one Webshare account returning 403 in a few seconds.
-                # Stop after a short consecutive wall; with multiple accounts each account
-                # has its own independent circuit and the interleaver immediately moves on.
-                if len(dq) >= WEBSHARE_BLOCK_CIRCUIT_STREAK and all(
-                    r == 'blocked' for r in list(dq)[-WEBSHARE_BLOCK_CIRCUIT_STREAK:]
+                self.webshare_pool_recent.append(result)
+                # Accounts often expose the same exit IPs. If snapshots overlap heavily,
+                # opening only an account-local circuit would simply burn the second key
+                # against the same blocked exits. Use one shared circuit for the common pool.
+                shared_pool = self._webshare_pool_is_shared_locked()
+                target_dq = self.webshare_pool_recent if shared_pool else dq
+                if len(target_dq) >= WEBSHARE_BLOCK_CIRCUIT_STREAK and all(
+                    r == 'blocked' for r in list(target_dq)[-WEBSHARE_BLOCK_CIRCUIT_STREAK:]
                 ):
                     until = now + MANAGED_PROVIDER_CIRCUIT_SECONDS
-                    if state['circuit_until'] < until - 1:
+                    if shared_pool:
+                        if self.webshare_pool_circuit_until < until - 1:
+                            self.webshare_pool_circuit_until = until
+                            return 'Webshare shared exit pool'
+                    elif state['circuit_until'] < until - 1:
                         state['circuit_until'] = until
                         return f'Webshare#{idx}'
         return None
@@ -1261,7 +1466,7 @@ class ProviderManager:
 
             if request_kind == 'discovery':
                 st['discovery_requests'] += 1
-                self.discovery_proxy_seen[src].add(proxy)
+                self._bounded_seen_add(self.discovery_proxy_seen[src], proxy)
                 if result == 'success':
                     st['discovery_success'] += 1
             elif request_kind == 'fixed':
@@ -1274,7 +1479,7 @@ class ProviderManager:
                     st['recovery_success'] += 1
 
             if result == 'success':
-                self.success_proxy_seen[src].add(proxy)
+                self._bounded_seen_add(self.success_proxy_seen[src], proxy)
 
             if src == 'webshare':
                 idx = self.webshare_account_by_proxy.get(proxy)
@@ -1288,11 +1493,11 @@ class ProviderManager:
                         state['blocked'] += 1
                     if request_kind == 'discovery':
                         state['discovery_requests'] += 1
-                        state['unique_discovery'].add(proxy)
+                        self._bounded_seen_add(state['unique_discovery'], proxy)
                         if result == 'success':
                             state['discovery_success'] += 1
                     if result == 'success':
-                        state['unique_success'].add(proxy)
+                        self._bounded_seen_add(state['unique_success'], proxy)
 
             circuit_label = self._update_managed_circuit_locked(proxy, result, request_kind)
 
@@ -1384,6 +1589,77 @@ class ProxyManager:
 
         # Мягкий cross-surface penalty (auction <-> main) после eBay 403/429.
         self.soft_host_penalty_until = {}
+        self.last_reputation_prune = 0.0
+
+    def _prune_reputation_locked(self, now):
+        """Bound stale reputation from rotating public proxy feeds.
+
+        Free ProxyScrape endpoints change continuously. V6.23 kept fail_streak/last_failure/
+        last_used forever, which is harmless for correctness but can grow the process RSS
+        over days. Keep active/current endpoints and recent history; discard old dead ones.
+        """
+        if now - self.last_reputation_prune < 300:
+            return
+        self.last_reputation_prune = now
+        active = set(self.all_proxies) | set(self.proxies) | set(self.standard_current)
+        try:
+            active.update(provider_manager.proxy_sets.get('proxyscrape_premium', ()))
+            active.update(provider_manager.proxy_sets.get('webshare', ()))
+        except Exception:
+            pass
+        keys = set()
+        for d in (self.last_used, self.success_score, self.last_success_at, self.fail_streak,
+                  self.last_failure_result, self.last_failure_at, self.standard_first_seen_at):
+            keys.update(d.keys())
+        cutoff = now - PROXY_REPUTATION_TTL
+        removable = []
+        for proxy in keys:
+            if proxy in active:
+                continue
+            activity = max(
+                self.last_used.get(proxy, 0.0),
+                self.last_success_at.get(proxy, 0.0),
+                self.last_failure_at.get(proxy, 0.0),
+                self.standard_first_seen_at.get(proxy, 0.0),
+            )
+            if activity < cutoff:
+                removable.append((activity, proxy))
+        # Hard cap is only for inactive history; never evict the currently usable pool.
+        inactive_count = max(0, len(keys) - len(active & keys))
+        if inactive_count > PROXY_REPUTATION_MAX:
+            extra = inactive_count - PROXY_REPUTATION_MAX
+            already = {p for _a, p in removable}
+            older = []
+            for proxy in keys:
+                if proxy in active or proxy in already:
+                    continue
+                activity = max(
+                    self.last_used.get(proxy, 0.0), self.last_success_at.get(proxy, 0.0),
+                    self.last_failure_at.get(proxy, 0.0), self.standard_first_seen_at.get(proxy, 0.0),
+                )
+                older.append((activity, proxy))
+            older.sort(key=lambda row: row[0])
+            removable.extend(older[:extra])
+        if not removable:
+            return
+        doomed = {p for _a, p in removable}
+        for proxy in doomed:
+            self.last_used.pop(proxy, None)
+            self.success_score.pop(proxy, None)
+            self.last_success_at.pop(proxy, None)
+            self.fail_streak.pop(proxy, None)
+            self.last_failure_result.pop(proxy, None)
+            self.last_failure_at.pop(proxy, None)
+            self.standard_first_seen_at.pop(proxy, None)
+            self.preflight_ok_until.pop(proxy, None)
+            self.preflight_bad_until.pop(proxy, None)
+            self.preflight_last_result.pop(proxy, None)
+            self.preflight_latency_ms.pop(proxy, None)
+            self.quality_ok_until.pop(proxy, None)
+            self.quality_bad_until.pop(proxy, None)
+            self.quality_last_result.pop(proxy, None)
+            self.quality_latency_ms.pop(proxy, None)
+            self.outage_proxy_last_probe.pop(proxy, None)
 
     def _cleanup_bad_locked(self):
         now = time.time()
@@ -1410,6 +1686,8 @@ class ProxyManager:
             self.outage_host_last_probe.pop(host, None)
         for p in [p for p, ts in self.outage_proxy_last_probe.items() if ts < outage_cutoff]:
             self.outage_proxy_last_probe.pop(p, None)
+
+        self._prune_reputation_locked(now)
 
         # Возвращаем proxy после cooldown, если он есть в свежем списке.
         current = set(self.proxies)
@@ -2171,14 +2449,17 @@ class ProxyManager:
             + random.uniform(0, 2.0)
         )
 
-    def get_webshare_rescue_candidate(self, excluded_hosts=None):
-        """Return one currently-usable Webshare endpoint for the immediate failover wave.
+    def get_webshare_rescue_candidates(self, limit=1, excluded_hosts=None):
+        """Return fast Webshare rescue candidates, preferring different accounts.
 
-        This is intentionally separate from the generic batch ranking. In v6.21 a deep
-        warm-free queue could occupy all 4 initial workers, even though Webshare had by
-        far the highest distinct-endpoint success rate. One explicit rescue slot keeps
-        worst-case outages short while still limiting metered Webshare to one request.
+        With one account this deliberately behaves like the old single rescue slot.
+        With multiple billing accounts, the failover wave may use different exit hosts
+        while balancing traffic between credentials at once. This improves time-to-first-success without
+        draining many IPs from one correlated Webshare pool.
         """
+        limit = max(0, int(limit or 0))
+        if limit <= 0:
+            return []
         excluded_hosts = set(excluded_hosts or ())
         now = time.time()
         with self.lock:
@@ -2194,13 +2475,43 @@ class ProxyManager:
                     continue
                 if self.soft_host_penalty_until.get(host, 0) > now:
                     continue
-                rows.append(proxy)
+                idx = provider_manager.webshare_account_index_fast(proxy)
+                rows.append((proxy, idx, self._candidate_score_locked(proxy, now)))
             if not rows:
-                return None
-            rows.sort(key=lambda p: self._candidate_score_locked(p, now), reverse=True)
-            chosen = rows[0]
-            self.last_used[chosen] = now
+                return []
+
+            rows.sort(key=lambda row: row[2], reverse=True)
+            chosen = []
+            chosen_accounts = set()
+            chosen_hosts = set()
+
+            # First pass: balance endpoints across billing accounts; host de-duplication still wins.
+            for proxy, idx, _score in rows:
+                host = _proxy_host(proxy)
+                if idx in chosen_accounts or host in chosen_hosts:
+                    continue
+                chosen.append(proxy)
+                chosen_accounts.add(idx)
+                chosen_hosts.add(host)
+                self.last_used[proxy] = now
+                if len(chosen) >= limit:
+                    return chosen
+
+            # Fallback only when limit exceeds usable account count.
+            for proxy, _idx, _score in rows:
+                host = _proxy_host(proxy)
+                if proxy in chosen or host in chosen_hosts:
+                    continue
+                chosen.append(proxy)
+                chosen_hosts.add(host)
+                self.last_used[proxy] = now
+                if len(chosen) >= limit:
+                    break
             return chosen
+
+    def get_webshare_rescue_candidate(self, excluded_hosts=None):
+        rows = self.get_webshare_rescue_candidates(1, excluded_hosts=excluded_hosts)
+        return rows[0] if rows else None
 
     def get_candidate_batch(self, batch_size, tried_hosts=None, preferred_scheme=None, allow_webshare=False):
         """Выдаёт несколько proxy с уникальными IP и разумным mix HTTP/SOCKS5.
@@ -2329,10 +2640,40 @@ class ProxyManager:
             # монополизировать весь batch: это одновременно ускоряет поиск и даёт честную
             # сравнительную статистику. До rescue-unlock Webshare вообще отсутствует.
             if allow_webshare:
-                for p in usable:
-                    if provider_manager.source_fast(p) == 'webshare':
+                # Scale rescue help with INDEPENDENT accounts, not with raw proxy count.
+                # 1 account -> one ordinary slot. 2-4 accounts -> up to two Webshare
+                # slots in ordinary rolling batches, still leaving room for Premium/FREE.
+                active_ws_accounts = provider_manager.usable_webshare_account_count()
+                ws_limit = min(active_ws_accounts, max(1, batch_size // 2), 2)
+                ws_accounts_added = {
+                    provider_manager.webshare_account_index_fast(p)
+                    for p in batch if provider_manager.source_fast(p) == 'webshare'
+                }
+                ws_added = len([p for p in batch if provider_manager.source_fast(p) == 'webshare'])
+                if ws_added < ws_limit:
+                    for p in usable:
+                        if provider_manager.source_fast(p) != 'webshare':
+                            continue
+                        idx = provider_manager.webshare_account_index_fast(p)
+                        if idx in ws_accounts_added:
+                            continue
                         if add_candidate(p):
-                            break  # metered: максимум один Webshare slot за batch
+                            ws_added += 1
+                            ws_accounts_added.add(idx)
+                            if ws_added >= ws_limit or len(batch) >= batch_size:
+                                break
+
+            # Hard boundary: later generic protocol/quality fillers must not silently
+            # add extra metered Webshare endpoints beyond the account-aware quota above.
+            non_webshare_usable = [
+                p for p in usable if provider_manager.source_fast(p) != 'webshare'
+            ]
+            non_webshare_quality = [
+                p for p in quality_usable if provider_manager.source_fast(p) != 'webshare'
+            ]
+            non_webshare_tcp = [
+                p for p in tcp_usable if provider_manager.source_fast(p) != 'webshare'
+            ]
 
             premium_block_streak = provider_manager.premium_block_streak()
             premium_limit = (
@@ -2341,7 +2682,7 @@ class ProxyManager:
                 else max(1, batch_size - 1)
             )
             premium_added = 0
-            for p in usable:
+            for p in non_webshare_usable:
                 if provider_manager.source_fast(p) != 'proxyscrape_premium':
                     continue
                 if add_candidate(p):
@@ -2350,13 +2691,13 @@ class ProxyManager:
                         break
 
             # Один слот по возможности оставляем уже доказанному HTTPS/TLS free-reserve.
-            for p in quality_usable:
+            for p in non_webshare_quality:
                 if provider_manager.source_fast(p) == 'free' and add_candidate(p):
                     break
 
             # Если verified-free не было, свободные места снова отдаём Premium.
             if len(batch) < batch_size:
-                for p in usable:
+                for p in non_webshare_usable:
                     if provider_manager.source_fast(p) == 'proxyscrape_premium':
                         add_candidate(p)
                         if len(batch) >= batch_size:
@@ -2364,7 +2705,7 @@ class ProxyManager:
 
             # Остальные quality-ready (например future managed source) тоже полезны.
             if len(batch) < batch_size:
-                for p in quality_usable:
+                for p in non_webshare_quality:
                     add_candidate(p)
                     if len(batch) >= batch_size:
                         return batch
@@ -2372,7 +2713,7 @@ class ProxyManager:
             # TCP-only — только один дополнительный слот: лог v6.18 показал, что сам
             # открытый порт слишком слабый признак и не должен забивать весь batch.
             tcp_added = 0
-            for p in tcp_usable:
+            for p in non_webshare_tcp:
                 if add_candidate(p):
                     tcp_added += 1
                     if tcp_added >= 1 or len(batch) >= batch_size:
@@ -2386,21 +2727,21 @@ class ProxyManager:
                 # а не заполнить им весь batch. В v6.3 этот цикл мог набрать сразу
                 # 3 SOCKS5, что видно по логам и ухудшало поиск из-за множества
                 # SSL/MITM-ошибок бесплатных SOCKS5.
-                for p in usable:
+                for p in non_webshare_usable:
                     if _proxy_scheme(p) == preferred_scheme and add_candidate(p):
                         break
 
-            # 4) Для новых адресов используем примерно 3:1 HTTP:SOCKS5 (2:1 при batch=3).
-            # Это сохраняет приоритет HTTP по реальным UK-логам, но не оставляет 150-200
-            # SOCKS5 вообще непроверенными до истечения discovery budget.
+            # 4) SOCKS5 is not forced during the first SOCKS_MIX_DELAY seconds.
+            # It remains available as fallback and receives one reserved slot later,
+            # so we keep protocol diversity without paying early timeout/SSL cost.
             remaining = batch_size - len(batch)
             if remaining > 0:
                 selected_socks = sum(1 for p in batch if _proxy_scheme(p) == 'socks5')
-                want_socks_total = 1 if batch_size >= 3 else 0
+                want_socks_total = 1 if (batch_size >= 3 and preferred_scheme == 'socks5') else 0
                 need_socks = max(0, want_socks_total - selected_socks)
 
                 if need_socks:
-                    for p in usable:
+                    for p in non_webshare_usable:
                         if _proxy_scheme(p) == 'socks5' and add_candidate(p):
                             need_socks -= 1
                             if need_socks <= 0 or len(batch) >= batch_size:
@@ -2408,14 +2749,14 @@ class ProxyManager:
 
             # 5) Остальные слоты в первую очередь HTTP/HTTPS, затем любой protocol.
             if len(batch) < batch_size:
-                for p in usable:
+                for p in non_webshare_usable:
                     if _proxy_scheme(p) in ('http', 'https'):
                         add_candidate(p)
                         if len(batch) >= batch_size:
                             break
 
             if len(batch) < batch_size:
-                for p in usable:
+                for p in non_webshare_usable:
                     add_candidate(p)
                     if len(batch) >= batch_size:
                         break
@@ -3119,45 +3460,158 @@ def _auction_queue_key(url, item_id=None):
     return f"url:{digest}"
 
 
-def enqueue_auction_link(url):
-    """Надёжно ставит пользовательскую auction-ссылку в PostgreSQL-очередь.
+def _read_existing_auction_state(cur, item_id, include_queue=True):
+    """Read durable auction state in priority order: exact -> pending -> queue."""
+    item_id = str(item_id or '').strip()
+    if not item_id:
+        return None
+    cur.execute(
+        "SELECT title, end_time_utc FROM auction_reminders WHERE item_id=%s",
+        (item_id,),
+    )
+    row = cur.fetchone()
+    if row:
+        return {'state': 'exact', 'title': row[0], 'end_time_utc': row[1]}
 
-    Повторная отправка того же ItemID не создаёт второй job. Уже существующий job
-    просто будится немедленно, при этом его Telegram status_message_id сохраняется.
+    cur.execute(
+        """
+        SELECT title, remaining_text, end_earliest_utc, end_latest_utc, status_message_id
+        FROM auction_pending WHERE item_id=%s
+        """,
+        (item_id,),
+    )
+    row = cur.fetchone()
+    if row:
+        return {
+            'state': 'pending', 'title': row[0], 'remaining_text': row[1],
+            'end_earliest_utc': row[2], 'end_latest_utc': row[3],
+            'status_message_id': row[4],
+        }
+
+    if include_queue:
+        cur.execute(
+            """
+            SELECT status_message_id, attempt_count, next_attempt, created_at
+            FROM auction_link_queue WHERE item_id=%s
+            ORDER BY created_at ASC LIMIT 1
+            """,
+            (item_id,),
+        )
+        row = cur.fetchone()
+        if row:
+            return {
+                'state': 'queued', 'status_message_id': row[0],
+                'attempt_count': row[1], 'next_attempt': row[2], 'created_at': row[3],
+            }
+    return None
+
+
+def get_saved_auction_state(item_id):
+    """Exact/pending state only; used to reconcile a queue row after crash/restart."""
+    if not item_id:
+        return None
+    with get_db_connection('ebay_uk_auction_saved_state') as conn:
+        with conn.cursor() as cur:
+            return _read_existing_auction_state(cur, item_id, include_queue=False)
+
+
+def enqueue_auction_link(url):
+    """Durably enqueue one user auction link with cross-table duplicate protection.
+
+    The INSERT/duplicate check is committed before Telegram update acknowledgement.
+    Exact/pending/queued duplicates never create another network job. A queue row stays
+    in PostgreSQL until processing reaches a durable exact/pending/terminal result, so a
+    Render restart at any point simply resumes the existing job.
     """
     item_id = extract_ebay_item_id_any(url or '')
     canonical = f"https://www.ebay.co.uk/itm/{item_id}" if item_id else str(url or '')
     key = _auction_queue_key(canonical, item_id)
+    duplicate_state = None
+    existing_message_id = None
+    is_new = False
+
     with get_db_connection('ebay_uk_auction_link_enqueue') as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                "SELECT status_message_id FROM auction_link_queue WHERE queue_key=%s FOR UPDATE",
-                (key,),
-            )
-            row = cur.fetchone()
-            existing_message_id = row[0] if row else None
-            if row:
+            if item_id:
+                duplicate_state = _read_existing_auction_state(cur, item_id, include_queue=True)
+
+            if duplicate_state is None:
+                # URL-only links without an ItemID still dedupe by deterministic queue_key.
                 cur.execute(
-                    """
-                    UPDATE auction_link_queue
-                    SET item_id=%s, url=%s, next_attempt=NOW(), updated_at=NOW()
-                    WHERE queue_key=%s
-                    """,
-                    (item_id, canonical, key),
+                    "SELECT status_message_id, attempt_count, next_attempt, created_at "
+                    "FROM auction_link_queue WHERE queue_key=%s FOR UPDATE",
+                    (key,),
                 )
-                is_new = False
-            else:
-                cur.execute(
-                    """
-                    INSERT INTO auction_link_queue (queue_key, item_id, url, next_attempt)
-                    VALUES (%s,%s,%s,NOW())
-                    """,
-                    (key, item_id, canonical),
-                )
-                is_new = True
+                row = cur.fetchone()
+                if row:
+                    existing_message_id = row[0]
+                    duplicate_state = {
+                        'state': 'queued', 'status_message_id': row[0],
+                        'attempt_count': row[1], 'next_attempt': row[2], 'created_at': row[3],
+                    }
+                else:
+                    cur.execute(
+                        """
+                        INSERT INTO auction_link_queue (queue_key, item_id, url, next_attempt)
+                        VALUES (%s,%s,%s,NOW())
+                        """,
+                        (key, item_id, canonical),
+                    )
+                    is_new = True
+            elif duplicate_state.get('state') == 'queued':
+                existing_message_id = duplicate_state.get('status_message_id')
         conn.commit()
-    auction_link_wakeup_event.set()
-    return key, item_id, canonical, existing_message_id, is_new
+
+    if is_new:
+        auction_link_wakeup_event.set()
+    elif duplicate_state and duplicate_state.get('state') == 'queued':
+        # Do not reset attempt_count/backoff on accidental duplicate messages, but wake the
+        # worker in case next_attempt is already due.
+        auction_link_wakeup_event.set()
+    return key, item_id, canonical, existing_message_id, is_new, duplicate_state
+
+
+def send_duplicate_auction_notice(item_id, canonical_url, state):
+    """Tell the user immediately that this ItemID is already durable; no re-scrape."""
+    state = state or {}
+    kind = state.get('state')
+    if kind == 'exact':
+        title = html_lib.escape(_clean_auction_title(state.get('title'), item_id))
+        end_dt = state.get('end_time_utc')
+        end_line = f"\n🕒 Окончание по Киеву: {format_kyiv_datetime(end_dt)}" if end_dt else ''
+        msg = (
+            "ℹ️ <b>Этот аукцион уже есть в списке</b> 🇬🇧\n\n"
+            f"📦 <b>{title}</b>{end_line}\n\n"
+            f"🔗 <a href='{html_lib.escape(canonical_url, quote=True)}'>Открыть аукцион на eBay</a>"
+        )
+    elif kind == 'pending':
+        title = html_lib.escape(_clean_auction_title(state.get('title'), item_id))
+        remaining = _format_pending_remaining_ru(state.get('remaining_text'))
+        msg = (
+            "ℹ️ <b>Этот аукцион уже сохранён и уточняется</b> 🇬🇧\n\n"
+            f"📦 <b>{title}</b>\n"
+            f"⏳ Сейчас по eBay: <b>{html_lib.escape(remaining)}</b>\n\n"
+            "🔄 Точное время будет уточнено автоматически.\n\n"
+            f"🔗 <a href='{html_lib.escape(canonical_url, quote=True)}'>Открыть аукцион на eBay</a>"
+        )
+    else:
+        attempt = int(state.get('attempt_count') or 0)
+        msg = (
+            "ℹ️ <b>Этот аукцион уже находится в надёжной очереди</b> 🇬🇧\n\n"
+            "⏳ Повторно не добавляю. Проверка продолжится автоматически даже после перезапуска Render."
+            + (f"\nПопыток: {attempt}" if attempt else '')
+            + f"\n\n🔗 <a href='{html_lib.escape(canonical_url, quote=True)}'>Открыть аукцион на eBay</a>"
+        )
+    duplicate_keyboard = (
+        auction_message_keyboard(item_id, canonical_url)
+        if kind in ('exact', 'pending') and item_id
+        else auction_queue_keyboard(canonical_url)
+    )
+    send_telegram_message(
+        msg,
+        reply_markup=duplicate_keyboard,
+        preview_url=canonical_url,
+    )
 
 
 def set_auction_link_status_message(queue_key, message_id):
@@ -3228,10 +3682,26 @@ def list_queued_auction_links(limit=20):
 
 def postpone_auction_link_job(queue_key, attempt_count, reason='temporary_unavailable'):
     attempt_count = max(0, int(attempt_count or 0)) + 1
-    # 15 -> 30 -> 60 сек., затем держим максимум 60. Небольшой jitter не создаёт
-    # синхронный ритм и не мешает следующей ссылке в очереди получить свой шанс.
-    delay = min(AUCTION_LINK_RETRY_MAX, AUCTION_LINK_RETRY_BASE * (2 ** min(attempt_count - 1, 2)))
-    delay = max(AUCTION_LINK_RETRY_BASE, int(delay + random.uniform(0, min(5, delay * 0.15))))
+    # Durable adaptive retry. With one/no usable Webshare account preserve the proven
+    # 15 -> 30 -> 60 cadence. Extra billing accounts add traffic budget,
+    # but may expose the same exit IPs, so waiting a full minute is unnecessary:
+    # 2 accounts ~= 8/16/30s, 3 ~= 5/10/20s, 4+ ~= 5/8/15s. If accounts hit
+    # circuit/bandwidth limits, usable count falls and backoff automatically relaxes.
+    ws_accounts = provider_manager.usable_webshare_account_count()
+    if ws_accounts <= 0:
+        effective_base = AUCTION_LINK_RETRY_BASE
+        effective_max = min(AUCTION_LINK_RETRY_MAX, 45)
+    elif ws_accounts == 1:
+        # One 1GB account: rescue traffic is cheap compared with missing an auction.
+        effective_base = min(AUCTION_LINK_RETRY_BASE, 10)
+        effective_max = min(AUCTION_LINK_RETRY_MAX, 30)
+    else:
+        # V6.25: key #2 usually adds bandwidth, not new exit IPs. Use that extra budget
+        # for moderately faster retries, but do NOT scale 3-4x as if the IP pool grew.
+        effective_base, effective_max = 7, 20
+    raw_delay = effective_base * (2 ** min(attempt_count - 1, 2))
+    delay = min(effective_max, raw_delay)
+    delay = max(effective_base, int(delay + random.uniform(0, min(3, delay * 0.12))))
     with get_db_connection('ebay_uk_auction_link_retry') as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -3248,7 +3718,7 @@ def postpone_auction_link_job(queue_key, attempt_count, reason='temporary_unavai
         conn.commit()
     logging.info(
         f"🟡 Auction link остаётся в очереди: key={queue_key}, attempt={attempt_count}, "
-        f"повтор примерно через {delay} сек.; reason={reason}"
+        f"повтор примерно через {delay} сек.; reason={reason}; usable_webshare_accounts={ws_accounts}"
     )
     return delay
 
@@ -3260,6 +3730,90 @@ def delete_auction_link_job(queue_key):
             deleted = cur.fetchone() is not None
         conn.commit()
     return deleted
+
+
+def get_auction_durable_counts():
+    """Return exact/pending/queued counts from PostgreSQL for startup diagnostics."""
+    with get_db_connection('ebay_uk_auction_durable_counts') as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    (SELECT COUNT(*) FROM auction_reminders),
+                    (SELECT COUNT(*) FROM auction_pending),
+                    (SELECT COUNT(*) FROM auction_link_queue)
+                """
+            )
+            row = cur.fetchone() or (0, 0, 0)
+            return tuple(int(x or 0) for x in row)
+
+
+def recover_auction_queue_after_startup():
+    """Keep every unfinished job and make old backoff retry soon after a deploy/restart."""
+    with get_db_connection('ebay_uk_auction_queue_recover') as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE auction_link_queue
+                SET next_attempt = LEAST(next_attempt, NOW() + INTERVAL '3 seconds'),
+                    updated_at = NOW()
+                WHERE next_attempt > NOW() + INTERVAL '3 seconds'
+                """
+            )
+            accelerated = cur.rowcount
+        conn.commit()
+    exact, pending, queued = get_auction_durable_counts()
+    logging.info(
+        f"♻️ Durable auction state restored: exact={exact}, pending={pending}, queued={queued}; "
+        f"restart-accelerated={accelerated}"
+    )
+    if queued:
+        auction_link_wakeup_event.set()
+    return exact, pending, queued
+
+
+def _advance_queued_auctions_for_new_fixed(limit=10):
+    """A newly proven main Session is a fresh auction opportunity: do not wait 60s."""
+    try:
+        with get_db_connection('ebay_uk_auction_queue_new_fixed') as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    WITH picked AS (
+                        SELECT queue_key
+                        FROM auction_link_queue
+                        ORDER BY created_at ASC
+                        LIMIT %s
+                    )
+                    UPDATE auction_link_queue AS q
+                    SET next_attempt = LEAST(q.next_attempt, NOW()),
+                        updated_at = NOW()
+                    FROM picked
+                    WHERE q.queue_key = picked.queue_key
+                    RETURNING q.queue_key
+                    """,
+                    (max(1, int(limit)),),
+                )
+                changed = len(cur.fetchall())
+            conn.commit()
+        if changed:
+            logging.info(
+                f"⚡ Новый рабочий fixed proxy: {changed} queued auction job(s) получили немедленный retry"
+            )
+            auction_link_wakeup_event.set()
+    except Exception as e:
+        # This optimization must never affect the main monitor/fixed proxy.
+        logging.warning(f"Не удалось ускорить auction queue после нового fixed proxy: {e}")
+
+
+def wake_queued_auctions_for_new_fixed(limit=10):
+    auction_link_wakeup_event.set()
+    threading.Thread(
+        target=_advance_queued_auctions_for_new_fixed,
+        args=(limit,),
+        daemon=True,
+        name='auction-new-fixed-wakeup',
+    ).start()
 
 
 def transfer_auction_link_status_to_pending(item_id):
@@ -4011,12 +4565,16 @@ def _auction_proxy_cleanup_locked(now=None):
     stale = [p for p, until in auction_proxy_bad_until.items() if until <= now]
     for p in stale:
         auction_proxy_bad_until.pop(p, None)
+        if p not in auction_proxy_success_at:
+            auction_proxy_fail_streak.pop(p, None)
     stale_hosts = [h for h, until in auction_proxy_host_bad_until.items() if until <= now]
     for h in stale_hosts:
         auction_proxy_host_bad_until.pop(h, None)
     stale_success = [p for p, ts in auction_proxy_success_at.items() if now - ts > AUCTION_PROXY_GOOD_MEMORY]
     for p in stale_success:
         auction_proxy_success_at.pop(p, None)
+        if auction_proxy_bad_until.get(p, 0) <= now:
+            auction_proxy_fail_streak.pop(p, None)
 
 
 def _auction_proxy_is_available(proxy, now=None):
@@ -4146,6 +4704,9 @@ def _auction_transport_result(exc):
 
 
 def _classify_auction_response(response, proxy):
+    # Decode once. Auction pages can be hundreds of KB; repeated response.text calls
+    # create avoidable temporary Unicode copies near Render's 512 MB memory ceiling.
+    body_text = response.text or ''
     final_url = str(getattr(response, 'url', '') or '')
     status = int(getattr(response, 'status_code', 0) or 0)
     if status not in (200, 404, 410):
@@ -4156,7 +4717,7 @@ def _classify_auction_response(response, proxy):
             return None, final_url, 'rate_limited'
         return None, final_url, 'http_error'
 
-    blocked, reason = _is_ebay_block_page(response)
+    blocked, reason = _is_ebay_block_page(response, body_text)
     if blocked:
         logging.info(f"Auction page через {_proxy_log_name(proxy)}: eBay block/challenge ({reason})")
         return None, final_url, 'blocked'
@@ -4172,7 +4733,7 @@ def _classify_auction_response(response, proxy):
         f"✅ Auction page получена через {_proxy_log_name(proxy)}: HTTP {status}, "
         f"bytes={len(response.content or b'')}, url={final_url[:160]}"
     )
-    return response.text, final_url, 'success'
+    return body_text, final_url, 'success'
 
 
 def _request_auction_page_once(url, proxy, profile, connect_timeout=None, read_timeout=None):
@@ -4195,7 +4756,7 @@ def _request_auction_page_once(url, proxy, profile, connect_timeout=None, read_t
         close_session(session)
 
 
-def _request_auction_via_main_session(url, connect_timeout=None, read_timeout=None, wait_timeout=None):
+def _request_auction_via_main_session(url, connect_timeout=None, read_timeout=None, wait_timeout=None, penalize_failure=True):
     """Пробует auction search через РЕАЛЬНУЮ fixed Session основного monitor.
 
     Никакой новой Session/CONNECT для того же proxy не создаётся. Доступ сериализован
@@ -4211,7 +4772,7 @@ def _request_auction_via_main_session(url, connect_timeout=None, read_timeout=No
         current = fixed_proxy
         if current:
             logging.info(
-                f"Auction: main fixed Session {current} занята; ждали {wait_timeout:.1f} сек., "
+                f"Auction: main fixed Session {_proxy_log_name(current)} занята; ждали {wait_timeout:.1f} сек., "
                 "переходим к reserve без вмешательства в основной monitor"
             )
         return None, '', 'main_busy', current
@@ -4240,8 +4801,13 @@ def _request_auction_via_main_session(url, connect_timeout=None, read_timeout=No
 
         if result == 'success':
             _auction_proxy_mark_success(proxy)
-        elif result not in ('main_busy', 'main_unavailable'):
+        elif result not in ('main_busy', 'main_unavailable') and penalize_failure:
             _auction_proxy_mark_failure(proxy, result)
+        elif result not in ('main_busy', 'main_unavailable') and not penalize_failure:
+            logging.info(
+                f"🧭 Auction route-only failure via {_proxy_log_name(proxy)}: {result}; "
+                "не ставим whole-proxy auction cooldown до проверки canonical item page"
+            )
         return html, final_url, result, proxy
     finally:
         main_fixed_request_lock.release()
@@ -4263,6 +4829,9 @@ def fetch_auction_pages(
     canonicalize_item=True,
     prefer_current_fixed=False,
     exclude_hosts=None,
+    penalize_main_failure=True,
+    allow_webshare_reserve=True,
+    penalize_reserve_blocked=True,
 ):
     """Получает auction/search HTML без полного proxy-discovery.
 
@@ -4302,6 +4871,7 @@ def fetch_auction_pages(
                 connect_timeout=connect_timeout,
                 read_timeout=read_timeout,
                 wait_timeout=AUCTION_MAIN_PROXY_WAIT,
+                penalize_failure=penalize_main_failure,
             )
             main_proxy_tried = proxy_used or main_proxy_tried
             if html:
@@ -4343,6 +4913,7 @@ def fetch_auction_pages(
         reserve = proxy_manager.get_candidate_batch(
             need,
             tried_hosts=excluded_hosts | candidate_hosts,
+            allow_webshare=allow_webshare_reserve,
         )
         for candidate in reserve:
             add_candidate(candidate)
@@ -4356,6 +4927,7 @@ def fetch_auction_pages(
             extra = proxy_manager.get_candidate_batch(
                 extra_need,
                 tried_hosts=excluded_hosts | candidate_hosts | _auction_proxy_blocked_hosts(),
+                allow_webshare=allow_webshare_reserve,
             )
             for candidate in extra:
                 add_candidate(candidate)
@@ -4374,7 +4946,13 @@ def fetch_auction_pages(
             if html:
                 _auction_proxy_mark_success(proxy)
                 return html, final_url or candidate_url, proxy, result
-            _auction_proxy_mark_failure(proxy, result)
+            if result == 'blocked' and not penalize_reserve_blocked:
+                logging.info(
+                    f"🧭 Auction reserve search-route 403 via {_proxy_log_name(proxy)}; "
+                    "оставляем proxy доступным для canonical item-page fallback"
+                )
+            else:
+                _auction_proxy_mark_failure(proxy, result)
         return None, None, proxy, last_result
 
     pending_candidates = list(candidates[:max_reserve_proxies])
@@ -4434,6 +5012,7 @@ def fetch_auction_pages(
                     connect_timeout=connect_timeout,
                     read_timeout=read_timeout,
                     wait_timeout=min(4.0, AUCTION_MAIN_PROXY_WAIT),
+                    penalize_failure=penalize_main_failure,
                 )
                 if html:
                     pages.append((html, final_url or candidate_url, proxy_used))
@@ -4661,11 +5240,31 @@ def _extract_visible_exact_start(visible):
     return None
 
 
+def _html_visible_and_h1(raw_html):
+    """Return visible text and H1 text without retaining a full BeautifulSoup tree."""
+    if not raw_html:
+        return '', ''
+    soup = BeautifulSoup(raw_html, 'html.parser')
+    try:
+        visible = re.sub(r'\s+', ' ', soup.get_text(' ', strip=True))
+        h1 = soup.find('h1')
+        h1_text = re.sub(r'\s+', ' ', h1.get_text(' ', strip=True)).strip() if h1 else ''
+        return visible, h1_text
+    finally:
+        try:
+            soup.decompose()
+        except Exception:
+            pass
+
+
+def _html_visible_text(raw_html):
+    return _html_visible_and_h1(raw_html)[0]
+
+
 def _extract_exact_start_time(raw_html, item_id=None):
     if not raw_html:
         return None, 'none'
-    soup = BeautifulSoup(raw_html, 'html.parser')
-    visible = re.sub(r'\s+', ' ', soup.get_text(' ', strip=True))
+    visible = _html_visible_text(raw_html)
     visible_start = _extract_visible_exact_start(visible)
     if visible_start:
         return visible_start, 'visible_exact_start'
@@ -4736,8 +5335,7 @@ def _extract_listing_duration_days(raw_html, item_id=None):
                             found.append(d)
                             break
 
-    soup = BeautifulSoup(raw_html, 'html.parser')
-    visible = re.sub(r'\s+', ' ', soup.get_text(' ', strip=True))
+    visible = _html_visible_text(raw_html)
     for m in re.finditer(r'\bDuration\b\s*:?\s*(\d{1,2})\s*days?\b', visible, re.I):
         d = int(m.group(1))
         if d in allowed:
@@ -5105,88 +5703,94 @@ def _extract_localized_timer_observations(raw_html, observed_at=None):
     if not raw_html:
         return []
     soup = BeautifulSoup(raw_html, 'html.parser')
-    observed = _ensure_aware_utc(observed_at or datetime.now(timezone.utc))
-    observations = []
-    seen_pairs = set()
+    try:
+        observed = _ensure_aware_utc(observed_at or datetime.now(timezone.utc))
+        observations = []
+        seen_pairs = set()
 
-    clock_regex = (
-        r'(?:'
-        r'\b(?:Monday|Mon|Tuesday|Tue(?:s)?|Wednesday|Wed|Thursday|Thu(?:rs?)?|Friday|Fri|Saturday|Sat|Sunday|Sun)\b\s*[,]?\s*'
-        r'|'
-        r'\b(?:Today|Tomorrow)\b\s*[,]?\s*(?:at\s*)?'
-        r')'
-        r'\d{1,2}:\d{2}(?:\s*(?:AM|PM))?'
-    )
-    relative_regex = (
-        r'\b(?:Ends?\s+in|Time\s+left)\s*:?[\s]*'
-        r'(?:(?:\d+)\s*(?:d|days?|h|hrs?|hours?|m|mins?|minutes?|s|secs?|seconds?)\s*){1,4}'
-    )
+        clock_regex = (
+            r'(?:'
+            r'\b(?:Monday|Mon|Tuesday|Tue(?:s)?|Wednesday|Wed|Thursday|Thu(?:rs?)?|Friday|Fri|Saturday|Sat|Sunday|Sun)\b\s*[,]?\s*'
+            r'|'
+            r'\b(?:Today|Tomorrow)\b\s*[,]?\s*(?:at\s*)?'
+            r')'
+            r'\d{1,2}:\d{2}(?:\s*(?:AM|PM))?'
+        )
+        relative_regex = (
+            r'\b(?:Ends?\s+in|Time\s+left)\s*:?[\s]*'
+            r'(?:(?:\d+)\s*(?:d|days?|h|hrs?|hours?|m|mins?|minutes?|s|secs?|seconds?)\s*){1,4}'
+        )
 
-    containers = soup.select(
-        '[data-testid="x-end-time"], .x-end-time, [data-testid="ux-timer"], .ux-timer'
-    )
-    for container in containers:
-        rel_node = (
-            container.select_one('[data-testid="ux-timer__text"]')
-            or container.select_one('.ux-timer__text')
+        containers = soup.select(
+            '[data-testid="x-end-time"], .x-end-time, [data-testid="ux-timer"], .ux-timer'
         )
-        clock_node = (
-            container.select_one('.ux-timer__time-left')
-            or container.select_one('[data-testid="ux-timer__time-left"]')
-        )
-        rel_text = rel_node.get_text(' ', strip=True) if rel_node else ''
-        clock_text = clock_node.get_text(' ', strip=True) if clock_node else ''
-        if not rel_text or not clock_text:
-            whole = container.get_text(' ', strip=True)
-            rel_m = re.search(relative_regex, whole, re.I)
-            clock_m = re.search(clock_regex, whole, re.I)
-            if rel_m and not rel_text:
-                rel_text = rel_m.group(0)
-            if clock_m and not clock_text:
-                clock_text = clock_m.group(0)
-        pair = (rel_text.strip(), clock_text.strip())
-        if not all(pair) or pair in seen_pairs:
-            continue
-        seen_pairs.add(pair)
-        candidates, diagnostic = _localized_clock_utc_candidates(
-            rel_text, clock_text, observed_at=observed
-        )
-        if candidates:
-            observations.append({
-                'candidates': candidates,
-                'relative': diagnostic['relative'],
-                'clock': diagnostic['clock'],
-                'observed_at': observed,
-                'source': 'ux_timer',
-            })
+        for container in containers:
+            rel_node = (
+                container.select_one('[data-testid="ux-timer__text"]')
+                or container.select_one('.ux-timer__text')
+            )
+            clock_node = (
+                container.select_one('.ux-timer__time-left')
+                or container.select_one('[data-testid="ux-timer__time-left"]')
+            )
+            rel_text = rel_node.get_text(' ', strip=True) if rel_node else ''
+            clock_text = clock_node.get_text(' ', strip=True) if clock_node else ''
+            if not rel_text or not clock_text:
+                whole = container.get_text(' ', strip=True)
+                rel_m = re.search(relative_regex, whole, re.I)
+                clock_m = re.search(clock_regex, whole, re.I)
+                if rel_m and not rel_text:
+                    rel_text = rel_m.group(0)
+                if clock_m and not clock_text:
+                    clock_text = clock_m.group(0)
+            pair = (rel_text.strip(), clock_text.strip())
+            if not all(pair) or pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+            candidates, diagnostic = _localized_clock_utc_candidates(
+                rel_text, clock_text, observed_at=observed
+            )
+            if candidates:
+                observations.append({
+                    'candidates': candidates,
+                    'relative': diagnostic['relative'],
+                    'clock': diagnostic['clock'],
+                    'observed_at': observed,
+                    'source': 'ux_timer',
+                })
 
-    # Search-card fallback. В реальном логе eBay текст ровно такой:
-    # ``Time left 4d 14h left (Sat, 14:26)``. предыдущий regex видел строку, но искал
-    # только ``Ends in``, поэтому точный UTC candidate вообще не строился.
-    visible = re.sub(r'\s+', ' ', soup.get_text(' ', strip=True))
-    pat = re.compile(
-        rf'({relative_regex})\s*(?:left\b)?\s*[\(\[]?\s*.{{0,20}}?'
-        rf'({clock_regex})\s*[\)\]]?',
-        re.I,
-    )
-    for m in pat.finditer(visible):
-        pair = (m.group(1).strip(), m.group(2).strip())
-        if pair in seen_pairs:
-            continue
-        seen_pairs.add(pair)
-        candidates, diagnostic = _localized_clock_utc_candidates(
-            pair[0], pair[1], observed_at=observed
+        # Search-card fallback. В реальном логе eBay текст ровно такой:
+        # ``Time left 4d 14h left (Sat, 14:26)``. предыдущий regex видел строку, но искал
+        # только ``Ends in``, поэтому точный UTC candidate вообще не строился.
+        visible = re.sub(r'\s+', ' ', soup.get_text(' ', strip=True))
+        pat = re.compile(
+            rf'({relative_regex})\s*(?:left\b)?\s*[\(\[]?\s*.{{0,20}}?'
+            rf'({clock_regex})\s*[\)\]]?',
+            re.I,
         )
-        if candidates:
-            observations.append({
-                'candidates': candidates,
-                'relative': diagnostic['relative'],
-                'clock': diagnostic['clock'],
-                'observed_at': observed,
-                'source': 'visible_timer',
-            })
-    return observations
+        for m in pat.finditer(visible):
+            pair = (m.group(1).strip(), m.group(2).strip())
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+            candidates, diagnostic = _localized_clock_utc_candidates(
+                pair[0], pair[1], observed_at=observed
+            )
+            if candidates:
+                observations.append({
+                    'candidates': candidates,
+                    'relative': diagnostic['relative'],
+                    'clock': diagnostic['clock'],
+                    'observed_at': observed,
+                    'source': 'visible_timer',
+                })
+        return observations
 
+    finally:
+        try:
+            soup.decompose()
+        except Exception:
+            pass
 
 def _resolve_localized_timer_evidence(html_pages, observed_at=None):
     """Консервативно сводит localized timer из нескольких независимых HTML.
@@ -5240,8 +5844,7 @@ def _log_timer_observations(item_id, observations, prefix='Auction timer'):
 def _page_has_active_auction_evidence(raw_html, item_id=None):
     if not raw_html:
         return False
-    soup = BeautifulSoup(raw_html, 'html.parser')
-    visible = re.sub(r'\s+', ' ', soup.get_text(' ', strip=True))
+    visible = _html_visible_text(raw_html)
     return bool(
         re.search(r'\b\d+\s+bids?\b', visible, re.I)
         or re.search(r'\bsubmit\s+bid\b', visible, re.I)
@@ -5285,8 +5888,7 @@ def _derive_exact_end_from_start_duration(raw_html, item_id=None, supporting_htm
     # eBay UI sometimes hides seconds in the displayed Ends line. Since fixed-duration
     # auctions preserve the start second, combine the displayed minute with exact start second.
     for blob in blobs:
-        soup = BeautifulSoup(blob, 'html.parser')
-        visible = re.sub(r'\s+', ' ', soup.get_text(' ', strip=True))
+        visible = _html_visible_text(blob)
         minute_end = _extract_visible_end_minute(visible)
         if minute_end and not creation_only_start:
             candidate = minute_end.replace(second=start.second, microsecond=start.microsecond)
@@ -5296,8 +5898,7 @@ def _derive_exact_end_from_start_duration(raw_html, item_id=None, supporting_htm
     now = _ensure_aware_utc(observed_at or datetime.now(timezone.utc))
     standard_days = (1, 3, 5, 7, 10, 30)
     for blob in blobs:
-        soup = BeautifulSoup(blob, 'html.parser')
-        visible = re.sub(r'\s+', ' ', soup.get_text(' ', strip=True))
+        visible = _html_visible_text(blob)
         rel = _extract_relative_time_left(visible)
         if not rel:
             continue
@@ -5336,48 +5937,54 @@ def _extract_semantic_attribute_end_times(html):
     if not html:
         return []
     soup = BeautifulSoup(html, 'html.parser')
-    values = []
-    end_attr_name = re.compile(
-        r'^(?:data[-_])?(?:item[-_]?|listing[-_]?|auction[-_]?)?'
-        r'(?:end|ending|ends)(?:[-_]?(?:date|time|datetime|at|timestamp))?$',
-        re.I,
-    )
-    marker_re = re.compile(r'(?:^|[-_\s])(?:end|ending|ends|time[-_\s]?left)(?:$|[-_\s])', re.I)
-    for tag in soup.find_all(True):
-        attrs = tag.attrs or {}
-        attrs_lower = {str(k).lower(): v for k, v in attrs.items()}
-        marker_text = ' '.join(
-            str(attrs_lower.get(k, '')) for k in
-            ('itemprop', 'data-testid', 'id', 'class', 'name', 'property', 'aria-label', 'title')
+    try:
+        values = []
+        end_attr_name = re.compile(
+            r'^(?:data[-_])?(?:item[-_]?|listing[-_]?|auction[-_]?)?'
+            r'(?:end|ending|ends)(?:[-_]?(?:date|time|datetime|at|timestamp))?$',
+            re.I,
         )
-        for raw_name, raw_value in attrs.items():
-            name = str(raw_name).lower()
-            if not (end_attr_name.search(name) or (name == 'datetime' and (tag.name == 'time' or marker_re.search(marker_text)))):
-                continue
-            candidates = raw_value if isinstance(raw_value, (list, tuple)) else [raw_value]
-            for raw in candidates:
-                dt = _parse_iso_datetime(raw) or _parse_human_tz_datetime(raw)
-                if dt and 2020 <= dt.year <= 2040:
-                    values.append(dt)
-        # aria-label/title/class can itself contain "Ending 21 Sep at 19:35".
-        if marker_re.search(marker_text):
-            marker_dt = _extract_visible_end_minute(marker_text)
-            if marker_dt:
-                values.append(marker_dt)
+        marker_re = re.compile(r'(?:^|[-_\s])(?:end|ending|ends|time[-_\s]?left)(?:$|[-_\s])', re.I)
+        for tag in soup.find_all(True):
+            attrs = tag.attrs or {}
+            attrs_lower = {str(k).lower(): v for k, v in attrs.items()}
+            marker_text = ' '.join(
+                str(attrs_lower.get(k, '')) for k in
+                ('itemprop', 'data-testid', 'id', 'class', 'name', 'property', 'aria-label', 'title')
+            )
+            for raw_name, raw_value in attrs.items():
+                name = str(raw_name).lower()
+                if not (end_attr_name.search(name) or (name == 'datetime' and (tag.name == 'time' or marker_re.search(marker_text)))):
+                    continue
+                candidates = raw_value if isinstance(raw_value, (list, tuple)) else [raw_value]
+                for raw in candidates:
+                    dt = _parse_iso_datetime(raw) or _parse_human_tz_datetime(raw)
+                    if dt and 2020 <= dt.year <= 2040:
+                        values.append(dt)
+            # aria-label/title/class can itself contain "Ending 21 Sep at 19:35".
+            if marker_re.search(marker_text):
+                marker_dt = _extract_visible_end_minute(marker_text)
+                if marker_dt:
+                    values.append(marker_dt)
 
-        # <time datetime="..."> whose nearby visible text is Ends/Ending/Time left.
-        if tag.name == 'time' and tag.get('datetime'):
-            nearby = ' '.join([
-                marker_text,
-                tag.get_text(' ', strip=True),
-                tag.parent.get_text(' ', strip=True)[:180] if isinstance(tag.parent, Tag) else '',
-            ])
-            if marker_re.search(nearby):
-                dt = _parse_iso_datetime(tag.get('datetime')) or _parse_human_tz_datetime(tag.get('datetime'))
-                if dt and 2020 <= dt.year <= 2040:
-                    values.append(dt)
-    return values
+            # <time datetime="..."> whose nearby visible text is Ends/Ending/Time left.
+            if tag.name == 'time' and tag.get('datetime'):
+                nearby = ' '.join([
+                    marker_text,
+                    tag.get_text(' ', strip=True),
+                    tag.parent.get_text(' ', strip=True)[:180] if isinstance(tag.parent, Tag) else '',
+                ])
+                if marker_re.search(nearby):
+                    dt = _parse_iso_datetime(tag.get('datetime')) or _parse_human_tz_datetime(tag.get('datetime'))
+                    if dt and 2020 <= dt.year <= 2040:
+                        values.append(dt)
+        return values
 
+    finally:
+        try:
+            soup.decompose()
+        except Exception:
+            pass
 
 def _choose_unique_plausible_end(values, horizon_days=45):
     if not values:
@@ -5451,21 +6058,27 @@ def _extract_structured_end_time(html, item_id=None):
     # Semantic HTML / microdata fallback. Accept only elements explicitly named as end.
     soup = BeautifulSoup(html, 'html.parser')
     semantic_values = []
-    for tag in soup.find_all(True):
-        attrs = {str(k).lower(): str(v) for k, v in (tag.attrs or {}).items()}
-        marker = ' '.join([
-            attrs.get('itemprop', ''), attrs.get('data-testid', ''), attrs.get('id', ''),
-            attrs.get('class', ''), attrs.get('name', ''), attrs.get('property', ''),
-        ]).lower()
-        if not re.search(r'(?:item|listing|auction)?[-_ ]?end(?:date|time|ing|s|at)?', marker):
-            continue
-        for field in ('content', 'datetime', 'data-end-time', 'data-end-date', 'value', 'aria-label', 'title'):
-            raw = attrs.get(field)
-            if not raw:
+    try:
+        for tag in soup.find_all(True):
+            attrs = {str(k).lower(): str(v) for k, v in (tag.attrs or {}).items()}
+            marker = ' '.join([
+                attrs.get('itemprop', ''), attrs.get('data-testid', ''), attrs.get('id', ''),
+                attrs.get('class', ''), attrs.get('name', ''), attrs.get('property', ''),
+            ]).lower()
+            if not re.search(r'(?:item|listing|auction)?[-_ ]?end(?:date|time|ing|s|at)?', marker):
                 continue
-            dt = _parse_iso_datetime(raw) or _parse_human_tz_datetime(raw)
-            if dt:
-                semantic_values.append(dt)
+            for field in ('content', 'datetime', 'data-end-time', 'data-end-date', 'value', 'aria-label', 'title'):
+                raw = attrs.get(field)
+                if not raw:
+                    continue
+                dt = _parse_iso_datetime(raw) or _parse_human_tz_datetime(raw)
+                if dt:
+                    semantic_values.append(dt)
+    finally:
+        try:
+            soup.decompose()
+        except Exception:
+            pass
     if semantic_values:
         clusters = _cluster_datetimes(semantic_values, tolerance_seconds=65)
         if len(clusters) == 1:
@@ -5577,14 +6190,9 @@ def parse_auction_page(html, final_url):
     if not html:
         return None, None, None, 'empty', 'unknown'
 
-    soup = BeautifulSoup(html, 'html.parser')
-    visible = re.sub(r'\s+', ' ', soup.get_text(' ', strip=True))
+    visible, title = _html_visible_and_h1(html)
     item_id = extract_ebay_item_id_any(final_url, html)
 
-    title = ''
-    h1 = soup.find('h1')
-    if h1:
-        title = re.sub(r'\s+', ' ', h1.get_text(' ', strip=True)).strip()
     if not title:
         title = _response_title(html)
         title = re.sub(r'\s*\|\s*eBay(?:\s+UK)?\s*$', '', title, flags=re.I).strip()
@@ -5676,34 +6284,34 @@ def _search_target_card_html(html, item_id):
     if not html or not item_id:
         return None
     soup = BeautifulSoup(html, 'html.parser')
-    for a in soup.find_all('a', href=True):
-        href = str(a.get('href') or '')
-        if str(item_id) not in href:
-            continue
-        card = (
-            a.find_parent('li', class_=lambda c: c and ('s-item' in str(c) or 's-card' in str(c)))
-            or a.find_parent('div', class_=lambda c: c and 'su-card-container' in str(c))
-        )
-        if card:
-            return str(card)
-    return None
+    try:
+        for a in soup.find_all('a', href=True):
+            href = str(a.get('href') or '')
+            if str(item_id) not in href:
+                continue
+            card = (
+                a.find_parent('li', class_=lambda c: c and ('s-item' in str(c) or 's-card' in str(c)))
+                or a.find_parent('div', class_=lambda c: c and 'su-card-container' in str(c))
+            )
+            if card:
+                return str(card)
+        return None
+    finally:
+        try:
+            soup.decompose()
+        except Exception:
+            pass
 
 
 def _search_target_card_tag(html, item_id):
-    if not html or not item_id:
+    """Return a small detached target-card tree instead of retaining the full SRP DOM."""
+    card_html = _search_target_card_html(html, item_id)
+    if not card_html:
         return None
-    soup = BeautifulSoup(html, 'html.parser')
-    for a in soup.find_all('a', href=True):
-        href = str(a.get('href') or '')
-        if str(item_id) not in href:
-            continue
-        card = (
-            a.find_parent('li', class_=lambda c: c and ('s-item' in str(c) or 's-card' in str(c)))
-            or a.find_parent('div', class_=lambda c: c and 'su-card-container' in str(c))
-        )
-        if card:
-            return card
-    return None
+    fragment = BeautifulSoup(card_html, 'html.parser')
+    # The fragment is small (one card); returning its root no longer pins the full
+    # 1.6 MB search-page BeautifulSoup graph in memory.
+    return fragment.find(['li', 'div']) or fragment
 
 
 def _search_card_title(target_card, item_id):
@@ -5850,8 +6458,7 @@ def extract_coarse_auction_page_observation(html, final_url, expected_item_id=No
     if not html:
         return None
     observed = _ensure_aware_utc(observed_at or datetime.now(timezone.utc))
-    soup = BeautifulSoup(html, 'html.parser')
-    visible = re.sub(r'\s+', ' ', soup.get_text(' ', strip=True))
+    visible, title = _html_visible_and_h1(html)
     item_id = extract_ebay_item_id_any(final_url or '', html) or expected_item_id
     if expected_item_id and item_id and str(item_id) != str(expected_item_id):
         return None
@@ -5862,8 +6469,6 @@ def extract_coarse_auction_page_observation(html, final_url, expected_item_id=No
     if not floor_window:
         return None
     low, high, vals = floor_window
-    h1 = soup.find('h1')
-    title = re.sub(r'\s+', ' ', h1.get_text(' ', strip=True)).strip() if h1 else ''
     title = _clean_auction_title(title, item_id)
     remaining_text = ' '.join(
         f"{vals[k]}{label}" for k, label in (('d','d'),('h','h'),('m','m'),('s','s')) if k in vals
@@ -6052,25 +6657,37 @@ def _evaluate_search_pages_for_auction(search_pages, item_id):
     return exact, coarse, had_target
 
 
-def _fetch_exact_item_search_pages(item_id, reserve_if_needed=True):
-    search_url = _auction_exact_search_url(item_id)
-    # Сначала ОДИН запрос: current fixed, если main сейчас свободен. Если он занят,
-    # fetch helper без ожидания берёт небольшой reserve. Никакого полного discovery.
-    pages = fetch_auction_pages(
-        search_url,
-        max_reserve_proxies=2,
-        connect_timeout=min(AUCTION_FETCH_CONNECT_TIMEOUT, 4.0),
-        read_timeout=min(AUCTION_FETCH_READ_TIMEOUT, 10.0),
-        max_pages=1,
-        canonicalize_item=False,
-        prefer_current_fixed=True,
-    )
-    exact, coarse, had_target = _evaluate_search_pages_for_auction(pages, item_id)
-    if exact or coarse or not reserve_if_needed:
-        return exact, coarse, had_target, pages
+def _fetch_exact_item_search_pages(item_id, reserve_if_needed=True, prefer_current_fixed=True):
+    """Fetch exact-item search card with route-aware fixed-session handling.
 
-    # Только если первая HTML вообще не дала target-card/timing — максимум две reserve
-    # страницы. Это существенно легче старого 8-proxy item-page + Bid History пути.
+    A 403 on /sch/i.html for an ItemID is not enough to condemn a proxy: the same
+    persistent Session may still serve /itm/<id> and the normal monitor. Therefore the
+    fixed search-route probe is non-penalizing. Reserve search proxies are used only
+    after the caller has had a chance to try the canonical item page via the same fixed.
+    """
+    search_url = _auction_exact_search_url(item_id)
+    pages = []
+
+    if prefer_current_fixed:
+        pages = fetch_auction_pages(
+            search_url,
+            max_reserve_proxies=0,
+            connect_timeout=min(AUCTION_FETCH_CONNECT_TIMEOUT, 4.0),
+            read_timeout=min(AUCTION_FETCH_READ_TIMEOUT, 10.0),
+            max_pages=1,
+            canonicalize_item=False,
+            prefer_current_fixed=True,
+            penalize_main_failure=False,
+        )
+        exact, coarse, had_target = _evaluate_search_pages_for_auction(pages, item_id)
+        if exact or coarse or not reserve_if_needed:
+            return exact, coarse, had_target, pages
+    else:
+        exact, coarse, had_target = None, None, False
+        if not reserve_if_needed:
+            return exact, coarse, had_target, pages
+
+    # Reserve search is bounded and may use metered Webshare rescue if available.
     first_pass_hosts = {_proxy_host(p) for _html, _url, p in pages if p}
     reserve_pages = fetch_auction_pages(
         search_url,
@@ -6081,9 +6698,82 @@ def _fetch_exact_item_search_pages(item_id, reserve_if_needed=True):
         canonicalize_item=False,
         prefer_current_fixed=False,
         exclude_hosts=first_pass_hosts,
+        allow_webshare_reserve=True,
+        penalize_reserve_blocked=False,
     )
     exact2, coarse2, had_target2 = _evaluate_search_pages_for_auction(reserve_pages, item_id)
     return exact2, coarse2, had_target or had_target2, pages + reserve_pages
+
+
+def _try_resolve_quick_item_pages(pages, original_url, expected_item_id):
+    """Try to finish an auction from one/few already fetched item pages.
+
+    Used immediately after a route-specific search 403 on the same fixed Session, before
+    rotating through reserve proxies. Returns None only when more network evidence is needed.
+    """
+    if not pages:
+        return None
+    parsed = []
+    htmls = []
+    coarse = None
+    for html, final_url, proxy_used in pages:
+        if not html:
+            continue
+        htmls.append(html)
+        parse_url = final_url if extract_ebay_item_id_any(final_url or '') else original_url
+        result = parse_auction_page(html, parse_url)
+        item_id, title, end_time_utc, parse_source, auction_status = result
+        logging.info(
+            f"🧪 Auction quick-main parse: proxy={_proxy_log_name(proxy_used)}, item={item_id}, "
+            f"status={auction_status}, source={parse_source}, "
+            f"end={end_time_utc.isoformat() if end_time_utc else None}"
+        )
+        if expected_item_id and item_id and item_id != expected_item_id:
+            continue
+        parsed.append(result)
+        if auction_status == 'active' and item_id and end_time_utc:
+            return _finish_exact_auction_save(item_id, title, end_time_utc, parse_source, notify=True)
+        if not end_time_utc and coarse is None:
+            coarse = extract_coarse_auction_page_observation(
+                html, parse_url, expected_item_id=expected_item_id,
+                observed_at=datetime.now(timezone.utc),
+            )
+
+    if htmls:
+        timer_end, timer_source, _obs = _resolve_localized_timer_evidence(htmls)
+        if timer_end and any(
+            _page_has_active_auction_evidence(h, item_id=expected_item_id) for h in htmls
+        ):
+            representative = next((r for r in parsed if r[0]), None)
+            item_id = expected_item_id or (representative[0] if representative else None)
+            title = (representative[1] if representative else '') or f'eBay item {item_id}'
+            if item_id:
+                return _finish_exact_auction_save(
+                    item_id, title, timer_end, timer_source, notify=True
+                )
+
+    if coarse:
+        return _save_pending_from_observation(coarse, original_url, notify=True)
+
+    statuses = [r[4] for r in parsed]
+    if 'ended' in statuses:
+        ended = next(r for r in parsed if r[4] == 'ended')
+        line = f"\n\n🕒 Окончание по Киеву: {format_kyiv_datetime(ended[2])}" if ended[2] else ''
+        publish_auction_status(
+            expected_item_id or ended[0],
+            "⌛ <b>Этот аукцион уже завершён.</b>" + line,
+            disable_preview=True,
+        )
+        return 'ended'
+    if 'not_auction' in statuses:
+        publish_auction_status(
+            expected_item_id,
+            "ℹ️ <b>Это не активный аукцион со ставками.</b>\n\n"
+            "Buy It Now / Best Offer без режима торгов не сохраняется.",
+            disable_preview=True,
+        )
+        return 'not_auction'
+    return None
 
 
 def process_auction_link(url):
@@ -6091,12 +6781,49 @@ def process_auction_link(url):
         return 'ignored'
 
     expected_item_id = extract_ebay_item_id_any(url or '')
-
-    # 1) Самый лёгкий и полезный путь — exact search-card по ItemID. Именно здесь
-    # в реальном логе была строка ``Time left 4d 14h left (Sat, 14:26)``.
     search_pages = []
+
+    # 1) First use the already proven persistent fixed Session. A search-route 403 is
+    # route-specific evidence only; before any reserve rotation immediately try the
+    # canonical /itm/<id> page through the SAME Session.
     if expected_item_id:
-        exact, coarse, had_target, search_pages = _fetch_exact_item_search_pages(expected_item_id)
+        exact, coarse, had_target, fixed_search_pages = _fetch_exact_item_search_pages(
+            expected_item_id,
+            reserve_if_needed=False,
+            prefer_current_fixed=True,
+        )
+        search_pages.extend(fixed_search_pages)
+        if exact:
+            item_id, title, end_time_utc, source, status = exact
+            return _finish_exact_auction_save(item_id, title, end_time_utc, source, notify=True)
+        if coarse:
+            return _save_pending_from_observation(coarse, url, notify=True)
+
+        canonical_item_url = f"https://www.ebay.co.uk/itm/{expected_item_id}"
+        fixed_item_pages = fetch_auction_pages(
+            canonical_item_url,
+            max_reserve_proxies=0,
+            connect_timeout=min(AUCTION_FETCH_CONNECT_TIMEOUT, 4.0),
+            read_timeout=min(AUCTION_FETCH_READ_TIMEOUT, 10.0),
+            max_pages=1,
+            canonicalize_item=True,
+            prefer_current_fixed=True,
+            penalize_main_failure=True,
+        )
+        quick_result = _try_resolve_quick_item_pages(
+            fixed_item_pages, canonical_item_url, expected_item_id
+        )
+        if quick_result is not None:
+            return quick_result
+
+        # Only now rotate to two reserve search candidates. This avoids putting a good
+        # main proxy in auction cooldown merely because /sch/i.html was blocked.
+        exact, coarse, had_target2, reserve_search_pages = _fetch_exact_item_search_pages(
+            expected_item_id,
+            reserve_if_needed=True,
+            prefer_current_fixed=False,
+        )
+        search_pages.extend(reserve_search_pages)
         if exact:
             item_id, title, end_time_utc, source, status = exact
             return _finish_exact_auction_save(item_id, title, end_time_utc, source, notify=True)
@@ -6208,6 +6935,45 @@ def process_auction_link(url):
     return 'retry'
 
 
+def _reconcile_completed_auction_queue_job(item_id, status_message_id, state):
+    """Finish the tiny crash window: saved exact/pending row exists but queue row remains."""
+    kind = (state or {}).get('state')
+    canonical = f"https://www.ebay.co.uk/itm/{item_id}"
+    try:
+        if kind == 'exact' and status_message_id:
+            title = html_lib.escape(_clean_auction_title(state.get('title'), item_id))
+            end_dt = state.get('end_time_utc')
+            publish_auction_status(
+                item_id,
+                "✅ <b>Аукцион сохранён</b> 🇬🇧\n\n"
+                f"📦 <b>{title}</b>\n\n"
+                f"🕒 Окончание по Киеву: {format_kyiv_datetime(end_dt)}\n\n"
+                f"🔗 <a href='{html_lib.escape(canonical, quote=True)}'>Открыть аукцион на eBay</a>",
+                reply_markup=auction_message_keyboard(item_id, canonical),
+                preview_url=canonical,
+                existing_message_id=status_message_id,
+            )
+        elif kind == 'pending':
+            if status_message_id:
+                set_pending_status_message(item_id, status_message_id)
+                title = html_lib.escape(_clean_auction_title(state.get('title'), item_id))
+                remaining = _format_pending_remaining_ru(state.get('remaining_text'))
+                publish_auction_status(
+                    item_id,
+                    "🟡 <b>Аукцион сохранён</b> 🇬🇧\n\n"
+                    f"📦 <b>{title}</b>\n\n"
+                    f"⏳ Сейчас по eBay: <b>{html_lib.escape(remaining)}</b>\n\n"
+                    "🔄 Точное время окончания уточню автоматически.",
+                    reply_markup=auction_message_keyboard(item_id, canonical),
+                    preview_url=canonical,
+                    existing_message_id=status_message_id,
+                    persist_pending=True,
+                )
+    except Exception as e:
+        # Durable schedule already exists; Telegram cosmetics must not re-open network work.
+        logging.warning(f"Не удалось восстановить auction status message для {item_id}: {e}")
+
+
 def auction_link_worker():
     logging.info("🔗 Worker надёжной очереди eBay-аукционов запущен")
     db_ready_event.wait()
@@ -6224,6 +6990,27 @@ def auction_link_worker():
                 continue
 
             queue_key, item_id, url, status_message_id, attempt_count, created_at = job
+
+            # Main new-item monitor has priority over auction enrichment under failover/RAM
+            # pressure. The job stays due in PostgreSQL (no attempt/backoff increment), so
+            # it resumes within a couple seconds when the main path is stable.
+            if main_discovery_active_event.is_set() or memory_pressure_event.is_set():
+                auction_link_wakeup_event.wait(timeout=2.0)
+                continue
+
+            # Crash-safe reconciliation: exact/pending save is committed BEFORE queue deletion.
+            # If Render died in that tiny window, do not scrape eBay again after restart.
+            if item_id:
+                saved_state = get_saved_auction_state(item_id)
+                if saved_state is not None:
+                    _reconcile_completed_auction_queue_job(item_id, status_message_id, saved_state)
+                    delete_auction_link_job(queue_key)
+                    logging.info(
+                        f"♻️ Auction queue reconciled after restart/crash: key={queue_key}, "
+                        f"durable_state={saved_state.get('state')}"
+                    )
+                    continue
+
             try:
                 result = process_auction_link(url)
             except Exception as e:
@@ -6496,7 +7283,11 @@ def auction_status_worker():
     while True:
         try:
             elapsed, _, had_success = _connection_outage_snapshot()
-            healthy = is_paused or (had_success and elapsed < 180)
+            healthy = (
+                (is_paused or (had_success and elapsed < 180))
+                and not main_discovery_active_event.is_set()
+                and not memory_pressure_event.is_set()
+            )
             if healthy:
                 # Сначала максимум ОДИН pending: это редкая лёгкая search-card проверка.
                 pending_rows = get_due_pending_auctions(limit=1)
@@ -6895,6 +7686,7 @@ def telegram_listener():
                 if update_id <= last_update_id:
                     continue
 
+                update_processed_ok = False
                 try:
                     callback = update.get('callback_query')
                     if callback:
@@ -6932,21 +7724,40 @@ def telegram_listener():
                                 ebay_urls = extract_ebay_urls(text)
                                 if ebay_urls:
                                     for ebay_url in ebay_urls[:20]:
-                                        key, item_id, canonical_url, existing_message_id, is_new = enqueue_auction_link(ebay_url)
+                                        (
+                                            key, item_id, canonical_url, existing_message_id,
+                                            is_new, duplicate_state
+                                        ) = enqueue_auction_link(ebay_url)
+                                        if duplicate_state is not None:
+                                            send_duplicate_auction_notice(item_id, canonical_url, duplicate_state)
+                                            continue
                                         # Одно компактное жёлтое status-сообщение. Оно не накапливается:
                                         # после получения результата бот отредактирует ЭТО ЖЕ сообщение в pending/exact.
-                                        if not existing_message_id:
+                                        if is_new and not existing_message_id:
                                             msg_id = send_telegram_message(
                                                 "🟡 <b>Аукцион добавлен</b> 🇬🇧\n\n"
-                                                "⏳ Проверяю время окончания автоматически.",
+                                                "⏳ Проверяю время окончания автоматически.\n"
+                                                "💾 Ссылка уже сохранена в надёжной очереди и не пропадёт после перезапуска Render.",
                                                 reply_markup=auction_queue_keyboard(canonical_url),
                                                 preview_url=canonical_url,
                                                 return_message_id=True,
                                             )
                                             if msg_id:
                                                 set_auction_link_status_message(key, msg_id)
+                    # ВАЖНО: update считается обработанным только после того, как все
+                    # необходимые durable DB-операции (включая enqueue auction link) завершились.
+                    update_processed_ok = True
                 except Exception as e:
                     logging.error(f"Ошибка обработки Telegram update {update_id}: {e}", exc_info=True)
+
+                if not update_processed_ok:
+                    # Не подтверждаем Telegram update при DB/network exception внутри handler.
+                    # getUpdates вернёт его снова, а DB-dedupe не даст создать второй auction job.
+                    # Это закрывает редкое окно потери ссылки при рестарте Render прямо во время enqueue.
+                    logging.warning(
+                        f"⚠️ Telegram update {update_id} НЕ подтверждён; повторим после восстановления"
+                    )
+                    break
 
                 # Подтверждаем обработанный update в нашей БД. Это не связано с seen_items:
                 # здесь защищаем только входящие команды/кнопки от повторного проигрывания после deploy.
@@ -6977,10 +7788,16 @@ def _response_title(html):
     return re.sub(r'\s+', ' ', match.group(1)).strip()[:160]
 
 
-def _is_ebay_block_page(response):
-    """Определяем именно защитную страницу eBay, а не слово robot в обычном JS."""
-    text_lower = (response.text or "").lower()
-    title_lower = _response_title(response.text).lower()
+def _is_ebay_block_page(response, html_text=None):
+    """Определяем именно защитную страницу eBay, а не слово robot в обычном JS.
+
+    V6.25 accepts the already-decoded body so a 1.6 MB search page is not repeatedly
+    decoded/retained while memory pressure is high.
+    """
+    if html_text is None:
+        html_text = response.text or ""
+    text_lower = html_text.lower()
+    title_lower = _response_title(html_text).lower()
     final_url = str(getattr(response, 'url', '') or '').lower()
 
     if 'pardon our interruption' in text_lower:
@@ -7063,9 +7880,16 @@ def _make_request(proxy, profile, session=None, timeout=None, request_kind="unkn
         # discovery быстро отбрасывать медленные proxy, не затрагивая fixed session.
         response = session.get(EBAY_SEARCH_URL, timeout=timeout)
 
-        title = _response_title(response.text)
+        # Decode exactly once. curl_cffi keeps the raw body on Response; repeated
+        # response.text access during parallel discovery can create avoidable temporary
+        # allocations near Render's 512 MB ceiling.
+        body_text = response.text or ''
+        title = _response_title(body_text)
         final_url = str(getattr(response, 'url', '') or '')
-        body_len = len(response.content or b'')
+        try:
+            body_len = len(response.content or b'')
+        except Exception:
+            body_len = len(body_text)
 
         logging.info(
             f"🌐 eBay ответ: HTTP {response.status_code}, bytes={body_len}, "
@@ -7083,7 +7907,7 @@ def _make_request(proxy, profile, session=None, timeout=None, request_kind="unkn
                     close_session(session)
                 return tracked_return('blocked', None, None if own_session else session, body_len)
 
-            if not _looks_like_search_results(response.text):
+            if not _looks_like_search_results(body_text):
                 logging.warning(
                     f"⚠️ HTTP 200, но выдача eBay не распознана "
                     f"(bytes={body_len}, title={title!r})"
@@ -7093,7 +7917,7 @@ def _make_request(proxy, profile, session=None, timeout=None, request_kind="unkn
                 return tracked_return('http_error', None, None if own_session else session, body_len)
 
             logging.info(f"✅ УСПЕШНО c прокси {_proxy_log_name(proxy)}, профиль {profile['name']}")
-            return tracked_return('success', response.text, session, body_len)
+            return tracked_return('success', body_text, session, body_len)
 
         if response.status_code == 403:
             logging.warning(f"🚫 eBay HTTP 403 для прокси {_proxy_log_name(proxy)}, профиль {profile['name']}")
@@ -7497,6 +8321,7 @@ def _adopt_webshare_handoff_if_ready():
             f"♻️ Webshare bridge handoff complete: now using proven FREE {_proxy_log_name(proxy)}; "
             "metered Webshare traffic stopped without an outage"
         )
+        wake_queued_auctions_for_new_fixed()
         return True
     close_session(session)
     return False
@@ -7513,6 +8338,13 @@ def webshare_handoff_worker():
     while True:
         try:
             current = fixed_proxy
+            # Handoff is an optimization, not a reason to compete with the main failover
+            # for RAM. Under pressure/discovery we keep the proven Webshare fixed alive
+            # and resume the free-scout as soon as the main path is stable.
+            if main_discovery_active_event.is_set() or memory_pressure_event.is_set() or main_fixed_request_lock.locked():
+                webshare_handoff_wakeup_event.wait(timeout=5.0)
+                webshare_handoff_wakeup_event.clear()
+                continue
             if is_paused or current is None or provider_manager.source_fast(current) != 'webshare':
                 if current is None or provider_manager.source_fast(current) != 'webshare':
                     _discard_webshare_handoff_ready('fixed is not Webshare')
@@ -7752,6 +8584,12 @@ def fetch_ebay_html_with_fixed_pair():
             WARM_STANDBY_TOTAL_LIMIT,
             excluded_hosts={_proxy_host(old_proxy)},
         )
+        # HTTP won every discovery in the supplied production window. Keep SOCKS5 as
+        # fallback, but let equally warm HTTP endpoints occupy the earliest slots.
+        fast_standby_queue = (
+            [p for p in fast_standby_queue if _proxy_scheme(p) in ('http', 'https')]
+            + [p for p in fast_standby_queue if _proxy_scheme(p) == 'socks5']
+        )
         if fast_standby_queue:
             quality_ready = sum(
                 1 for p in fast_standby_queue
@@ -7770,6 +8608,8 @@ def fetch_ebay_html_with_fixed_pair():
     # последний deep-emergency tier. Hard cooldown никогда не снимаются.
     # V6.20: сначала обновляем управляемые источники. Ошибка их API полностью fail-open:
     # старый бесплатный ProxyScrape остаётся независимым fallback.
+    # V6.25 trims old parser/curl arenas before starting a multi-session failover burst.
+    _memory_maintenance('before discovery', force=True)
     provider_manager.refresh_all(force=False, include_stats=False)
 
     # На свежем старте сначала ОБЯЗАТЕЛЬНО загружаем обычный Render PROXY_LIST
@@ -7793,14 +8633,22 @@ def fetch_ebay_html_with_fixed_pair():
         logging.error("Нет поддерживаемого browser-профиля curl_cffi")
         return None
 
+    # Build the executor first, then advertise discovery ownership. If executor
+    # construction itself ever failed, background workers must not remain paused by a
+    # stale event. From this point main failover owns the network/memory budget.
     executor = ThreadPoolExecutor(
         max_workers=PROBE_DEEP_CONCURRENCY,
         thread_name_prefix='proxy-probe',
     )
+    main_discovery_active_event.set()
     future_to_proxy = {}
 
     def desired_concurrency():
         elapsed_now = time.monotonic() - started
+        # Normal healthy behaviour is unchanged. Only near Render's memory ceiling do
+        # we temporarily stay at the original 4-worker failover width.
+        if memory_pressure_event.is_set():
+            return PROBE_CONCURRENCY
         if emergency_loaded and elapsed_now >= PROBE_DEEP_ESCALATE_AFTER:
             return PROBE_DEEP_CONCURRENCY
         if elapsed_now >= PROBE_ESCALATE_AFTER:
@@ -7901,7 +8749,12 @@ def fetch_ebay_html_with_fixed_pair():
             1 for p in future_to_proxy.values()
             if _proxy_scheme(p) == 'socks5'
         )
-        preferred_scheme = 'socks5' if desired >= 3 and inflight_socks == 0 else None
+        elapsed_for_mix = time.monotonic() - started
+        preferred_scheme = (
+            'socks5'
+            if elapsed_for_mix >= SOCKS_MIX_DELAY and desired >= 3 and inflight_socks == 0
+            else None
+        )
         inflight_hosts = {_proxy_host(p) for p in future_to_proxy.values()}
         batch = []
         batch_kinds = {}
@@ -7913,14 +8766,29 @@ def fetch_ebay_html_with_fixed_pair():
             # the best distinct-IP success rate, and a single rescue probe costs little
             # compared with running it as fixed for hours.
             if WEBSHARE_FIRST_BATCH and attempts == 0 and len(batch) < need:
-                ws_rescue = proxy_manager.get_webshare_rescue_candidate(
+                active_ws_accounts = provider_manager.usable_webshare_account_count()
+                unique_ws_hosts = provider_manager.webshare_unique_host_count()
+                # Multiple keys often expose the SAME 10 exit IPs. Treat extra accounts
+                # as bandwidth capacity, not artificial IP diversity. With two funded
+                # accounts we can afford two different Webshare exits early, but never
+                # consume 3/4 first-wave workers just because more credentials exist.
+                ws_first_limit = min(
+                    active_ws_accounts,
+                    unique_ws_hosts,
+                    2,
+                    max(1, need - 1) if need > 1 else 1,
+                )
+                ws_rescues = proxy_manager.get_webshare_rescue_candidates(
+                    ws_first_limit,
                     excluded_hosts=(
                         tried_hosts
                         | inflight_hosts
                         | {_proxy_host(p) for p in batch}
-                    )
+                    ),
                 )
-                if ws_rescue is not None:
+                for ws_rescue in ws_rescues:
+                    if len(batch) >= need:
+                        break
                     batch.append(ws_rescue)
                     batch_kinds[ws_rescue] = 'Webshare bridge'
 
@@ -7978,10 +8846,16 @@ def fetch_ebay_html_with_fixed_pair():
             remaining_need = need - len(batch)
             if remaining_need > 0:
                 elapsed_for_provider = time.monotonic() - started
+                first_wave_has_webshare = any(
+                    kind == 'Webshare bridge' for kind in batch_kinds.values()
+                )
                 allow_webshare = (
-                    (WEBSHARE_FIRST_BATCH and provider_manager.has_usable_webshare())
-                    or elapsed_for_provider >= WEBSHARE_UNLOCK_AFTER
-                    or attempts >= WEBSHARE_UNLOCK_ATTEMPTS
+                    (not first_wave_has_webshare)
+                    and (
+                        (WEBSHARE_FIRST_BATCH and provider_manager.has_usable_webshare())
+                        or elapsed_for_provider >= WEBSHARE_UNLOCK_AFTER
+                        or attempts >= WEBSHARE_UNLOCK_ATTEMPTS
+                    )
                 )
                 normal_batch = proxy_manager.get_candidate_batch(
                     remaining_need,
@@ -8067,9 +8941,8 @@ def fetch_ebay_html_with_fixed_pair():
             future_to_proxy[future] = proxy
         return bool(batch)
 
-    submit_more()
-
     try:
+        submit_more()
         while True:
             elapsed = time.monotonic() - started
             if elapsed >= SEARCH_TIME_BUDGET:
@@ -8149,6 +9022,9 @@ def fetch_ebay_html_with_fixed_pair():
                 fixed_pair_since_monotonic = time.monotonic()
                 record_ebay_success()
                 proxy_preflight_wakeup_event.set()
+                # A newly proven Session is also a new chance for durable auction jobs.
+                # Do not leave them sleeping behind an old 30/60-second retry deadline.
+                wake_queued_auctions_for_new_fixed()
                 if provider_manager.source_fast(winner_proxy) == 'webshare':
                     webshare_handoff_wakeup_event.set()
                 discovery_elapsed = time.monotonic() - started
@@ -8173,6 +9049,8 @@ def fetch_ebay_html_with_fixed_pair():
                     lambda f, p=proxy: _cleanup_late_probe_future(f, p)
                 )
         executor.shutdown(wait=False, cancel_futures=True)
+        main_discovery_active_event.clear()
+        _memory_maintenance('after discovery', force=False)
 
     logging.error(
         f"❌ В этом цикле рабочий proxy не найден: "
@@ -8659,71 +9537,83 @@ def _listing_link(card):
 def parse_ebay_listings(html, max_items=MAX_ITEMS):
     if not html:
         return None
-    soup = BeautifulSoup(html, 'html.parser')
-    cards = _main_search_result_cards(soup)
-    if cards is None:
-        return None
+    soup = None
+    try:
+        soup = BeautifulSoup(html, 'html.parser')
+        cards = _main_search_result_cards(soup)
+        if cards is None:
+            return None
 
-    items = {}
-    for card in cards:
-        if len(items) >= max_items:
-            break
+        items = {}
+        for card in cards:
+            if len(items) >= max_items:
+                break
 
-        link = _listing_link(card)
-        if not link:
-            continue
-        url = link.get('href')
-        if not url:
-            continue
-        if url.startswith('/'):
-            url = 'https://www.ebay.co.uk' + url
-        item_id = extract_item_id(url)
-        if not item_id or item_id in items:
-            continue
+            link = _listing_link(card)
+            if not link:
+                continue
+            url = link.get('href')
+            if not url:
+                continue
+            if url.startswith('/'):
+                url = 'https://www.ebay.co.uk' + url
+            item_id = extract_item_id(url)
+            if not item_id or item_id in items:
+                continue
 
-        title_elem = (
-            card.select_one('div.s-card__title')
-            or card.select_one('.s-card__title')
-            or card.select_one('div.s-item__title span[role="heading"]')
-            or card.select_one('div.s-item__title')
-            or card.select_one('[role="heading"]')
-            or link
-        )
-        title = clean_title(title_elem.get_text(' ', strip=True) if title_elem else '')
-        if not title:
-            title = clean_title(link.get_text(' ', strip=True))
-        if not title:
-            continue
-        if title.strip().lower() in {'shop on ebay', 'opens in a new window or tab'}:
-            continue
+            title_elem = (
+                card.select_one('div.s-card__title')
+                or card.select_one('.s-card__title')
+                or card.select_one('div.s-item__title span[role="heading"]')
+                or card.select_one('div.s-item__title')
+                or card.select_one('[role="heading"]')
+                or link
+            )
+            title = clean_title(title_elem.get_text(' ', strip=True) if title_elem else '')
+            if not title:
+                title = clean_title(link.get_text(' ', strip=True))
+            if not title:
+                continue
+            if title.strip().lower() in {'shop on ebay', 'opens in a new window or tab'}:
+                continue
 
-        price = extract_price_jsonld(card, url, soup) or extract_price_css(card)
-        range_prices = []
-        if price and ' до ' in price:
-            parts = price.split(' до ')
-            if len(parts) == 2:
-                range_prices = [parts[0].strip(), parts[1].strip()]
-        if price and not is_gbp_price(price):
-            price = None
+            price = extract_price_jsonld(card, url, soup) or extract_price_css(card)
+            range_prices = []
+            if price and ' до ' in price:
+                parts = price.split(' до ')
+                if len(parts) == 2:
+                    range_prices = [parts[0].strip(), parts[1].strip()]
+            if price and not is_gbp_price(price):
+                price = None
 
-        shipping = extract_shipping(card, item_price=price, range_prices=range_prices)
-        best_offer = extract_best_offer(card)
-        auction = extract_auction(card)
-        has_bin, bin_price = extract_buy_it_now_info(card)
+            shipping = extract_shipping(card, item_price=price, range_prices=range_prices)
+            best_offer = extract_best_offer(card)
+            auction = extract_auction(card)
+            has_bin, bin_price = extract_buy_it_now_info(card)
 
-        items[item_id] = {
-            'url': url,
-            'title': title,
-            'price': price,
-            'shipping': shipping,
-            'best_offer': best_offer,
-            'auction': auction,
-            'has_buy_it_now': has_bin,
-            'buy_it_now_price': bin_price,
-        }
+            items[item_id] = {
+                'url': url,
+                'title': title,
+                'price': price,
+                'shipping': shipping,
+                'best_offer': best_offer,
+                'auction': auction,
+                'has_buy_it_now': has_bin,
+                'buy_it_now_price': bin_price,
+            }
 
-    logging.info(f"Обработано товаров основной выдачи: {len(items)}")
-    return items
+        logging.info(f"Обработано товаров основной выдачи: {len(items)}")
+        return items
+    finally:
+        # BeautifulSoup creates a large cyclic object graph from a ~1.6 MB eBay page.
+        # Explicitly breaking it is important on a 512 MB Render instance; waiting for
+        # a later cyclic-GC pass can leave several generations resident at once.
+        if soup is not None:
+            try:
+                soup.decompose()
+            except Exception:
+                pass
+
 
 def perform_initial_snapshot():
     logging.info("Начальный снимок...")
@@ -8731,6 +9621,8 @@ def perform_initial_snapshot():
     if not html:
         return False
     items = parse_ebay_listings(html, max_items=MAX_ITEMS)
+    html = None
+    _memory_maintenance('initial snapshot', force=False)
     if not items:
         return False
     add_seen_ids_batch(list(items.keys()))
@@ -8770,6 +9662,8 @@ def check_and_send_new_items():
         return 'fetch_error'
 
     current = parse_ebay_listings(html)
+    html = None
+    _memory_maintenance('main parse', force=False)
     if current is None:
         logging.warning("Структура основной выдачи eBay не распознана; проверка пропущена без изменений БД")
         # Это НЕ означает, что proxy плохой: HTTP 200 уже мог быть успешным.
@@ -8863,6 +9757,9 @@ def proxy_preflight_warm_worker():
                 or PROXY_PREFLIGHT_WARM_BATCH <= 0
                 or is_paused
                 or fixed_proxy is None
+                or main_discovery_active_event.is_set()
+                or memory_pressure_event.is_set()
+                or main_fixed_request_lock.locked()
             ):
                 proxy_preflight_wakeup_event.wait(timeout=PROXY_PREFLIGHT_WARM_INTERVAL)
                 proxy_preflight_wakeup_event.clear()
@@ -8982,7 +9879,7 @@ def bot_worker():
     seen_line = f"\n📚 В базе: {seen_total} товаров." if seen_total is not None else ""
     send_telegram_message(
         startup_line +
-        "\n🇬🇧 eBay UK monitor v6.23 DBProviderGuard работает." +
+        "\n🇬🇧 eBay UK monitor v6.25 MemorySafeDurable работает." +
         seen_line +
         "\nКоманды: /stop /start /list (/auctions) /delauction НОМЕР_ЛОТА"
         "\nМожно отправить ссылку на eBay-аукцион — сохраню точное время и напомню заранее.",
@@ -9027,21 +9924,36 @@ def start_leader_workers():
     """Инициализирует БД и запускает фоновые задачи только в leader-instance."""
     init_db()
     initialize_seen_count_cache()
+    # Durable auction rows live in PostgreSQL. Recovery acceleration is an optimization:
+    # if this diagnostics UPDATE happens to fail during a brief Aiven hiccup, do NOT block
+    # the whole bot startup; the queue rows are still durable and its worker will retry.
+    try:
+        recover_auction_queue_after_startup()
+    except Exception as e:
+        logging.warning(f"⚠️ Не удалось ускорить auction queue при старте: {e}; durable rows сохранены")
+        auction_link_wakeup_event.set()
     db_ready_event.set()
     leader_active_event.set()
     logging.info("👑 Эта Render-копия стала leader; запускаем фоновые worker-ы")
     logging.info(
-        "🌐 Multi-provider v6.23: "
+        "🌐 Multi-provider v6.25: "
         f"ProxyScrape Premium={'ON' if PROXYSCRAPE_PREMIUM_API_KEY else 'OFF'}, "
         f"Webshare={'ON (' + str(len(WEBSHARE_API_KEYS)) + ' account(s))' if WEBSHARE_API_KEYS else 'OFF'}, "
-        f"Webshare first-batch={'ON (1 reserved slot)' if WEBSHARE_FIRST_BATCH else 'OFF'}, "
+        f"Webshare first-batch={'ON (1-2 unique-host slots; extra keys=bandwidth)' if WEBSHARE_FIRST_BATCH else 'OFF'}, "
         f"bridge-handoff={WEBSHARE_HANDOFF_AFTER:.0f}s, warm-first-wave={WARM_STANDBY_TOTAL_LIMIT}, "
         f"ws403-circuit={WEBSHARE_BLOCK_CIRCUIT_STREAK}, "
         f"premium403-throttle/circuit={PREMIUM_BLOCK_THROTTLE_STREAK}/{PREMIUM_BLOCK_CIRCUIT_STREAK}"
     )
+    rss = _memory_rss_mb()
+    logging.info(
+        f"🧠 MemorySafe: RSS≈{rss:.0f} MB, soft/high={MEMORY_SOFT_MB}/{MEMORY_HIGH_MB} MB; "
+        f"background TLS workers={PROXY_PREFLIGHT_WARM_CONCURRENCY}" if rss is not None else
+        f"🧠 MemorySafe enabled: soft/high={MEMORY_SOFT_MB}/{MEMORY_HIGH_MB} MB"
+    )
 
     threading.Thread(target=telegram_listener, daemon=True, name='telegram-listener').start()
     threading.Thread(target=connection_watchdog, daemon=True, name='connection-watchdog').start()
+    threading.Thread(target=memory_guard_worker, daemon=True, name='memory-guard-worker').start()
     threading.Thread(target=proxy_preflight_warm_worker, daemon=True, name='proxy-preflight-worker').start()
     threading.Thread(target=webshare_handoff_worker, daemon=True, name='webshare-handoff-worker').start()
     threading.Thread(target=auction_link_worker, daemon=True, name='auction-link-worker').start()
@@ -9085,7 +9997,7 @@ def leader_supervisor():
 @app.route('/')
 def index():
     role = "leader" if leader_active_event.is_set() else "standby"
-    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.23 DBProviderGuard, {role})"
+    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.25 MemorySafeDurable, {role})"
 
 
 @app.route('/health')
