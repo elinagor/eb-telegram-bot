@@ -72,22 +72,24 @@ LEADER_RETRY_INTERVAL = max(2, int(os.getenv("LEADER_RETRY_INTERVAL", "5")))
 LEADER_HEALTH_INTERVAL = max(5, int(os.getenv("LEADER_HEALTH_INTERVAL", "10")))
 
 # Discovery запускается только когда уже нет рабочей fixed-session.
-# Нормальный аварийный поиск остаётся консервативным: 4 уникальных IP сразу -> 5 после 10 сек.
-# Только если outage затянулся и уже включён расширенный emergency pool, допускаем максимум 6.
-# При живом fixed proxy по-прежнему выполняется ОДИН запрос — обычная нагрузка не меняется.
-PROBE_CONCURRENCY = max(4, min(int(os.getenv("PROBE_CONCURRENCY", "4")), 5))
+# V6.26: реальные логи V6.25 показали 17.7–55.9 сек. на failover при RSS всего 198–290 MB.
+# Поэтому возвращаем более быстрый безопасный разгон: 4 сразу -> 5 после ~8 сек. -> 6 после
+# ~18 сек., не дожидаясь deep-emergency. При живом fixed proxy всё равно выполняется ОДИН
+# обычный eBay request — частота основного мониторинга не меняется. Memory guard ниже может
+# динамически вернуть ширину к 4 только около реального лимита RAM Render.
+PROBE_CONCURRENCY = max(4, min(int(os.getenv("PROBE_CONCURRENCY", "4")), 4))
 PROBE_ESCALATED_CONCURRENCY = max(
     PROBE_CONCURRENCY,
     min(int(os.getenv("PROBE_ESCALATED_CONCURRENCY", "5")), 5),
 )
-PROBE_ESCALATE_AFTER = max(5.0, float(os.getenv("PROBE_ESCALATE_AFTER", "10")))
+PROBE_ESCALATE_AFTER = max(5.0, float(os.getenv("PROBE_ESCALATE_AFTER", "8")))
 PROBE_DEEP_CONCURRENCY = max(
     PROBE_ESCALATED_CONCURRENCY,
     min(int(os.getenv("PROBE_DEEP_CONCURRENCY", "6")), 6),
 )
 PROBE_DEEP_ESCALATE_AFTER = max(
-    PROBE_ESCALATE_AFTER,
-    float(os.getenv("PROBE_DEEP_ESCALATE_AFTER", "35")),
+    PROBE_ESCALATE_AFTER + 2.0,
+    float(os.getenv("PROBE_DEEP_ESCALATE_AFTER", "18")),
 )
 PROBE_CONNECT_TIMEOUT = float(os.getenv("PROBE_CONNECT_TIMEOUT", "3.5"))
 # В старой версии после 45 сек. timeout искусственно увеличивался до 4.5/12 и один
@@ -257,7 +259,7 @@ PROXY_QUALITY_BAD_TTL = max(20, int(os.getenv("PROXY_QUALITY_BAD_TTL", "45")))
 # реально достаточно короткой первой wave из 4 verified-free. Поэтому держим ~8 свежих
 # HTTPS-capable резервов, а не 12+, и уменьшаем тяжёлый background batch без потери fallback.
 PROXY_PREFLIGHT_WARM_BATCH = max(4, min(int(os.getenv("PROXY_PREFLIGHT_WARM_BATCH", "12")), 24))
-# V6.25 MemorySafe: keep the same reserve depth, but limit simultaneous TLS handshakes.
+# V6.26 AdaptiveFast: keep the same reserve depth, but limit simultaneous TLS handshakes.
 # This does NOT slow the 15-27 second main eBay checks; it only lowers background peak RAM.
 PROXY_PREFLIGHT_WARM_CONCURRENCY = max(
     2, min(int(os.getenv("PROXY_PREFLIGHT_WARM_CONCURRENCY", "4")), 6)
@@ -280,14 +282,16 @@ FIXED_RECOVERY_SKIP_AFTER = max(
     8.0, float(os.getenv("FIXED_RECOVERY_SKIP_AFTER", "18"))
 )
 
-# V6.25 MemorySafe: Render Free is capped at 512 MB. The main polling cadence stays
-# untouched; only background work / emergency concurrency is reduced when RSS approaches
-# the cap. /proc/self/status is available on Render Linux and needs no extra dependency.
+# V6.26 AdaptiveFast: Render Free is capped at 512 MB. The observed V6.25 RSS stayed
+# around 198–290 MB, so 400 MB was unnecessarily conservative as a HIGH-pressure point.
+# Keep early GC/trim as cheap prevention, but do not pause background work/cap discovery until
+# ~450 MB. A second emergency ceiling near 485 MB preserves headroom below Render's 512 MB kill.
 MEMORY_GUARD_ENABLED = (os.getenv("MEMORY_GUARD_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off"))
 MEMORY_GUARD_INTERVAL = max(5.0, float(os.getenv("MEMORY_GUARD_INTERVAL", "10")))
 MEMORY_SOFT_MB = max(220, int(os.getenv("MEMORY_SOFT_MB", "330")))
-MEMORY_HIGH_MB = max(MEMORY_SOFT_MB + 30, int(os.getenv("MEMORY_HIGH_MB", "400")))
-MEMORY_CLEAR_MB = min(MEMORY_SOFT_MB, max(180, int(os.getenv("MEMORY_CLEAR_MB", "300"))))
+MEMORY_HIGH_MB = max(MEMORY_SOFT_MB + 40, int(os.getenv("MEMORY_HIGH_MB", "450")))
+MEMORY_EMERGENCY_MB = max(MEMORY_HIGH_MB + 20, min(int(os.getenv("MEMORY_EMERGENCY_MB", "485")), 500))
+MEMORY_CLEAR_MB = min(MEMORY_HIGH_MB - 30, max(180, int(os.getenv("MEMORY_CLEAR_MB", "360"))))
 PROXY_REPUTATION_TTL = max(1800, int(os.getenv("PROXY_REPUTATION_TTL", "21600")))
 PROXY_REPUTATION_MAX = max(1000, int(os.getenv("PROXY_REPUTATION_MAX", "7000")))
 PROVIDER_UNIQUE_STATS_CAP = max(500, int(os.getenv("PROVIDER_UNIQUE_STATS_CAP", "4096")))
@@ -481,6 +485,9 @@ is_paused = False
 auction_link_wakeup_event = threading.Event()
 auction_reminder_wakeup_event = threading.Event()
 auction_status_wakeup_event = threading.Event()
+# New user-submitted auction links have priority over background re-checks of already saved
+# auctions. The normal item monitor remains independent and continues in parallel.
+auction_user_job_active_event = threading.Event()
 # Новый fixed proxy будит Smart Reserve немедленно, а не ждёт до 15 сек. polling interval.
 proxy_preflight_wakeup_event = threading.Event()
 # V6.25: background TLS reserve/handoff pauses while the main worker is already doing
@@ -585,7 +592,7 @@ def memory_guard_worker():
                 if high:
                     logging.warning(
                         f"🧠 High memory pressure: RSS≈{rss:.0f} MB; "
-                        "pause background reserve and cap emergency discovery until memory falls"
+                        f"pause background reserve and cap discovery until memory falls (emergency≈{MEMORY_EMERGENCY_MB} MB)"
                     )
                 elif last_state is True:
                     logging.info(f"🧠 Memory pressure cleared: RSS≈{rss:.0f} MB")
@@ -3563,11 +3570,21 @@ def enqueue_auction_link(url):
         conn.commit()
 
     if is_new:
+        logging.info(f"📥 Auction link durably queued: key={key}, item={item_id or 'unknown'}")
         auction_link_wakeup_event.set()
     elif duplicate_state and duplicate_state.get('state') == 'queued':
         # Do not reset attempt_count/backoff on accidental duplicate messages, but wake the
         # worker in case next_attempt is already due.
+        logging.info(
+            f"♻️ Duplicate auction link already queued: key={key}, item={item_id or 'unknown'}, "
+            f"attempt={int(duplicate_state.get('attempt_count') or 0)}"
+        )
         auction_link_wakeup_event.set()
+    elif duplicate_state is not None:
+        logging.info(
+            f"♻️ Duplicate auction already durable: item={item_id or 'unknown'}, "
+            f"state={duplicate_state.get('state')}"
+        )
     return key, item_id, canonical, existing_message_id, is_new, duplicate_state
 
 
@@ -7012,11 +7029,24 @@ def auction_link_worker():
                     continue
 
             try:
+                try:
+                    created_utc = _ensure_aware_utc(created_at) if created_at is not None else None
+                    queue_age = max(0.0, (datetime.now(timezone.utc) - created_utc).total_seconds()) if created_utc else 0.0
+                except Exception:
+                    queue_age = 0.0
+                logging.info(
+                    f"🎯 Auction user-job start: key={queue_key}, item={item_id or 'unknown'}, "
+                    f"attempt={int(attempt_count or 0) + 1}, queue_age={queue_age:.1f}s"
+                )
+                auction_user_job_active_event.set()
                 result = process_auction_link(url)
             except Exception as e:
                 logging.error(f"Ошибка обработки auction URL {url}: {e}", exc_info=True)
                 postpone_auction_link_job(queue_key, attempt_count, 'internal_error')
                 continue
+            finally:
+                auction_user_job_active_event.clear()
+                auction_status_wakeup_event.set()
 
             if result == 'retry':
                 postpone_auction_link_job(queue_key, attempt_count, 'proxy_or_html_temporarily_unavailable')
@@ -7031,7 +7061,15 @@ def auction_link_worker():
                     logging.warning(f"Не удалось перенести auction status_message_id в pending: {e}")
 
             delete_auction_link_job(queue_key)
-            logging.info(f"✅ Auction queue job завершён: key={queue_key}, result={result!r}")
+            try:
+                created_utc = _ensure_aware_utc(created_at) if created_at is not None else None
+                total_age = max(0.0, (datetime.now(timezone.utc) - created_utc).total_seconds()) if created_utc else 0.0
+            except Exception:
+                total_age = 0.0
+            logging.info(
+                f"✅ Auction queue job завершён: key={queue_key}, result={result!r}, "
+                f"total_latency={total_age:.1f}s"
+            )
 
         except psycopg2.OperationalError as e:
             # Job хранится в PostgreSQL, поэтому при временном сетевом сбое ничего
@@ -7157,11 +7195,16 @@ def _notify_auction_closed_early(item_id, url, title, expected_end, detected_end
 
 def verify_saved_auction(item_id, url, title, expected_end, max_reserve_proxies=1, notify_time_change=True):
     """Проверяет сохранённый лот. Никогда не удаляет запись из-за network/proxy ошибки."""
+    # Saved-auction background checks should first reuse the currently proven fixed Session.
+    # The V6.25 log showed an old auction-good proxy timing out repeatedly while a newer main
+    # fixed proxy was serving the normal eBay search successfully. Only if current fixed cannot
+    # serve the item page do we spend one reserve candidate.
     html, final_url, proxy_used = fetch_auction_page(
         url,
         max_reserve_proxies=max_reserve_proxies,
         connect_timeout=AUCTION_STATUS_CONNECT_TIMEOUT,
         read_timeout=AUCTION_STATUS_READ_TIMEOUT,
+        prefer_current_fixed=True,
     )
     if not html:
         return 'unverified'
@@ -7218,29 +7261,113 @@ def verify_saved_auction(item_id, url, title, expected_end, max_reserve_proxies=
 
 
 def refine_pending_auction(item_id, url, title, end_earliest, end_latest, remaining_text='', clock_text=''):
-    """Уточняет pending только lightweight search-card запросом; Bid History не нужен."""
-    exact, coarse, had_target, pages = _fetch_exact_item_search_pages(item_id)
+    """Refine pending with current fixed Session first, then a tiny reserve fallback.
+
+    V6.26: search-route 403/no-target is not enough reason to rotate through Webshare/free.
+    Try canonical /itm/<id> through the same proven main Session before reserve search.
+    """
+    # 1) Lightweight exact search through the current fixed Session only.
+    exact, coarse, _had_target, _pages = _fetch_exact_item_search_pages(
+        item_id, reserve_if_needed=False, prefer_current_fixed=True
+    )
     if exact:
         exact_id, exact_title, exact_end, source, status = exact
         logging.info(
-            f"✅ Pending auction уточнён: item={item_id}, end={exact_end.isoformat()}, source={source}"
+            f"✅ Pending auction уточнён через current fixed search: item={item_id}, "
+            f"end={exact_end.isoformat()}, source={source}"
         )
         return 'exact' if _finish_exact_auction_save(
             exact_id, exact_title or title, exact_end, source, notify=True, refined=True
         ) else 'finished'
-
     if coarse:
         pending_state = _save_pending_from_observation(coarse, url, notify=False, refined=True)
         if pending_state == 'exact':
             return 'exact'
         logging.info(
-            f"🟡 Pending auction пока coarse: item={item_id}, remaining={coarse['remaining_text']!r}; "
-            f"следующая проверка будет рассчитана заново"
+            f"🟡 Pending auction пока coarse через current fixed search: item={item_id}, "
+            f"remaining={coarse['remaining_text']!r}"
         )
         return 'coarse'
 
-    # Network/HTML ambiguity никогда не удаляет pending. Близко к окончанию нельзя
-    # откладывать на 10 минут: иначе можно перескочить порог 60/30/10/5.
+    # 2) Search route may be blocked while canonical item page works on the SAME Session.
+    canonical = f"https://www.ebay.co.uk/itm/{item_id}"
+    fixed_item_pages = fetch_auction_pages(
+        canonical,
+        max_reserve_proxies=0,
+        connect_timeout=min(AUCTION_STATUS_CONNECT_TIMEOUT, 4.0),
+        read_timeout=min(AUCTION_STATUS_READ_TIMEOUT, 8.0),
+        max_pages=1,
+        canonicalize_item=True,
+        prefer_current_fixed=True,
+        penalize_main_failure=True,
+    )
+    fixed_htmls = []
+    coarse_item = None
+    for html, final_url, proxy_used in fixed_item_pages:
+        if not html:
+            continue
+        fixed_htmls.append(html)
+        parse_url = final_url if extract_ebay_item_id_any(final_url or '') else canonical
+        parsed_id, parsed_title, parsed_end, source, status = parse_auction_page(html, parse_url)
+        if parsed_id and parsed_id != str(item_id):
+            continue
+        if status == 'active' and parsed_end:
+            logging.info(
+                f"✅ Pending auction уточнён через current fixed item-page: item={item_id}, "
+                f"end={parsed_end.isoformat()}, source={source}"
+            )
+            return 'exact' if _finish_exact_auction_save(
+                str(item_id), parsed_title or title, parsed_end, source, notify=True, refined=True
+            ) else 'finished'
+        if coarse_item is None:
+            coarse_item = extract_coarse_auction_page_observation(
+                html, parse_url, expected_item_id=str(item_id), observed_at=datetime.now(timezone.utc)
+            )
+
+    if fixed_htmls:
+        timer_end, timer_source, _timer_obs = _resolve_localized_timer_evidence(fixed_htmls)
+        if timer_end and any(_page_has_active_auction_evidence(h, item_id=str(item_id)) for h in fixed_htmls):
+            logging.info(
+                f"✅ Pending auction уточнён по timer через current fixed item-page: "
+                f"item={item_id}, end={timer_end.isoformat()}, source={timer_source}"
+            )
+            return 'exact' if _finish_exact_auction_save(
+                str(item_id), title, timer_end, timer_source, notify=True, refined=True
+            ) else 'finished'
+    if coarse_item:
+        pending_state = _save_pending_from_observation(coarse_item, url, notify=False, refined=True)
+        if pending_state == 'exact':
+            return 'exact'
+        logging.info(
+            f"🟡 Pending auction пока coarse через current fixed item-page: item={item_id}, "
+            f"remaining={coarse_item['remaining_text']!r}"
+        )
+        return 'coarse'
+
+    # 3) Only now spend the small reserve search fallback (max two candidates internally).
+    exact, coarse, _had_target, _pages = _fetch_exact_item_search_pages(
+        item_id, reserve_if_needed=True, prefer_current_fixed=False
+    )
+    if exact:
+        exact_id, exact_title, exact_end, source, status = exact
+        logging.info(
+            f"✅ Pending auction уточнён через reserve search: item={item_id}, "
+            f"end={exact_end.isoformat()}, source={source}"
+        )
+        return 'exact' if _finish_exact_auction_save(
+            exact_id, exact_title or title, exact_end, source, notify=True, refined=True
+        ) else 'finished'
+    if coarse:
+        pending_state = _save_pending_from_observation(coarse, url, notify=False, refined=True)
+        if pending_state == 'exact':
+            return 'exact'
+        logging.info(
+            f"🟡 Pending auction пока coarse после reserve search: item={item_id}, "
+            f"remaining={coarse['remaining_text']!r}; следующая проверка будет рассчитана заново"
+        )
+        return 'coarse'
+
+    # Network/HTML ambiguity never deletes pending. Close to end, keep reminders responsive.
     now_utc = datetime.now(timezone.utc)
     latest_utc = _ensure_aware_utc(end_latest)
     remaining_latest = (latest_utc - now_utc).total_seconds()
@@ -7252,7 +7379,7 @@ def refine_pending_auction(item_id, url, title, end_earliest, end_latest, remain
         retry_seconds = AUCTION_PENDING_RETRY
     postpone_pending_auction(item_id, retry_seconds)
     logging.info(
-        f"🟡 Pending auction {item_id}: точная search-card пока недоступна; "
+        f"🟡 Pending auction {item_id}: exact time пока недоступен; "
         f"повтор через {retry_seconds} сек."
     )
     return 'unverified'
@@ -7287,6 +7414,7 @@ def auction_status_worker():
                 (is_paused or (had_success and elapsed < 180))
                 and not main_discovery_active_event.is_set()
                 and not memory_pressure_event.is_set()
+                and not auction_user_job_active_event.is_set()
             )
             if healthy:
                 # Сначала максимум ОДИН pending: это редкая лёгкая search-card проверка.
@@ -8603,7 +8731,7 @@ def fetch_ebay_html_with_fixed_pair():
         logging.info("Ищем новую рабочую пару...")
 
     # 2) Rolling discovery V6.19: warm reserve -> обычные 4 worker -> 5 после 10 сек.;
-    # только при затянувшемся outage с уже включённым emergency pool -> максимум 6.
+    # максимум 6 при нормальном RSS; emergency/deep tiers по-прежнему расширяют сам пул.
     # Сначала расширяемся до ProxyScrape 3000 ms, а 4000 ms используем только как
     # последний deep-emergency tier. Hard cooldown никогда не снимаются.
     # V6.20: сначала обновляем управляемые источники. Ошибка их API полностью fail-open:
@@ -8645,11 +8773,17 @@ def fetch_ebay_html_with_fixed_pair():
 
     def desired_concurrency():
         elapsed_now = time.monotonic() - started
-        # Normal healthy behaviour is unchanged. Only near Render's memory ceiling do
-        # we temporarily stay at the original 4-worker failover width.
-        if memory_pressure_event.is_set():
+        rss_now = _memory_rss_mb() if MEMORY_GUARD_ENABLED else None
+        # Hard safety margin: if RSS is already extremely close to Render's 512 MB cap,
+        # do not create more simultaneous full-page curl responses. Existing in-flight work
+        # can still finish; this does NOT stop the main failover.
+        if rss_now is not None and rss_now >= MEMORY_EMERGENCY_MB:
+            return 2
+        # Real protective mode starts at 450 MB by default. Check RSS directly as well as
+        # the background Event so a fast discovery spike cannot wait for the next 10-sec guard tick.
+        if (rss_now is not None and rss_now >= MEMORY_HIGH_MB) or memory_pressure_event.is_set():
             return PROBE_CONCURRENCY
-        if emergency_loaded and elapsed_now >= PROBE_DEEP_ESCALATE_AFTER:
+        if elapsed_now >= PROBE_DEEP_ESCALATE_AFTER:
             return PROBE_DEEP_CONCURRENCY
         if elapsed_now >= PROBE_ESCALATE_AFTER:
             return PROBE_ESCALATED_CONCURRENCY
@@ -9879,7 +10013,7 @@ def bot_worker():
     seen_line = f"\n📚 В базе: {seen_total} товаров." if seen_total is not None else ""
     send_telegram_message(
         startup_line +
-        "\n🇬🇧 eBay UK monitor v6.25 MemorySafeDurable работает." +
+        "\n🇬🇧 eBay UK monitor v6.26 AdaptiveFastAuction работает." +
         seen_line +
         "\nКоманды: /stop /start /list (/auctions) /delauction НОМЕР_ЛОТА"
         "\nМожно отправить ссылку на eBay-аукцион — сохраню точное время и напомню заранее.",
@@ -9936,7 +10070,7 @@ def start_leader_workers():
     leader_active_event.set()
     logging.info("👑 Эта Render-копия стала leader; запускаем фоновые worker-ы")
     logging.info(
-        "🌐 Multi-provider v6.25: "
+        "🌐 Multi-provider v6.26: "
         f"ProxyScrape Premium={'ON' if PROXYSCRAPE_PREMIUM_API_KEY else 'OFF'}, "
         f"Webshare={'ON (' + str(len(WEBSHARE_API_KEYS)) + ' account(s))' if WEBSHARE_API_KEYS else 'OFF'}, "
         f"Webshare first-batch={'ON (1-2 unique-host slots; extra keys=bandwidth)' if WEBSHARE_FIRST_BATCH else 'OFF'}, "
@@ -9946,9 +10080,9 @@ def start_leader_workers():
     )
     rss = _memory_rss_mb()
     logging.info(
-        f"🧠 MemorySafe: RSS≈{rss:.0f} MB, soft/high={MEMORY_SOFT_MB}/{MEMORY_HIGH_MB} MB; "
+        f"🧠 MemorySafe: RSS≈{rss:.0f} MB, soft/high/emergency={MEMORY_SOFT_MB}/{MEMORY_HIGH_MB}/{MEMORY_EMERGENCY_MB} MB; "
         f"background TLS workers={PROXY_PREFLIGHT_WARM_CONCURRENCY}" if rss is not None else
-        f"🧠 MemorySafe enabled: soft/high={MEMORY_SOFT_MB}/{MEMORY_HIGH_MB} MB"
+        f"🧠 MemorySafe enabled: soft/high/emergency={MEMORY_SOFT_MB}/{MEMORY_HIGH_MB}/{MEMORY_EMERGENCY_MB} MB"
     )
 
     threading.Thread(target=telegram_listener, daemon=True, name='telegram-listener').start()
@@ -9997,7 +10131,7 @@ def leader_supervisor():
 @app.route('/')
 def index():
     role = "leader" if leader_active_event.is_set() else "standby"
-    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.25 MemorySafeDurable, {role})"
+    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.26 AdaptiveFastAuction, {role})"
 
 
 @app.route('/health')
