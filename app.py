@@ -61,6 +61,18 @@ DB_CONNECT_ATTEMPTS = max(1, min(int(os.getenv("DB_CONNECT_ATTEMPTS", "3")), 5))
 DB_CONNECT_RETRY_BASE = max(0.10, float(os.getenv("DB_CONNECT_RETRY_BASE", "0.35")))
 DB_MAIN_RETRY_WAIT = max(3.0, float(os.getenv("DB_MAIN_RETRY_WAIT", "8")))
 
+# V6.30: persist only SAFE metadata for the most recently proven main proxy.
+# Render zero-downtime deploys start a fresh Python process, so RAM-only reputation is lost.
+# A short one-shot restart probe can recover the exact last-good endpoint before broad discovery.
+# Credentials are NEVER written to PostgreSQL: managed providers are resolved back to their
+# current authenticated URL from the fresh provider API snapshot by host/port.
+RESTART_STICKY_PROXY_ENABLED = os.getenv("RESTART_STICKY_PROXY_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+RESTART_STICKY_PROXY_MAX_AGE = max(300, int(os.getenv("RESTART_STICKY_PROXY_MAX_AGE", str(12 * 3600))))
+RESTART_STICKY_PROXY_REFRESH = max(120, int(os.getenv("RESTART_STICKY_PROXY_REFRESH", "600")))
+RESTART_STICKY_CONNECT_TIMEOUT = max(1.5, min(float(os.getenv("RESTART_STICKY_CONNECT_TIMEOUT", "3.5")), 5.0))
+RESTART_STICKY_READ_TIMEOUT = max(4.0, min(float(os.getenv("RESTART_STICKY_READ_TIMEOUT", "7.0")), 10.0))
+RESTART_STICKY_STATE_KEY = "main_restart_sticky_proxy_v1"
+
 # Render делает zero-downtime deploy: новая и старая копия некоторое время живут одновременно.
 # Один session-level advisory lock в PostgreSQL гарантирует, что фоновые worker-ы активны
 # только в ОДНОЙ копии приложения. Ключ стабильный и не требует таблицы/настроек в Aiven.
@@ -3192,6 +3204,16 @@ fixed_profile = None
 fixed_session = None
 fixed_pair_since_monotonic = None
 
+# Durable restart-sticky proxy state. Only one candidate is tried at cold leader start;
+# a stale/dead endpoint can therefore cost only one short request before normal discovery.
+restart_sticky_lock = threading.Lock()
+restart_sticky_candidate = None
+restart_sticky_consumed = False
+restart_sticky_last_queued_identity = None
+restart_sticky_last_queued_at = 0.0
+restart_sticky_pending_record = None
+restart_sticky_persist_event = threading.Event()
+
 # V6.22 make-before-break: while a metered Webshare fixed session keeps the monitor
 # continuously online, a separate worker scouts FREE proxies. A replacement is adopted
 # only after it already returned a valid eBay HTTP 200 in its own Session.
@@ -3382,6 +3404,168 @@ def set_bot_state(key, value):
                 (key, str(value)),
             )
         conn.commit()
+
+
+def _restart_sticky_safe_record(proxy):
+    """Build credential-free metadata for PostgreSQL. Never persist user:password."""
+    if not proxy:
+        return None
+    try:
+        parts = urlsplit(proxy)
+        host = (parts.hostname or '').strip().lower()
+        port = parts.port
+        scheme = (parts.scheme or 'http').lower()
+        if not host or port is None or scheme not in ('http', 'https', 'socks5'):
+            return None
+        source = provider_manager.source_fast(proxy) if 'provider_manager' in globals() else 'free'
+        if source not in ('free', 'proxyscrape_premium', 'webshare'):
+            source = 'free'
+        return {
+            'v': 1,
+            'scheme': scheme,
+            'host': host,
+            'port': int(port),
+            'source': source,
+            'saved_at': time.time(),
+        }
+    except Exception:
+        return None
+
+
+def _restart_sticky_identity(record):
+    if not record:
+        return None
+    return (
+        str(record.get('source') or 'free'),
+        str(record.get('scheme') or 'http'),
+        str(record.get('host') or '').lower(),
+        int(record.get('port') or 0),
+    )
+
+
+def _queue_restart_sticky_persist(proxy, force=False):
+    """Non-blocking persistence: main eBay cycle never waits on Aiven for this optimization."""
+    global restart_sticky_last_queued_identity, restart_sticky_last_queued_at, restart_sticky_pending_record
+    if not RESTART_STICKY_PROXY_ENABLED:
+        return
+    record = _restart_sticky_safe_record(proxy)
+    if not record:
+        return
+    ident = _restart_sticky_identity(record)
+    now_mono = time.monotonic()
+    with restart_sticky_lock:
+        if (
+            not force
+            and ident == restart_sticky_last_queued_identity
+            and (now_mono - restart_sticky_last_queued_at) < RESTART_STICKY_PROXY_REFRESH
+        ):
+            return
+        restart_sticky_last_queued_identity = ident
+        restart_sticky_last_queued_at = now_mono
+        restart_sticky_pending_record = record
+    restart_sticky_persist_event.set()
+
+
+def restart_sticky_persist_worker():
+    """Persist latest safe proxy metadata without ever blocking the main monitor."""
+    global restart_sticky_pending_record
+    db_ready_event.wait()
+    while True:
+        restart_sticky_persist_event.wait(timeout=30)
+        restart_sticky_persist_event.clear()
+        with restart_sticky_lock:
+            record = restart_sticky_pending_record
+            restart_sticky_pending_record = None
+        if not record:
+            continue
+        try:
+            set_bot_state(RESTART_STICKY_STATE_KEY, json.dumps(record, separators=(',', ':')))
+            logging.info(
+                f"💾 Restart-sticky saved: {record['scheme']}://{record['host']}:{record['port']} "
+                f"[{record['source']}]"
+            )
+        except Exception as e:
+            logging.warning(f"⚠️ Не удалось сохранить restart-sticky proxy в Aiven: {e}")
+            # Keep the newest pending value. If another success arrived meanwhile, do not overwrite it.
+            with restart_sticky_lock:
+                if restart_sticky_pending_record is None:
+                    restart_sticky_pending_record = record
+            restart_sticky_persist_event.wait(timeout=10)
+            restart_sticky_persist_event.set()
+
+
+def _load_restart_sticky_candidate():
+    """Load one credential-free candidate from PostgreSQL for the next cold-start probe."""
+    global restart_sticky_candidate, restart_sticky_consumed
+    restart_sticky_candidate = None
+    restart_sticky_consumed = False
+    if not RESTART_STICKY_PROXY_ENABLED:
+        return None
+    try:
+        raw = get_bot_state(RESTART_STICKY_STATE_KEY)
+        if not raw:
+            logging.info("♻️ Restart-sticky: сохранённого last-good proxy пока нет")
+            return None
+        record = json.loads(raw)
+        if not isinstance(record, dict) or int(record.get('v', 0)) != 1:
+            return None
+        ident = _restart_sticky_identity(record)
+        if not ident or not ident[2] or ident[3] <= 0:
+            return None
+        age = max(0.0, time.time() - float(record.get('saved_at') or 0.0))
+        if age > RESTART_STICKY_PROXY_MAX_AGE:
+            logging.info(
+                f"♻️ Restart-sticky: запись устарела ({age/3600:.1f} ч.); обычный discovery"
+            )
+            return None
+        restart_sticky_candidate = record
+        logging.info(
+            f"♻️ Restart-sticky loaded: {record.get('scheme','http')}://{record.get('host')}:{record.get('port')} "
+            f"[{record.get('source','free')}], age={age:.0f}s; будет проверен первым"
+        )
+        return record
+    except Exception as e:
+        logging.warning(f"⚠️ Не удалось загрузить restart-sticky proxy: {e}; обычный discovery")
+        return None
+
+
+def _resolve_restart_sticky_proxy(record):
+    """Resolve safe DB metadata to a current proxy URL; credentials stay only in provider memory."""
+    if not record:
+        return None
+    try:
+        source = str(record.get('source') or 'free')
+        scheme = str(record.get('scheme') or 'http').lower()
+        host = str(record.get('host') or '').lower()
+        port = int(record.get('port') or 0)
+        if not host or port <= 0:
+            return None
+        if source == 'free':
+            return f"{scheme}://{host}:{port}"
+
+        # Managed endpoints need fresh credentials. Never reconstruct or persist them ourselves.
+        rows = provider_manager.candidates(include_webshare=True)
+        for proxy in rows:
+            if provider_manager.source_fast(proxy) != source:
+                continue
+            try:
+                p = urlsplit(proxy)
+                if (p.hostname or '').lower() == host and int(p.port or 0) == port:
+                    return proxy
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
+
+def _consume_restart_sticky_candidate():
+    global restart_sticky_consumed
+    with restart_sticky_lock:
+        if restart_sticky_consumed or restart_sticky_candidate is None:
+            return None
+        restart_sticky_consumed = True
+        return dict(restart_sticky_candidate)
 
 
 def initialize_seen_count_cache():
@@ -8634,6 +8818,7 @@ def _adopt_webshare_handoff_if_ready():
             "metered Webshare traffic stopped without an outage"
         )
         wake_queued_auctions_for_new_fixed()
+        _queue_restart_sticky_persist(proxy, force=True)
         return True
     close_session(session)
     return False
@@ -8825,6 +9010,7 @@ def fetch_ebay_html_with_fixed_pair():
             fixed_session = returned_session
             proxy_manager.mark_success(old_proxy)
             record_ebay_success()
+            _queue_restart_sticky_persist(old_proxy, force=False)
             return html
 
         # Частая реальная ситуация: умерло только старое TCP/TLS соединение Session,
@@ -8865,6 +9051,7 @@ def fetch_ebay_html_with_fixed_pair():
                     fixed_pair_since_monotonic = time.monotonic()
                 proxy_manager.mark_success(old_proxy)
                 record_ebay_success()
+                _queue_restart_sticky_persist(old_proxy, force=True)
                 logging.info("✅ Proxy восстановился после пересоздания session")
                 return retry_html
 
@@ -8928,6 +9115,65 @@ def fetch_ebay_html_with_fixed_pair():
     # (timeout=1500). Emergency 3000 не имеет права включаться на пустом 0/0 pool.
     if not proxy_manager.standard_pool_loaded():
         proxy_manager.refresh_proxies(force=True, emergency=False)
+
+    # V6.30: on a fresh leader process, try the exact last eBay-proven endpoint ONCE
+    # before broad discovery. Render deploys discard RAM state, but the old process may
+    # have confirmed this proxy only seconds earlier. A dead/stale candidate gets only a
+    # short bounded attempt and then normal 4→5→6 discovery proceeds unchanged.
+    sticky_record = _consume_restart_sticky_candidate()
+    if sticky_record is not None:
+        sticky_proxy = _resolve_restart_sticky_proxy(sticky_record)
+        sticky_profile = get_preferred_profile()
+        if sticky_proxy is None:
+            logging.info(
+                "♻️ Restart-sticky: managed endpoint больше не доступен в свежем provider snapshot; "
+                "переходим к обычному discovery"
+            )
+        elif sticky_profile is None:
+            logging.warning("♻️ Restart-sticky: нет поддерживаемого browser-profile; обычный discovery")
+        else:
+            sticky_started = time.monotonic()
+            logging.info(
+                f"♻️ Restart-sticky FIRST: проверяем последний eBay-good proxy "
+                f"{_proxy_log_name(sticky_proxy)} перед новым discovery"
+            )
+            with main_fixed_request_lock:
+                sticky_result, sticky_html, sticky_session = _make_request(
+                    sticky_proxy,
+                    sticky_profile,
+                    session=None,
+                    timeout=(RESTART_STICKY_CONNECT_TIMEOUT, RESTART_STICKY_READ_TIMEOUT),
+                    request_kind='recovery',
+                )
+            sticky_elapsed = time.monotonic() - sticky_started
+            if sticky_result == 'success':
+                fixed_proxy = sticky_proxy
+                fixed_profile = sticky_profile
+                fixed_session = sticky_session
+                fixed_pair_since_monotonic = time.monotonic()
+                proxy_manager.mark_success(sticky_proxy)
+                proxy_manager.clear_outage_memory()
+                record_ebay_success()
+                _queue_restart_sticky_persist(sticky_proxy, force=True)
+                proxy_preflight_wakeup_event.set()
+                wake_queued_auctions_for_new_fixed()
+                if provider_manager.source_fast(sticky_proxy) == 'webshare':
+                    webshare_handoff_wakeup_event.set()
+                logging.info(
+                    f"✅ Restart-sticky восстановлен за {sticky_elapsed:.1f} сек.: "
+                    f"{_proxy_log_name(sticky_proxy)}; широкий discovery не понадобился"
+                )
+                return sticky_html
+            close_session(sticky_session)
+            if sticky_result != 'profile_error':
+                proxy_manager.mark_failure(
+                    sticky_proxy, sticky_result, reason=f'restart-sticky {sticky_result}'
+                )
+                _auction_proxy_soft_host_penalty(sticky_proxy, sticky_result)
+            logging.info(
+                f"♻️ Restart-sticky не подтвердился ({sticky_result}) за {sticky_elapsed:.1f} сек.; "
+                "сразу запускаем обычный discovery"
+            )
 
     started = time.monotonic()
     tried_hosts = set()
@@ -9374,6 +9620,7 @@ def fetch_ebay_html_with_fixed_pair():
                 fixed_session = winner_session
                 fixed_pair_since_monotonic = time.monotonic()
                 record_ebay_success()
+                _queue_restart_sticky_persist(winner_proxy, force=True)
                 proxy_preflight_wakeup_event.set()
                 # A newly proven Session is also a new chance for durable auction jobs.
                 # Do not leave them sleeping behind an old 30/60-second retry deadline.
@@ -10232,7 +10479,7 @@ def bot_worker():
     seen_line = f"\n📚 В базе: {seen_total} товаров." if seen_total is not None else ""
     send_telegram_message(
         startup_line +
-        "\n🇬🇧 eBay UK monitor v6.29 AuctionLiteUI работает." +
+        "\n🇬🇧 eBay UK monitor v6.30 RestartSticky работает." +
         seen_line +
         "\nКоманды: /stop /start /list (/auctions) /delauction НОМЕР_ЛОТА"
         "\nМожно отправить ссылку на eBay-аукцион — сохраню точное время и напомню заранее."
@@ -10296,11 +10543,14 @@ def start_leader_workers():
     except Exception as e:
         logging.warning(f"⚠️ Не удалось ускорить auction queue при старте: {e}; durable rows сохранены")
         auction_link_wakeup_event.set()
+    # Load credential-free restart hint before main worker starts. Provider credentials,
+    # when needed, are resolved later from the freshly fetched API snapshot.
+    _load_restart_sticky_candidate()
     db_ready_event.set()
     leader_active_event.set()
     logging.info("👑 Эта Render-копия стала leader; запускаем фоновые worker-ы")
     logging.info(
-        "🌐 Multi-provider v6.29: "
+        "🌐 Multi-provider v6.30: "
         f"ProxyScrape Premium={'ON' if PROXYSCRAPE_PREMIUM_API_KEY else 'OFF'}, "
         f"Webshare={'ON (' + str(len(WEBSHARE_API_KEYS)) + ' account(s))' if WEBSHARE_API_KEYS else 'OFF'}, "
         f"Webshare first-batch={'ON (1-2 unique-host slots; extra keys=bandwidth)' if WEBSHARE_FIRST_BATCH else 'OFF'}, "
@@ -10318,6 +10568,7 @@ def start_leader_workers():
     threading.Thread(target=telegram_listener, daemon=True, name='telegram-listener').start()
     threading.Thread(target=connection_watchdog, daemon=True, name='connection-watchdog').start()
     threading.Thread(target=memory_guard_worker, daemon=True, name='memory-guard-worker').start()
+    threading.Thread(target=restart_sticky_persist_worker, daemon=True, name='restart-sticky-persist').start()
     threading.Thread(target=proxy_preflight_warm_worker, daemon=True, name='proxy-preflight-worker').start()
     threading.Thread(target=webshare_handoff_worker, daemon=True, name='webshare-handoff-worker').start()
     threading.Thread(target=auction_link_worker, daemon=True, name='auction-link-worker').start()
@@ -10361,7 +10612,7 @@ def leader_supervisor():
 @app.route('/')
 def index():
     role = "leader" if leader_active_event.is_set() else "standby"
-    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.29 AuctionLiteUI, {role})"
+    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.30 RestartSticky, {role})"
 
 
 @app.route('/health')
