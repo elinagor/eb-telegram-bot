@@ -61,7 +61,7 @@ DB_CONNECT_ATTEMPTS = max(1, min(int(os.getenv("DB_CONNECT_ATTEMPTS", "3")), 5))
 DB_CONNECT_RETRY_BASE = max(0.10, float(os.getenv("DB_CONNECT_RETRY_BASE", "0.35")))
 DB_MAIN_RETRY_WAIT = max(3.0, float(os.getenv("DB_MAIN_RETRY_WAIT", "8")))
 
-# V6.30: persist only SAFE metadata for the most recently proven main proxy.
+# V6.30/V6.32: persist only SAFE metadata for the most recently proven main proxy.
 # Render zero-downtime deploys start a fresh Python process, so RAM-only reputation is lost.
 # A short one-shot restart probe can recover the exact last-good endpoint before broad discovery.
 # Credentials are NEVER written to PostgreSQL: managed providers are resolved back to their
@@ -386,6 +386,34 @@ PREMIUM_BLOCK_CIRCUIT_STREAK = max(
     PREMIUM_BLOCK_THROTTLE_STREAK + 4,
     min(int(os.getenv("PREMIUM_BLOCK_CIRCUIT_STREAK", "20")), 40),
 )
+# V6.31: Premium gets the same conservative recovery semantics as Webshare.
+# A 5-minute circuit remains the safety net, but after 60s exactly one half-open
+# Premium endpoint may be tested per minute. Late in-flight 403s never extend the circuit.
+PREMIUM_CIRCUIT_HALF_OPEN_AFTER = max(
+    30.0, float(os.getenv("PREMIUM_CIRCUIT_HALF_OPEN_AFTER", "60"))
+)
+PREMIUM_CIRCUIT_HALF_OPEN_INTERVAL = max(
+    30.0, float(os.getenv("PREMIUM_CIRCUIT_HALF_OPEN_INTERVAL", "60"))
+)
+
+# V6.32: two additional UNMETERED public proxy sources. Do not ingest their huge
+# full pools into ProxyScrape's list: keep small quality snapshots and reserve only
+# a bounded number of discovery slots. This protects both latency and Render RAM.
+HPROXY_FREE_ENABLED = os.getenv("HPROXY_FREE_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
+DATABAY_FREE_ENABLED = os.getenv("DATABAY_FREE_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
+EXTERNAL_FREE_API_TIMEOUT = max(3.0, min(float(os.getenv("EXTERNAL_FREE_API_TIMEOUT", "8")), 15.0))
+HPROXY_FREE_REFRESH = max(60, int(os.getenv("HPROXY_FREE_REFRESH", "120")))
+DATABAY_FREE_REFRESH = max(120, int(os.getenv("DATABAY_FREE_REFRESH", "300")))
+HPROXY_FREE_ELITE_LIMIT = max(50, min(int(os.getenv("HPROXY_FREE_ELITE_LIMIT", "160")), 400))
+HPROXY_FREE_ANON_LIMIT = max(25, min(int(os.getenv("HPROXY_FREE_ANON_LIMIT", "90")), 250))
+HPROXY_FREE_MAX_LATENCY_MS = max(500, min(int(os.getenv("HPROXY_FREE_MAX_LATENCY_MS", "2000")), 5000))
+HPROXY_FREE_ELITE_MIN_UPTIME = max(50, min(int(os.getenv("HPROXY_FREE_ELITE_MIN_UPTIME", "85")), 100))
+HPROXY_FREE_ANON_MIN_UPTIME = max(50, min(int(os.getenv("HPROXY_FREE_ANON_MIN_UPTIME", "70")), 100))
+DATABAY_FREE_ELITE_LIMIT = max(50, min(int(os.getenv("DATABAY_FREE_ELITE_LIMIT", "160")), 400))
+DATABAY_FREE_ANON_LIMIT = max(25, min(int(os.getenv("DATABAY_FREE_ANON_LIMIT", "90")), 250))
+EXTERNAL_FREE_EARLY_SLOTS = max(0, min(int(os.getenv("EXTERNAL_FREE_EARLY_SLOTS", "1")), 1))
+EXTERNAL_FREE_ESCALATED_SLOTS = max(EXTERNAL_FREE_EARLY_SLOTS, min(int(os.getenv("EXTERNAL_FREE_ESCALATED_SLOTS", "2")), 2))
+EXTERNAL_FREE_STATS_INTERVAL = max(60, int(os.getenv("EXTERNAL_FREE_STATS_INTERVAL", "300")))
 
 # Background SmartReserve may hold 12+ verified free proxies, but the real log showed that
 # draining 10-12 of them before managed providers delayed recovery. Keep a deeper reserve in
@@ -747,6 +775,10 @@ def _proxy_log_name(proxy):
         port = f":{parts.port}" if parts.port else ''
         scheme = parts.scheme or 'http'
         source = provider_manager.source_label_fast(proxy) if 'provider_manager' in globals() else None
+        if source == 'free' and 'external_free_manager' in globals():
+            external_label = external_free_manager.label_fast(proxy)
+            if external_label:
+                source = external_label
         suffix = f" [{source}]" if source else ''
         return f"{scheme}://{host}{port}{suffix}"
     except Exception:
@@ -773,6 +805,8 @@ class ProviderManager:
         self.ps_subaccount_id = PROXYSCRAPE_PREMIUM_SUBACCOUNT_ID
         self.provider_circuit_until = {'proxyscrape_premium': 0.0}
         self.provider_recent = {'proxyscrape_premium': deque(maxlen=32)}
+        self.premium_circuit_opened_at = 0.0
+        self.premium_half_open_last = 0.0
         # V6.25: Webshare accounts may expose the SAME exit IP pool. Additional keys then
         # increase bandwidth allowance but not IP diversity. A shared circuit prevents key #2
         # from immediately retrying the same blocked provider pool after key #1 hits a 403 wall.
@@ -1318,6 +1352,50 @@ class ProviderManager:
             buckets = next_buckets
         return out
 
+    def premium_half_open_snapshot(self):
+        """Return Premium endpoints only for one controlled half-open recovery probe."""
+        now = time.time()
+        with self.lock:
+            until = self.provider_circuit_until.get('proxyscrape_premium', 0.0)
+            if until <= now:
+                return []
+            opened = self.premium_circuit_opened_at or (until - MANAGED_PROVIDER_CIRCUIT_SECONDS)
+            if (now - opened) < PREMIUM_CIRCUIT_HALF_OPEN_AFTER:
+                return []
+            if self.premium_half_open_last and (now - self.premium_half_open_last) < PREMIUM_CIRCUIT_HALF_OPEN_INTERVAL:
+                return []
+            rows = list(self.proxy_sets.get('proxyscrape_premium', ()))
+            random.shuffle(rows)
+            return rows
+
+    def claim_premium_half_open(self):
+        """Atomically reserve the current Premium half-open opportunity."""
+        now = time.time()
+        with self.lock:
+            until = self.provider_circuit_until.get('proxyscrape_premium', 0.0)
+            if until <= now:
+                return False
+            opened = self.premium_circuit_opened_at or (until - MANAGED_PROVIDER_CIRCUIT_SECONDS)
+            if (now - opened) < PREMIUM_CIRCUIT_HALF_OPEN_AFTER:
+                return False
+            if self.premium_half_open_last and (now - self.premium_half_open_last) < PREMIUM_CIRCUIT_HALF_OPEN_INTERVAL:
+                return False
+            self.premium_half_open_last = now
+            return True
+
+    def _close_premium_circuit_locked(self):
+        now = time.time()
+        if self.provider_circuit_until.get('proxyscrape_premium', 0.0) <= now:
+            return False
+        self.provider_circuit_until['proxyscrape_premium'] = 0.0
+        self.premium_circuit_opened_at = 0.0
+        self.premium_half_open_last = 0.0
+        dq = self.provider_recent.get('proxyscrape_premium')
+        if dq is not None:
+            dq.clear()
+            dq.append('success')
+        return True
+
     def webshare_half_open_snapshot(self):
         """Return Webshare endpoints while the shared circuit is open, without consuming a probe slot.
 
@@ -1537,8 +1615,12 @@ class ProviderManager:
                 r == 'blocked' for r in list(dq)[-PREMIUM_BLOCK_CIRCUIT_STREAK:]
             ):
                 until = now + MANAGED_PROVIDER_CIRCUIT_SECONDS
-                if self.provider_circuit_until['proxyscrape_premium'] < until - 1:
+                # Open once. Late in-flight 403s from the same wave must not push the
+                # recovery window forward again. Controlled half-open probes handle recovery.
+                if self.provider_circuit_until['proxyscrape_premium'] <= now:
                     self.provider_circuit_until['proxyscrape_premium'] = until
+                    self.premium_circuit_opened_at = now
+                    self.premium_half_open_last = 0.0
                     return 'ProxyScrape Premium'
         elif src == 'webshare':
             idx = self.webshare_account_by_proxy.get(proxy)
@@ -1576,6 +1658,7 @@ class ProviderManager:
             src = 'free'
         circuit_label = None
         webshare_circuit_closed = False
+        premium_circuit_closed = False
         with self.lock:
             st = self.stats[src]
             st['requests'] += 1
@@ -1599,6 +1682,8 @@ class ProviderManager:
 
             if result == 'success':
                 self._bounded_seen_add(self.success_proxy_seen[src], proxy)
+                if src == 'proxyscrape_premium':
+                    premium_circuit_closed = self._close_premium_circuit_locked()
 
             if src == 'webshare':
                 idx = self.webshare_account_by_proxy.get(proxy)
@@ -1627,6 +1712,8 @@ class ProviderManager:
 
         if webshare_circuit_closed:
             logging.info("🟢 Webshare shared exit pool recovered; circuit closed early after HTTP 200")
+        if premium_circuit_closed:
+            logging.info("🟢 ProxyScrape Premium recovered; circuit closed early after HTTP 200")
         if circuit_label:
             logging.warning(
                 f"🛑 {circuit_label}: temporary 403 circuit opened; "
@@ -1666,7 +1753,283 @@ class ProviderManager:
             )
 
 
+class ExternalFreeSourceManager:
+    """Small, quality-filtered HProxy + Databay snapshots used only for discovery.
+
+    They are deliberately NOT merged into the large ProxyScrape list. This keeps RAM bounded,
+    preserves source attribution, and lets each provider consume only a bounded number of probe
+    slots. The feeds are public/keyless and contain no credentials.
+    """
+    SOURCES = ('hproxy', 'databay')
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.refresh_gate = threading.Lock()
+        self.snapshots = {name: [] for name in self.SOURCES}
+        self.last_refresh = {name: 0.0 for name in self.SOURCES}
+        self.credit_source_by_proxy = {}
+        self.credit_source_at = {}
+        self.turn = 0
+        self.last_stats_log = 0.0
+        self.stats = {
+            name: {
+                'discovery': 0, 'discovery_success': 0, 'fixed': 0, 'fixed_success': 0,
+                'blocked': 0, 'rate_limited': 0, 'proxy_timeout': 0, 'proxy_error': 0,
+                'proxy_rejected': 0, 'proxy_ssl': 0, 'http_error': 0,
+                'winners': 0, 'unique_tested': set(), 'unique_success': set(),
+            }
+            for name in ('proxyscrape', 'hproxy', 'databay')
+        }
+
+    @staticmethod
+    def _normalize_http_proxy(ip, port):
+        try:
+            ip = str(ip or '').strip()
+            port = int(port)
+            if not ip or port < 1 or port > 65535:
+                return None
+            # HTTPS-capable public lists describe CONNECT capability; curl uses an HTTP
+            # proxy URL and negotiates TLS with eBay through the CONNECT tunnel.
+            return f"http://{ip}:{port}"
+        except Exception:
+            return None
+
+    @staticmethod
+    def _rows_from_json(data):
+        if isinstance(data, list):
+            return data
+        if not isinstance(data, dict):
+            return []
+        for key in ('data', 'results', 'proxies', 'items'):
+            rows = data.get(key)
+            if isinstance(rows, list):
+                return rows
+        return []
+
+    def _fetch_hproxy_group(self, anonymity, limit, min_uptime):
+        params = {
+            'format': 'json', 'protocol': 'https', 'anonymity': anonymity,
+            'min_uptime_pct': int(min_uptime), 'max_latency_ms': int(HPROXY_FREE_MAX_LATENCY_MS),
+            'sort': 'uptime', 'limit': int(limit),
+        }
+        resp = requests.get('https://hproxy.com/api/proxy-list', params=params, timeout=EXTERNAL_FREE_API_TIMEOUT)
+        if resp.status_code != 200:
+            logging.warning(f"HProxy free API HTTP {resp.status_code}; keep previous snapshot")
+            return None
+        rows = self._rows_from_json(resp.json())
+        out = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            proxy = self._normalize_http_proxy(row.get('ip') or row.get('host'), row.get('port'))
+            if proxy:
+                out.append(proxy)
+        return out
+
+    def _fetch_hproxy(self):
+        if not HPROXY_FREE_ENABLED:
+            return []
+        elite = self._fetch_hproxy_group('elite', HPROXY_FREE_ELITE_LIMIT, HPROXY_FREE_ELITE_MIN_UPTIME)
+        anon = self._fetch_hproxy_group('anonymous', HPROXY_FREE_ANON_LIMIT, HPROXY_FREE_ANON_MIN_UPTIME)
+        if elite is None and anon is None:
+            return None
+        return list(dict.fromkeys((elite or []) + (anon or [])))
+
+    def _fetch_databay_group(self, anonymity, limit):
+        params = {
+            'protocol': 'https', 'ssl': 'strict', 'speed': 'fast',
+            'anonymity': anonymity, 'format': 'json', 'limit': int(limit), 'page': 1,
+        }
+        resp = requests.get('https://databay.com/api/v1/proxy-list', params=params, timeout=EXTERNAL_FREE_API_TIMEOUT)
+        if resp.status_code != 200:
+            logging.warning(f"Databay free API HTTP {resp.status_code}; keep previous snapshot")
+            return None
+        rows = self._rows_from_json(resp.json())
+        out = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            proxy = self._normalize_http_proxy(row.get('ip') or row.get('host'), row.get('port'))
+            if proxy:
+                out.append(proxy)
+        return out
+
+    def _fetch_databay(self):
+        if not DATABAY_FREE_ENABLED:
+            return []
+        elite = self._fetch_databay_group('elite', DATABAY_FREE_ELITE_LIMIT)
+        anon = self._fetch_databay_group('anonymous', DATABAY_FREE_ANON_LIMIT)
+        if elite is None and anon is None:
+            return None
+        return list(dict.fromkeys((elite or []) + (anon or [])))
+
+    def _source_due(self, source, now, force=False):
+        if force:
+            return True
+        interval = HPROXY_FREE_REFRESH if source == 'hproxy' else DATABAY_FREE_REFRESH
+        return (now - self.last_refresh.get(source, 0.0)) >= interval
+
+    def refresh_all(self, force=False):
+        if not self.refresh_gate.acquire(blocking=False):
+            return False
+        try:
+            now = time.time()
+            due = []
+            with self.lock:
+                for source in self.SOURCES:
+                    enabled = HPROXY_FREE_ENABLED if source == 'hproxy' else DATABAY_FREE_ENABLED
+                    if enabled and self._source_due(source, now, force=force):
+                        due.append(source)
+            if not due:
+                return False
+
+            fetchers = {'hproxy': self._fetch_hproxy, 'databay': self._fetch_databay}
+            results = {}
+            with ThreadPoolExecutor(max_workers=min(2, len(due)), thread_name_prefix='external-free-api') as executor:
+                futs = {executor.submit(fetchers[source]): source for source in due}
+                for fut, source in list((f, src) for f, src in futs.items()):
+                    try:
+                        results[source] = fut.result()
+                    except Exception as e:
+                        logging.warning(f"{source} free API unavailable: {e}; keep previous snapshot")
+                        results[source] = None
+
+            changed = False
+            with self.lock:
+                stamp = time.time()
+                for source, rows in results.items():
+                    if rows is None:
+                        continue
+                    self.snapshots[source] = list(rows)
+                    self.last_refresh[source] = stamp
+                    changed = True
+                h_hosts = {_proxy_host(p) for p in self.snapshots['hproxy'] if _proxy_host(p)}
+                d_hosts = {_proxy_host(p) for p in self.snapshots['databay'] if _proxy_host(p)}
+                h_count, d_count = len(self.snapshots['hproxy']), len(self.snapshots['databay'])
+                overlap = len(h_hosts & d_hosts)
+            if changed:
+                logging.info(
+                    f"🧭 External FREE snapshots: HProxy={h_count}, Databay={d_count}, "
+                    f"overlap_hosts={overlap}; HTTPS-capable, Elite+Anonymous only"
+                )
+            return changed
+        finally:
+            self.refresh_gate.release()
+
+    def refresh_all_async(self, force=False):
+        if self.refresh_gate.locked():
+            return
+        threading.Thread(
+            target=self.refresh_all,
+            kwargs={'force': force},
+            name='external-free-refresh', daemon=True,
+        ).start()
+
+    def selection_snapshot(self):
+        with self.lock:
+            enabled = []
+            if HPROXY_FREE_ENABLED and self.snapshots['hproxy']:
+                enabled.append('hproxy')
+            if DATABAY_FREE_ENABLED and self.snapshots['databay']:
+                enabled.append('databay')
+            if not enabled:
+                return [], {}
+            # Rotate which source gets the single early slot, so one source cannot always
+            # win merely because it is listed first.
+            if len(enabled) > 1:
+                shift = self.turn % len(enabled)
+                enabled = enabled[shift:] + enabled[:shift]
+                self.turn += 1
+            return enabled, {name: list(self.snapshots[name]) for name in enabled}
+
+    def claim_credit(self, proxy, source):
+        if source not in self.stats:
+            return
+        now = time.time()
+        with self.lock:
+            self.credit_source_by_proxy[proxy] = source
+            self.credit_source_at[proxy] = now
+            # Keep credit history bounded; it is diagnostic only.
+            if len(self.credit_source_by_proxy) > 3000:
+                cutoff = now - 6 * 3600
+                stale = [p for p, ts in self.credit_source_at.items() if ts < cutoff]
+                for p in stale[:1000]:
+                    self.credit_source_at.pop(p, None)
+                    self.credit_source_by_proxy.pop(p, None)
+
+    def credit_source_fast(self, proxy):
+        return self.credit_source_by_proxy.get(proxy)
+
+    def label_fast(self, proxy):
+        source = self.credit_source_by_proxy.get(proxy)
+        if source in ('hproxy', 'databay'):
+            return source
+        return None
+
+    def all_snapshot_proxies(self):
+        with self.lock:
+            return set(self.snapshots['hproxy']) | set(self.snapshots['databay'])
+
+    def record_result(self, proxy, result, request_kind='unknown'):
+        source = self.credit_source_by_proxy.get(proxy)
+        if source not in self.stats:
+            return
+        with self.lock:
+            st = self.stats[source]
+            if request_kind == 'discovery':
+                st['discovery'] += 1
+                self._bounded_hash_add(st['unique_tested'], proxy)
+                if result == 'success':
+                    st['discovery_success'] += 1
+            elif request_kind in ('fixed', 'recovery'):
+                st['fixed'] += 1
+                if result == 'success':
+                    st['fixed_success'] += 1
+            if result in st:
+                st[result] += 1
+            if result == 'success':
+                self._bounded_hash_add(st['unique_success'], proxy)
+        self.maybe_log_stats(False)
+
+    @staticmethod
+    def _bounded_hash_add(bucket, proxy):
+        if len(bucket) < PROVIDER_UNIQUE_STATS_CAP:
+            bucket.add(hash(proxy))
+
+    def record_winner(self, proxy):
+        source = self.credit_source_by_proxy.get(proxy)
+        if source not in self.stats:
+            return
+        with self.lock:
+            self.stats[source]['winners'] += 1
+        self.maybe_log_stats(True)
+
+    def maybe_log_stats(self, force=False):
+        now = time.time()
+        with self.lock:
+            if not force and (now - self.last_stats_log) < EXTERNAL_FREE_STATS_INTERVAL:
+                return
+            self.last_stats_log = now
+            parts = []
+            for source in ('proxyscrape', 'hproxy', 'databay'):
+                st = self.stats[source]
+                d = st['discovery']
+                ds = st['discovery_success']
+                ud, us = len(st['unique_tested']), len(st['unique_success'])
+                rate = 100.0 * us / ud if ud else 0.0
+                pool = '-'
+                if source in self.snapshots:
+                    pool = str(len(self.snapshots[source]))
+                parts.append(
+                    f"{source}: pool={pool}, discovery={d}/{ds}, unique={ud}/{us}({rate:.1f}%), "
+                    f"fixed={st['fixed']}/{st['fixed_success']}, winners={st['winners']}, "
+                    f"403={st['blocked']}, timeout={st['proxy_timeout']}, reject={st['proxy_rejected']}, ssl={st['proxy_ssl']}"
+                )
+        logging.info("📊 Free-source stats | " + " | ".join(parts))
+
+
 provider_manager = ProviderManager()
+external_free_manager = ExternalFreeSourceManager()
 
 class ProxyManager:
     def __init__(self, proxy_list_url=None):
@@ -1731,6 +2094,8 @@ class ProxyManager:
         try:
             active.update(provider_manager.proxy_sets.get('proxyscrape_premium', ()))
             active.update(provider_manager.proxy_sets.get('webshare', ()))
+            if 'external_free_manager' in globals():
+                active.update(external_free_manager.all_snapshot_proxies())
         except Exception:
             pass
         keys = set()
@@ -2673,6 +3038,75 @@ class ProxyManager:
             self.last_used[chosen] = now
         return chosen
 
+    def get_premium_half_open_candidate(self, excluded_hosts=None):
+        """One controlled Premium retry while its 403 circuit is still active."""
+        excluded_hosts = set(excluded_hosts or ())
+        raw = provider_manager.premium_half_open_snapshot()
+        if not raw:
+            return None
+        now = time.time()
+        with self.lock:
+            self._cleanup_bad_locked()
+            rows = []
+            for proxy in raw:
+                host = _proxy_host(proxy)
+                if not host or host in excluded_hosts:
+                    continue
+                if self.bad_until.get(proxy, 0) > now or self.host_bad_until.get(host, 0) > now:
+                    continue
+                if self.soft_host_penalty_until.get(host, 0) > now:
+                    continue
+                rows.append(proxy)
+            if not rows:
+                return None
+            rows.sort(key=lambda p: self._candidate_score_locked(p, now), reverse=True)
+            chosen = rows[0]
+        if not provider_manager.claim_premium_half_open():
+            return None
+        with self.lock:
+            self.last_used[chosen] = now
+        return chosen
+
+    def get_external_free_candidates(self, max_total=1, excluded_hosts=None):
+        """Return at most one HProxy and one Databay endpoint, never monopolizing discovery."""
+        max_total = max(0, min(int(max_total or 0), 2))
+        if max_total <= 0:
+            return []
+        excluded_hosts = set(excluded_hosts or ())
+        order, snapshots = external_free_manager.selection_snapshot()
+        if not order:
+            return []
+        now = time.time()
+        chosen = []
+        chosen_hosts = set()
+        with self.lock:
+            self._cleanup_bad_locked()
+            for source in order:
+                rows = []
+                for proxy in snapshots.get(source, ()):
+                    host = _proxy_host(proxy)
+                    if not host or host in excluded_hosts or host in chosen_hosts:
+                        continue
+                    if self.bad_until.get(proxy, 0) > now or self.host_bad_until.get(host, 0) > now:
+                        continue
+                    if self.soft_host_penalty_until.get(host, 0) > now:
+                        continue
+                    if self._preflight_state_locked(proxy, now) == 'bad' or self._quality_state_locked(proxy, now) == 'bad':
+                        continue
+                    if self._host_recent_outage_locked(host, now) and not self._is_recent_good_locked(proxy, now):
+                        continue
+                    rows.append(proxy)
+                if not rows:
+                    continue
+                rows.sort(key=lambda p: self._candidate_score_locked(p, now), reverse=True)
+                proxy = rows[0]
+                chosen.append((proxy, source))
+                chosen_hosts.add(_proxy_host(proxy))
+                self.last_used[proxy] = now
+                if len(chosen) >= max_total:
+                    break
+        return chosen
+
     def get_candidate_batch(self, batch_size, tried_hosts=None, preferred_scheme=None, allow_webshare=False):
         """Выдаёт несколько proxy с уникальными IP и разумным mix HTTP/SOCKS5.
 
@@ -2855,22 +3289,39 @@ class ProxyManager:
                     if premium_added >= premium_limit or len(batch) >= batch_size:
                         break
 
+            # Hard Premium boundary: every generic filler below must exclude Premium,
+            # otherwise the old fallback path silently defeated the throttle.
+            ordinary_usable = [
+                p for p in non_webshare_usable
+                if provider_manager.source_fast(p) != 'proxyscrape_premium'
+            ]
+            ordinary_quality = [
+                p for p in non_webshare_quality
+                if provider_manager.source_fast(p) != 'proxyscrape_premium'
+            ]
+            ordinary_tcp = [
+                p for p in non_webshare_tcp
+                if provider_manager.source_fast(p) != 'proxyscrape_premium'
+            ]
+
             # Один слот по возможности оставляем уже доказанному HTTPS/TLS free-reserve.
-            for p in non_webshare_quality:
+            for p in ordinary_quality:
                 if provider_manager.source_fast(p) == 'free' and add_candidate(p):
                     break
 
-            # Если verified-free не было, свободные места снова отдаём Premium.
-            if len(batch) < batch_size:
+            # Если verified-free не было, Premium can fill only up to premium_limit.
+            if len(batch) < batch_size and premium_added < premium_limit:
                 for p in non_webshare_usable:
-                    if provider_manager.source_fast(p) == 'proxyscrape_premium':
-                        add_candidate(p)
-                        if len(batch) >= batch_size:
-                            return batch
+                    if provider_manager.source_fast(p) != 'proxyscrape_premium':
+                        continue
+                    if add_candidate(p):
+                        premium_added += 1
+                    if premium_added >= premium_limit or len(batch) >= batch_size:
+                        break
 
-            # Остальные quality-ready (например future managed source) тоже полезны.
+            # Остальные quality-ready free endpoints. Premium is intentionally excluded.
             if len(batch) < batch_size:
-                for p in non_webshare_quality:
+                for p in ordinary_quality:
                     add_candidate(p)
                     if len(batch) >= batch_size:
                         return batch
@@ -2878,7 +3329,7 @@ class ProxyManager:
             # TCP-only — только один дополнительный слот: лог v6.18 показал, что сам
             # открытый порт слишком слабый признак и не должен забивать весь batch.
             tcp_added = 0
-            for p in non_webshare_tcp:
+            for p in ordinary_tcp:
                 if add_candidate(p):
                     tcp_added += 1
                     if tcp_added >= 1 or len(batch) >= batch_size:
@@ -2892,7 +3343,7 @@ class ProxyManager:
                 # а не заполнить им весь batch. В v6.3 этот цикл мог набрать сразу
                 # 3 SOCKS5, что видно по логам и ухудшало поиск из-за множества
                 # SSL/MITM-ошибок бесплатных SOCKS5.
-                for p in non_webshare_usable:
+                for p in ordinary_usable:
                     if _proxy_scheme(p) == preferred_scheme and add_candidate(p):
                         break
 
@@ -2906,7 +3357,7 @@ class ProxyManager:
                 need_socks = max(0, want_socks_total - selected_socks)
 
                 if need_socks:
-                    for p in non_webshare_usable:
+                    for p in ordinary_usable:
                         if _proxy_scheme(p) == 'socks5' and add_candidate(p):
                             need_socks -= 1
                             if need_socks <= 0 or len(batch) >= batch_size:
@@ -2914,14 +3365,14 @@ class ProxyManager:
 
             # 5) Остальные слоты в первую очередь HTTP/HTTPS, затем любой protocol.
             if len(batch) < batch_size:
-                for p in non_webshare_usable:
+                for p in ordinary_usable:
                     if _proxy_scheme(p) in ('http', 'https'):
                         add_candidate(p)
                         if len(batch) >= batch_size:
                             break
 
             if len(batch) < batch_size:
-                for p in non_webshare_usable:
+                for p in ordinary_usable:
                     add_candidate(p)
                     if len(batch) >= batch_size:
                         break
@@ -8360,6 +8811,8 @@ def _make_request(proxy, profile, session=None, timeout=None, request_kind="unkn
             provider_manager.record_result(
                 proxy, result, body_bytes=body_bytes, request_kind=request_kind
             )
+            if 'external_free_manager' in globals():
+                external_free_manager.record_result(proxy, result, request_kind=request_kind)
             provider_manager.maybe_warn_webshare_usage()
         return result, html_value, session_value
 
@@ -9110,6 +9563,10 @@ def fetch_ebay_html_with_fixed_pair():
     # V6.25 trims old parser/curl arenas before starting a multi-session failover burst.
     _memory_maintenance('before discovery', force=True)
     provider_manager.refresh_all(force=False, include_stats=False)
+    # Do not delay failover on third-party list APIs. If background SmartReserve already
+    # refreshed them, they are ready immediately; otherwise this daemon refresh becomes
+    # available to later rolling batches while the normal discovery is already running.
+    external_free_manager.refresh_all_async(force=False)
 
     # На свежем старте сначала ОБЯЗАТЕЛЬНО загружаем обычный Render PROXY_LIST
     # (timeout=1500). Emergency 3000 не имеет права включаться на пустом 0/0 pool.
@@ -9391,6 +9848,20 @@ def fetch_ebay_html_with_fixed_pair():
                         f"🟡 Webshare half-open recovery probe: {_proxy_log_name(ws_half_open)}"
                     )
 
+            # V6.31: one controlled Premium recovery probe while its 403 circuit is active.
+            if len(batch) < need:
+                premium_half_open = proxy_manager.get_premium_half_open_candidate(
+                    excluded_hosts=(
+                        tried_hosts | inflight_hosts | {_proxy_host(p) for p in batch}
+                    ),
+                )
+                if premium_half_open is not None:
+                    batch.append(premium_half_open)
+                    batch_kinds[premium_half_open] = 'Premium half-open'
+                    logging.info(
+                        f"🟣 Premium half-open recovery probe: {_proxy_log_name(premium_half_open)}"
+                    )
+
             # Fill the remaining first-wave workers from already proven warm reserve.
             while fast_standby_queue and len(batch) < need:
                 standby = fast_standby_queue.pop(0)
@@ -9441,6 +9912,29 @@ def fetch_ebay_html_with_fixed_pair():
                 batch.append(transient)
                 batch_kinds[transient] = 'Transient re-probe'
                 logging.info(f"♻️ Emergency transient re-probe после cooldown: {_proxy_log_name(transient)}")
+
+            # V6.32: diversity from HProxy/Databay without letting unproven public feeds
+            # monopolize the workers. Before escalation only ONE external slot is allowed;
+            # after ~8s at most two (one per source) may run in parallel.
+            external_slot_cap = (
+                EXTERNAL_FREE_ESCALATED_SLOTS
+                if elapsed_for_mix >= PROBE_ESCALATE_AFTER
+                else EXTERNAL_FREE_EARLY_SLOTS
+            )
+            external_need = min(max(0, need - len(batch)), external_slot_cap)
+            if external_need > 0:
+                external_rows = proxy_manager.get_external_free_candidates(
+                    max_total=external_need,
+                    excluded_hosts=(
+                        tried_hosts | inflight_hosts | {_proxy_host(p) for p in batch}
+                    ),
+                )
+                for ext_proxy, ext_source in external_rows:
+                    if len(batch) >= need:
+                        break
+                    batch.append(ext_proxy)
+                    external_free_manager.claim_credit(ext_proxy, ext_source)
+                    batch_kinds[ext_proxy] = 'HProxy probe' if ext_source == 'hproxy' else 'Databay probe'
 
             remaining_need = need - len(batch)
             if remaining_need > 0:
@@ -9525,6 +10019,8 @@ def fetch_ebay_html_with_fixed_pair():
             attempts += 1
             kind = batch_kinds.get(proxy, 'Probe')
             source = provider_manager.source_fast(proxy)
+            if source == 'free' and kind not in ('HProxy probe', 'Databay probe'):
+                external_free_manager.claim_credit(proxy, 'proxyscrape')
             if source != 'free' and kind == 'Probe':
                 kind = 'Premium probe' if source == 'proxyscrape_premium' else 'Webshare rescue'
             limit_label = f"{MAX_SEARCH_ATTEMPTS}+1" if is_final_extra else str(MAX_SEARCH_ATTEMPTS)
@@ -9629,9 +10125,13 @@ def fetch_ebay_html_with_fixed_pair():
                     webshare_handoff_wakeup_event.set()
                 discovery_elapsed = time.monotonic() - started
                 provider_manager.record_winner(winner_proxy, discovery_elapsed, attempts)
+                external_free_manager.record_winner(winner_proxy)
+                winner_source = provider_manager.source_fast(winner_proxy)
+                if winner_source == 'free':
+                    winner_source = external_free_manager.credit_source_fast(winner_proxy) or 'proxyscrape'
                 logging.info(
                     f"✅ Найдена рабочая пара: proxy {_proxy_log_name(winner_proxy)}, "
-                    f"source={provider_manager.source_fast(winner_proxy)}, профиль {profile['name']}; "
+                    f"source={winner_source}, профиль {profile['name']}; "
                     f"проверено {attempts} proxy за {discovery_elapsed:.1f} сек."
                 )
                 return winner_html
@@ -10367,6 +10867,9 @@ def proxy_preflight_warm_worker():
 
             # Managed provider lists are metadata/API calls only; they do not consume proxy bandwidth.
             provider_manager.refresh_all(force=False)
+            # Keyless metadata feeds only. Runs in this background worker, never on the
+            # normal fixed eBay request path. Snapshots stay intentionally small.
+            external_free_manager.refresh_all(force=False)
 
             # Пока fixed работает, поддерживаем не только health-cache, но и СВЕЖИЙ
             # standard ProxyScrape snapshot. Внутренний refresh_interval ограничивает
@@ -10479,7 +10982,7 @@ def bot_worker():
     seen_line = f"\n📚 В базе: {seen_total} товаров." if seen_total is not None else ""
     send_telegram_message(
         startup_line +
-        "\n🇬🇧 eBay UK monitor v6.30 RestartSticky работает." +
+        "\n🇬🇧 eBay UK monitor v6.32 HProxy+Databay работает." +
         seen_line +
         "\nКоманды: /stop /start /list (/auctions) /delauction НОМЕР_ЛОТА"
         "\nМожно отправить ссылку на eBay-аукцион — сохраню точное время и напомню заранее."
@@ -10550,13 +11053,20 @@ def start_leader_workers():
     leader_active_event.set()
     logging.info("👑 Эта Render-копия стала leader; запускаем фоновые worker-ы")
     logging.info(
-        "🌐 Multi-provider v6.30: "
+        "🌐 Multi-provider v6.32: "
         f"ProxyScrape Premium={'ON' if PROXYSCRAPE_PREMIUM_API_KEY else 'OFF'}, "
         f"Webshare={'ON (' + str(len(WEBSHARE_API_KEYS)) + ' account(s))' if WEBSHARE_API_KEYS else 'OFF'}, "
         f"Webshare first-batch={'ON (1-2 unique-host slots; extra keys=bandwidth)' if WEBSHARE_FIRST_BATCH else 'OFF'}, "
         f"bridge-handoff={WEBSHARE_HANDOFF_AFTER:.0f}s, warm-first-wave={WARM_STANDBY_TOTAL_LIMIT}, "
         f"ws403-circuit={WEBSHARE_BLOCK_CIRCUIT_STREAK}, "
         f"premium403-throttle/circuit={PREMIUM_BLOCK_THROTTLE_STREAK}/{PREMIUM_BLOCK_CIRCUIT_STREAK}"
+    )
+    logging.info(
+        f"🧭 External FREE v6.32: HProxy={'ON' if HPROXY_FREE_ENABLED else 'OFF'} "
+        f"(HTTPS, elite+anonymous, cap={HPROXY_FREE_ELITE_LIMIT + HPROXY_FREE_ANON_LIMIT}), "
+        f"Databay={'ON' if DATABAY_FREE_ENABLED else 'OFF'} "
+        f"(HTTPS strict+fast, elite+anonymous, cap={DATABAY_FREE_ELITE_LIMIT + DATABAY_FREE_ANON_LIMIT}); "
+        f"slots={EXTERNAL_FREE_EARLY_SLOTS} early/{EXTERNAL_FREE_ESCALATED_SLOTS} escalated"
     )
     rss = _memory_rss_mb()
     logging.info(
@@ -10612,7 +11122,7 @@ def leader_supervisor():
 @app.route('/')
 def index():
     role = "leader" if leader_active_event.is_set() else "standby"
-    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.30 RestartSticky, {role})"
+    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.32 HProxy+Databay, {role})"
 
 
 @app.route('/health')
