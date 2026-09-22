@@ -103,6 +103,28 @@ PROBE_DEEP_ESCALATE_AFTER = max(
     PROBE_ESCALATE_AFTER + 2.0,
     float(os.getenv("PROBE_DEEP_ESCALATE_AFTER", "18")),
 )
+# V6.33: two late burst stages. They are deliberately unavailable during normal/short
+# failovers and are additionally gated by live RSS, so the extra curl responses cannot
+# consume the last Render memory reserve.
+PROBE_BURST_CONCURRENCY = max(
+    PROBE_DEEP_CONCURRENCY,
+    min(int(os.getenv("PROBE_BURST_CONCURRENCY", "7")), 7),
+)
+PROBE_BURST_ESCALATE_AFTER = max(
+    PROBE_DEEP_ESCALATE_AFTER + 4.0,
+    float(os.getenv("PROBE_BURST_ESCALATE_AFTER", "28")),
+)
+PROBE_MAX_CONCURRENCY = max(
+    PROBE_BURST_CONCURRENCY,
+    min(int(os.getenv("PROBE_MAX_CONCURRENCY", "8")), 8),
+)
+PROBE_MAX_ESCALATE_AFTER = max(
+    PROBE_BURST_ESCALATE_AFTER + 5.0,
+    float(os.getenv("PROBE_MAX_ESCALATE_AFTER", "38")),
+)
+PROBE_BURST_MEMORY_CEILING_MB = max(
+    340, min(int(os.getenv("PROBE_BURST_MEMORY_CEILING_MB", "390")), 420)
+)
 PROBE_CONNECT_TIMEOUT = float(os.getenv("PROBE_CONNECT_TIMEOUT", "3.5"))
 # В старой версии после 45 сек. timeout искусственно увеличивался до 4.5/12 и один
 # полуживой proxy мог держать целый batch 11+ секунд. При сотнях кандидатов выгоднее
@@ -364,6 +386,13 @@ WEBSHARE_HANDOFF_CONCURRENCY = max(1, min(int(os.getenv("WEBSHARE_HANDOFF_CONCUR
 WEBSHARE_HANDOFF_CONFIRMATIONS = max(1, min(int(os.getenv("WEBSHARE_HANDOFF_CONFIRMATIONS", "3")), 3))
 WEBSHARE_HANDOFF_CONFIRM_DELAY = max(1.0, float(os.getenv("WEBSHARE_HANDOFF_CONFIRM_DELAY", "10")))
 WEBSHARE_HANDOFF_READY_TTL = max(30.0, float(os.getenv("WEBSHARE_HANDOFF_READY_TTL", "90")))
+# V6.35: a background Webshare->FREE scout is opportunistic. A transient timeout/error
+# on a FREE proxy that was eBay-good recently must not poison the PRIMARY failover path.
+# Keep a separate scout-only cooldown so the handoff worker does not hammer it, while
+# main discovery remains free to make its own decision if the current fixed proxy dies.
+WEBSHARE_HANDOFF_TRANSIENT_COOLDOWN = max(20.0, min(
+    float(os.getenv("WEBSHARE_HANDOFF_TRANSIENT_COOLDOWN", "45")), 120.0
+))
 MANAGED_PROVIDER_CIRCUIT_SECONDS = max(120, int(os.getenv("MANAGED_PROVIDER_CIRCUIT_SECONDS", "300")))
 # V6.28: keep the full provider circuit as a safety net, but do not make a healthy
 # Webshare pool disappear for the whole 5 minutes. During a shared-pool circuit we allow
@@ -396,13 +425,13 @@ PREMIUM_CIRCUIT_HALF_OPEN_INTERVAL = max(
     30.0, float(os.getenv("PREMIUM_CIRCUIT_HALF_OPEN_INTERVAL", "60"))
 )
 
-# V6.32: two additional UNMETERED public proxy sources. Do not ingest their huge
+# V6.32/V6.33: two additional UNMETERED public proxy sources. Do not ingest their huge
 # full pools into ProxyScrape's list: keep small quality snapshots and reserve only
 # a bounded number of discovery slots. This protects both latency and Render RAM.
 HPROXY_FREE_ENABLED = os.getenv("HPROXY_FREE_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
 DATABAY_FREE_ENABLED = os.getenv("DATABAY_FREE_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
 EXTERNAL_FREE_API_TIMEOUT = max(3.0, min(float(os.getenv("EXTERNAL_FREE_API_TIMEOUT", "8")), 15.0))
-HPROXY_FREE_REFRESH = max(60, int(os.getenv("HPROXY_FREE_REFRESH", "120")))
+HPROXY_FREE_REFRESH = max(60, int(os.getenv("HPROXY_FREE_REFRESH", "60")))
 DATABAY_FREE_REFRESH = max(120, int(os.getenv("DATABAY_FREE_REFRESH", "300")))
 HPROXY_FREE_ELITE_LIMIT = max(50, min(int(os.getenv("HPROXY_FREE_ELITE_LIMIT", "160")), 400))
 HPROXY_FREE_ANON_LIMIT = max(25, min(int(os.getenv("HPROXY_FREE_ANON_LIMIT", "90")), 250))
@@ -413,6 +442,10 @@ DATABAY_FREE_ELITE_LIMIT = max(50, min(int(os.getenv("DATABAY_FREE_ELITE_LIMIT",
 DATABAY_FREE_ANON_LIMIT = max(25, min(int(os.getenv("DATABAY_FREE_ANON_LIMIT", "90")), 250))
 EXTERNAL_FREE_EARLY_SLOTS = max(0, min(int(os.getenv("EXTERNAL_FREE_EARLY_SLOTS", "1")), 1))
 EXTERNAL_FREE_ESCALATED_SLOTS = max(EXTERNAL_FREE_EARLY_SLOTS, min(int(os.getenv("EXTERNAL_FREE_ESCALATED_SLOTS", "2")), 2))
+# Small neutral TLS/CONNECT warm-check budget for HProxy+Databay. It never calls eBay
+# and shares the existing SmartReserve worker pool, so it does not add concurrent
+# background threads beyond the already bounded preflight executor.
+EXTERNAL_FREE_PREFLIGHT_SLOTS = max(0, min(int(os.getenv("EXTERNAL_FREE_PREFLIGHT_SLOTS", "4")), 4))
 EXTERNAL_FREE_STATS_INTERVAL = max(60, int(os.getenv("EXTERNAL_FREE_STATS_INTERVAL", "300")))
 
 # Background SmartReserve may hold 12+ verified free proxies, but the real log showed that
@@ -1770,6 +1803,7 @@ class ExternalFreeSourceManager:
         self.credit_source_by_proxy = {}
         self.credit_source_at = {}
         self.turn = 0
+        self.preflight_turn = 0
         self.last_stats_log = 0.0
         self.stats = {
             name: {
@@ -1942,6 +1976,25 @@ class ExternalFreeSourceManager:
                 self.turn += 1
             return enabled, {name: list(self.snapshots[name]) for name in enabled}
 
+    def preflight_selection_snapshot(self):
+        """Independent round-robin snapshot for neutral TLS preflight.
+
+        Uses its own turn counter so background warming cannot change discovery ordering.
+        """
+        with self.lock:
+            enabled = []
+            if HPROXY_FREE_ENABLED and self.snapshots['hproxy']:
+                enabled.append('hproxy')
+            if DATABAY_FREE_ENABLED and self.snapshots['databay']:
+                enabled.append('databay')
+            if not enabled:
+                return [], {}
+            if len(enabled) > 1:
+                shift = self.preflight_turn % len(enabled)
+                enabled = enabled[shift:] + enabled[:shift]
+                self.preflight_turn += 1
+            return enabled, {name: list(self.snapshots[name]) for name in enabled}
+
     def claim_credit(self, proxy, source):
         if source not in self.stats:
             return
@@ -2078,6 +2131,9 @@ class ProxyManager:
 
         # Мягкий cross-surface penalty (auction <-> main) после eBay 403/429.
         self.soft_host_penalty_until = {}
+        # V6.35: separate cooldown used ONLY by background Webshare handoff scout.
+        # It intentionally does not participate in main discovery/candidate scoring.
+        self.handoff_scout_bad_until = {}
         self.last_reputation_prune = 0.0
 
     def _prune_reputation_locked(self, now):
@@ -2142,6 +2198,7 @@ class ProxyManager:
             self.last_failure_result.pop(proxy, None)
             self.last_failure_at.pop(proxy, None)
             self.standard_first_seen_at.pop(proxy, None)
+            self.handoff_scout_bad_until.pop(proxy, None)
             self.preflight_ok_until.pop(proxy, None)
             self.preflight_bad_until.pop(proxy, None)
             self.preflight_last_result.pop(proxy, None)
@@ -2172,6 +2229,8 @@ class ProxyManager:
             self.quality_last_result.pop(p, None)
         for host in [h for h, until in self.soft_host_penalty_until.items() if until <= now]:
             self.soft_host_penalty_until.pop(host, None)
+        for p in [p for p, until in self.handoff_scout_bad_until.items() if until <= now]:
+            self.handoff_scout_bad_until.pop(p, None)
         outage_cutoff = now - OUTAGE_HOST_MEMORY
         for host in [h for h, ts in self.outage_host_last_probe.items() if ts < outage_cutoff]:
             self.outage_host_last_probe.pop(host, None)
@@ -2777,6 +2836,8 @@ class ProxyManager:
                     continue
                 if self.bad_until.get(proxy, 0) > now or self.host_bad_until.get(host, 0) > now:
                     continue
+                if self.handoff_scout_bad_until.get(proxy, 0) > now:
+                    continue
                 if self.soft_host_penalty_until.get(host, 0) > now:
                     continue
                 if self._preflight_state_locked(proxy, now) == 'bad':
@@ -2799,6 +2860,32 @@ class ProxyManager:
                 if len(result) >= limit:
                     break
             return result
+
+    def mark_handoff_transient_failure(self, proxy, result):
+        """Isolate weak background-scout transport failures from main reputation.
+
+        Returns True only when the proxy was genuinely eBay-good in the recent-good
+        window and the scout failure is transient (timeout/error). In that case we
+        create a short HANDOFF-ONLY cooldown and leave main fail_streak/bad_until/
+        last_failure untouched. Hard evidence (403/429, SSL, CONNECT reject) must still
+        go through mark_failure() and protect the primary monitor.
+        """
+        if not proxy or result not in ('proxy_timeout', 'proxy_error'):
+            return False
+        now = time.time()
+        with self.lock:
+            if not self._is_recent_good_locked(proxy, now):
+                return False
+            until = now + WEBSHARE_HANDOFF_TRANSIENT_COOLDOWN
+            self.handoff_scout_bad_until[proxy] = max(
+                self.handoff_scout_bad_until.get(proxy, 0), until
+            )
+        logging.info(
+            f"🌉 Handoff-only cooldown {int(WEBSHARE_HANDOFF_TRANSIENT_COOLDOWN)} сек. "
+            f"для {_proxy_log_name(proxy)} после {result}; "
+            "main reputation/cooldown не изменены"
+        )
+        return True
 
     def remember_outage_attempt(self, proxy):
         if not proxy:
@@ -3065,6 +3152,58 @@ class ProxyManager:
             return None
         with self.lock:
             self.last_used[chosen] = now
+        return chosen
+
+    def get_external_quality_preflight_candidates(self, limit=4, excluded_hosts=None):
+        """Neutral TLS/CONNECT candidates from HProxy/Databay, max two per source.
+
+        This never performs an eBay request. A failed neutral tunnel is cached as
+        quality_bad and will be skipped later by real discovery; a successful tunnel gets
+        the existing quality bonus. This is especially useful for Databay where the real
+        logs show many CONNECT rejects despite the feed's HTTPS metadata.
+        """
+        limit = max(0, min(int(limit or 0), 4))
+        if limit <= 0 or not PROXY_QUALITY_PREFLIGHT_ENABLED:
+            return []
+        excluded_hosts = set(excluded_hosts or ())
+        order, snapshots = external_free_manager.preflight_selection_snapshot()
+        if not order:
+            return []
+        now = time.time()
+        chosen = []
+        chosen_hosts = set()
+        per_source_cap = 2
+        with self.lock:
+            self._cleanup_bad_locked()
+            for source in order:
+                rows = []
+                for proxy in snapshots.get(source, ()):
+                    host = _proxy_host(proxy)
+                    if not host or host in excluded_hosts or host in chosen_hosts:
+                        continue
+                    if self.bad_until.get(proxy, 0) > now or self.host_bad_until.get(host, 0) > now:
+                        continue
+                    if self.soft_host_penalty_until.get(host, 0) > now:
+                        continue
+                    if self._quality_state_locked(proxy, now) != 'unknown':
+                        continue
+                    if self._preflight_state_locked(proxy, now) == 'bad':
+                        continue
+                    rows.append(proxy)
+                rows.sort(key=lambda p: self._candidate_score_locked(p, now), reverse=True)
+                taken = 0
+                for proxy in rows:
+                    host = _proxy_host(proxy)
+                    if not host or host in chosen_hosts:
+                        continue
+                    chosen.append(proxy)
+                    chosen_hosts.add(host)
+                    self.last_used[proxy] = now
+                    taken += 1
+                    if len(chosen) >= limit or taken >= per_source_cap:
+                        break
+                if len(chosen) >= limit:
+                    break
         return chosen
 
     def get_external_free_candidates(self, max_total=1, excluded_hosts=None):
@@ -5360,13 +5499,120 @@ def _is_allowed_ebay_url(url):
     return any(host == suffix or host.endswith('.' + suffix) for suffix in allowed)
 
 
+def _normalize_ebay_url_candidate(raw):
+    """Normalize a Telegram/eBay URL candidate without following it."""
+    candidate = str(raw or '').strip().strip('<>')
+    candidate = candidate.rstrip(').,;]>}\"\'')
+    if not candidate:
+        return None
+    if not re.match(r'(?i)^https?://', candidate):
+        candidate = 'https://' + candidate.lstrip('/')
+    return candidate if _is_allowed_ebay_url(candidate) else None
+
+
 def extract_ebay_urls(text):
+    """Extract literal and scheme-less eBay URLs from plain text.
+
+    Telegram/iOS may paste ``www.ebay.co.uk/...`` without ``https://``.  The old
+    extractor silently ignored such a message and then acknowledged its update_id.
+    """
     urls = []
-    for raw in re.findall(r'https?://[^\s<>]+', text or '', flags=re.I):
-        url = raw.rstrip(').,;]>}\"\'')
-        if _is_allowed_ebay_url(url) and url not in urls:
-            urls.append(url)
+    seen = set()
+    source = str(text or '')
+    patterns = (
+        r'https?://[^\s<>]+',
+        r'(?<![\w@])(?:www\.)?(?:[A-Za-z0-9-]+\.)*ebay\.(?:co\.uk|com|us)(?:/[^\s<>]*)?',
+    )
+    for pattern in patterns:
+        for raw in re.findall(pattern, source, flags=re.I):
+            url = _normalize_ebay_url_candidate(raw)
+            if url and url not in seen:
+                seen.add(url)
+                urls.append(url)
     return urls
+
+
+def _telegram_utf16_slice(text, offset, length):
+    """Slice Telegram entity text using Telegram's UTF-16 code-unit offsets."""
+    try:
+        raw = str(text or '').encode('utf-16-le')
+        start = max(0, int(offset or 0)) * 2
+        end = start + max(0, int(length or 0)) * 2
+        return raw[start:end].decode('utf-16-le', errors='ignore')
+    except Exception:
+        return ''
+
+
+def _telegram_message_raw_url_candidates(message):
+    """Return URL candidates from text/caption and Telegram URL entities.
+
+    A ``text_link`` entity can hide the real URL behind visible product-title text, so
+    looking at ``message['text']`` alone is not sufficient.  Caption entities are handled
+    too because forwarded/shared listings can arrive as media captions.
+    """
+    message = message or {}
+    candidates = []
+    for text_key, entities_key in (('text', 'entities'), ('caption', 'caption_entities')):
+        body = str(message.get(text_key) or '')
+        if body:
+            candidates.extend(extract_ebay_urls(body))
+        for entity in message.get(entities_key) or []:
+            etype = str(entity.get('type') or '')
+            raw_url = None
+            if etype == 'text_link':
+                raw_url = entity.get('url')
+            elif etype == 'url':
+                raw_url = _telegram_utf16_slice(
+                    body, entity.get('offset', 0), entity.get('length', 0)
+                )
+            if raw_url:
+                candidates.append(str(raw_url))
+
+    # Defensive coverage for less common Telegram representations.  Incoming link-preview
+    # metadata and inline-keyboard buttons can carry a URL that is not literally present in
+    # text/caption.  They are cheap to inspect and eliminate another possible silent-drop path.
+    preview = message.get('link_preview_options') or {}
+    if preview.get('url'):
+        candidates.append(str(preview.get('url')))
+    keyboard = (message.get('reply_markup') or {}).get('inline_keyboard') or []
+    for row in keyboard:
+        for button in row or []:
+            if isinstance(button, dict) and button.get('url'):
+                candidates.append(str(button.get('url')))
+    return candidates
+
+
+def extract_ebay_urls_from_telegram_message(message):
+    """Robust eBay URL extraction for Telegram messages/captions/entities."""
+    urls = []
+    seen = set()
+    for raw in _telegram_message_raw_url_candidates(message):
+        # ``raw`` may already be normalized by extract_ebay_urls() or may come directly
+        # from a Telegram text_link entity.
+        normalized = _normalize_ebay_url_candidate(raw)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            urls.append(normalized)
+    return urls
+
+
+def telegram_message_has_ebay_signal(message):
+    """Detect an eBay-looking message so it can never be silently acknowledged."""
+    message = message or {}
+    for key in ('text', 'caption'):
+        if 'ebay.' in str(message.get(key) or '').lower():
+            return True
+    for key in ('entities', 'caption_entities'):
+        for entity in message.get(key) or []:
+            if 'ebay.' in str(entity.get('url') or '').lower():
+                return True
+    if 'ebay.' in str((message.get('link_preview_options') or {}).get('url') or '').lower():
+        return True
+    for row in (message.get('reply_markup') or {}).get('inline_keyboard') or []:
+        for button in row or []:
+            if isinstance(button, dict) and 'ebay.' in str(button.get('url') or '').lower():
+                return True
+    return False
 
 
 def extract_ebay_item_id_any(url, html=None):
@@ -8635,9 +8881,19 @@ def telegram_listener():
                     if callback:
                         handle_telegram_callback(callback)
                     else:
-                        message = update.get('message')
+                        # Besides ordinary text messages, accept edited messages and channel
+                        # posts.  Duplicate auction protection is ItemID/queue-key based, so an
+                        # edited/replayed update is safe and cannot create a second durable job.
+                        message = (
+                            update.get('message')
+                            or update.get('edited_message')
+                            or update.get('channel_post')
+                            or update.get('edited_channel_post')
+                            or update.get('business_message')
+                            or update.get('edited_business_message')
+                        )
                         if message and str(message.get('chat', {}).get('id')) == str(TELEGRAM_CHAT_ID):
-                            text = message.get('text', '').strip()
+                            text = str(message.get('text') or '').strip()
                             if text == '/stop':
                                 is_paused = True
                                 send_telegram_message(
@@ -8668,8 +8924,18 @@ def telegram_listener():
                                     else:
                                         send_telegram_message(f"ℹ️ Активный лот <b>{item_id}</b> в списке не найден.")
                             else:
-                                ebay_urls = extract_ebay_urls(text)
+                                ebay_urls = extract_ebay_urls_from_telegram_message(message)
                                 if ebay_urls:
+                                    logging.info(
+                                        f"📨 Telegram eBay update {update_id}: распознано {len(ebay_urls)} URL; "
+                                        f"text_len={len(str(message.get('text') or ''))}, "
+                                        f"caption_len={len(str(message.get('caption') or ''))}"
+                                    )
+                                    if len(ebay_urls) > 20:
+                                        logging.warning(
+                                            f"Telegram update {update_id}: получено {len(ebay_urls)} eBay URL; "
+                                            "обрабатываем первые 20"
+                                        )
                                     for ebay_url in ebay_urls[:20]:
                                         (
                                             key, item_id, canonical_url, existing_message_id,
@@ -8691,6 +8957,29 @@ def telegram_listener():
                                             )
                                             if msg_id:
                                                 set_auction_link_status_message(key, msg_id)
+                                            else:
+                                                # Queue insert is already COMMITted, so a Telegram
+                                                # send failure cannot lose the auction.  The worker's
+                                                # final pending/exact publication will create a new
+                                                # message if there is no status_message_id.
+                                                logging.warning(
+                                                    f"⚠️ Auction {item_id or key} сохранён в очереди, "
+                                                    "но Telegram не подтвердил жёлтый status-message; "
+                                                    "финальный результат всё равно будет опубликован worker-ом"
+                                                )
+                                elif telegram_message_has_ebay_signal(message):
+                                    # Critical anti-silence guard: never ACK an eBay-looking update
+                                    # without telling the user that its URL could not be parsed.
+                                    logging.warning(
+                                        f"⚠️ Telegram eBay update {update_id} не удалось распознать: "
+                                        f"text_len={len(str(message.get('text') or ''))}, "
+                                        f"caption_len={len(str(message.get('caption') or ''))}"
+                                    )
+                                    send_telegram_message(
+                                        "⚠️ <b>Я вижу сообщение с eBay, но не смог распознать ссылку.</b>\n\n"
+                                        "Пожалуйста, отправьте полный URL лота ещё раз. "
+                                        "Сообщение не было принято как аукцион."
+                                    )
                     # ВАЖНО: update считается обработанным только после того, как все
                     # необходимые durable DB-операции (включая enqueue auction link) завершились.
                     update_processed_ok = True
@@ -9403,9 +9692,15 @@ def webshare_handoff_worker():
 
                         close_session(session)
                         if result != 'profile_error':
-                            proxy_manager.mark_failure(
-                                candidate, result, reason=f'{result} during Webshare handoff scout'
-                            )
+                            # V6.35: the handoff scout is background/opportunistic. A transient
+                            # timeout/error on a recently eBay-good FREE proxy is weak evidence
+                            # and must not remove that proxy from PRIMARY failover for minutes.
+                            # Keep hard signals (403/429, SSL, CONNECT reject, etc.) unchanged.
+                            isolated = proxy_manager.mark_handoff_transient_failure(candidate, result)
+                            if not isolated:
+                                proxy_manager.mark_failure(
+                                    candidate, result, reason=f'{result} during Webshare handoff scout'
+                                )
                             _auction_proxy_soft_host_penalty(candidate, result)
 
                 if winner is not None:
@@ -9652,7 +9947,7 @@ def fetch_ebay_html_with_fixed_pair():
     # construction itself ever failed, background workers must not remain paused by a
     # stale event. From this point main failover owns the network/memory budget.
     executor = ThreadPoolExecutor(
-        max_workers=PROBE_DEEP_CONCURRENCY,
+        max_workers=PROBE_MAX_CONCURRENCY,
         thread_name_prefix='proxy-probe',
     )
     main_discovery_active_event.set()
@@ -9674,6 +9969,19 @@ def fetch_ebay_html_with_fixed_pair():
         elif (rss_now is not None and rss_now >= MEMORY_HIGH_MB) or memory_pressure_event.is_set():
             desired = PROBE_CONCURRENCY
             reason = f'high-memory RSS≈{rss_now:.0f}MB' if rss_now is not None else 'memory-pressure'
+        # Do not enter 7/8-worker burst when RSS is already elevated. This intermediate
+        # guard preserves a wide margin below the 450/485 MB protective thresholds.
+        elif rss_now is not None and rss_now >= PROBE_BURST_MEMORY_CEILING_MB:
+            desired = PROBE_DEEP_CONCURRENCY if elapsed_now >= PROBE_DEEP_ESCALATE_AFTER else (
+                PROBE_ESCALATED_CONCURRENCY if elapsed_now >= PROBE_ESCALATE_AFTER else PROBE_CONCURRENCY
+            )
+            reason = f'burst-memory-cap RSS≈{rss_now:.0f}MB'
+        elif elapsed_now >= PROBE_MAX_ESCALATE_AFTER:
+            desired = PROBE_MAX_CONCURRENCY
+            reason = f'elapsed={elapsed_now:.1f}s'
+        elif elapsed_now >= PROBE_BURST_ESCALATE_AFTER:
+            desired = PROBE_BURST_CONCURRENCY
+            reason = f'elapsed={elapsed_now:.1f}s'
         elif elapsed_now >= PROBE_DEEP_ESCALATE_AFTER:
             desired = PROBE_DEEP_CONCURRENCY
             reason = f'elapsed={elapsed_now:.1f}s'
@@ -9913,7 +10221,7 @@ def fetch_ebay_html_with_fixed_pair():
                 batch_kinds[transient] = 'Transient re-probe'
                 logging.info(f"♻️ Emergency transient re-probe после cooldown: {_proxy_log_name(transient)}")
 
-            # V6.32: diversity from HProxy/Databay without letting unproven public feeds
+            # V6.32/V6.33: diversity from HProxy/Databay without letting unproven public feeds
             # monopolize the workers. Before escalation only ONE external slot is allowed;
             # after ~8s at most two (one per source) may run in parallel.
             external_slot_cap = (
@@ -10885,13 +11193,26 @@ def proxy_preflight_warm_worker():
                     if quality_before < PROXY_PREFLIGHT_RESERVE_TARGET
                     else PROXY_PREFLIGHT_MAINTENANCE_BATCH
                 )
-                candidates = proxy_manager.get_quality_preflight_candidates(
-                    batch_limit,
+                # Reserve a small part of the existing preflight batch for HProxy/Databay.
+                # These checks are neutral CONNECT+TLS only (no eBay), so bad external
+                # endpoints are filtered before they can consume scarce discovery slots.
+                external_candidates = proxy_manager.get_external_quality_preflight_candidates(
+                    min(EXTERNAL_FREE_PREFLIGHT_SLOTS, batch_limit),
                     excluded_hosts=excluded,
                 )
+                external_hosts = {_proxy_host(p) for p in external_candidates if _proxy_host(p)}
+                base_limit = max(0, batch_limit - len(external_candidates))
+                candidates = proxy_manager.get_quality_preflight_candidates(
+                    base_limit,
+                    excluded_hosts=excluded | external_hosts,
+                )
+                candidates.extend(external_candidates)
+                external_candidate_set = set(external_candidates)
 
                 checked = 0
                 ok_count = 0
+                external_checked = 0
+                external_ok = 0
                 reason_counts = {}
                 if candidates:
                     with ThreadPoolExecutor(
@@ -10902,14 +11223,19 @@ def proxy_preflight_warm_worker():
                             executor.submit(_quality_https_preflight_proxy, p): p
                             for p in candidates
                         }
-                        for future in future_map:
+                        for future, checked_proxy in future_map.items():
                             checked += 1
+                            is_external = checked_proxy in external_candidate_set
+                            if is_external:
+                                external_checked += 1
                             try:
                                 ok, reason = future.result()
                             except Exception:
                                 ok, reason = False, 'proxy_error'
                             if ok:
                                 ok_count += 1
+                                if is_external:
+                                    external_ok += 1
                             else:
                                 reason = reason or 'proxy_error'
                                 reason_counts[reason] = reason_counts.get(reason, 0) + 1
@@ -10920,9 +11246,13 @@ def proxy_preflight_warm_worker():
                     failure_summary = ', '.join(
                         f"{k}={v}" for k, v in sorted(reason_counts.items())
                     ) or 'нет'
+                    ext_suffix = (
+                        f", external_preflight={external_checked}/{external_ok}"
+                        if external_checked else ""
+                    )
                     logging.info(
                         f"🧪 Smart reserve: HTTPS-ready={quality_after}, TCP-only={tcp_after}; "
-                        f"проверено={checked}, quality_ok={ok_count}, failures[{failure_summary}]"
+                        f"проверено={checked}, quality_ok={ok_count}{ext_suffix}, failures[{failure_summary}]"
                     )
             else:
                 candidates = proxy_manager.get_preflight_candidates(
@@ -10982,7 +11312,7 @@ def bot_worker():
     seen_line = f"\n📚 В базе: {seen_total} товаров." if seen_total is not None else ""
     send_telegram_message(
         startup_line +
-        "\n🇬🇧 eBay UK monitor v6.32 HProxy+Databay работает." +
+        "\n🇬🇧 eBay UK monitor v6.35 HandoffSafe+ReliableTelegram+AdaptiveBurst работает." +
         seen_line +
         "\nКоманды: /stop /start /list (/auctions) /delauction НОМЕР_ЛОТА"
         "\nМожно отправить ссылку на eBay-аукцион — сохраню точное время и напомню заранее."
@@ -11053,7 +11383,7 @@ def start_leader_workers():
     leader_active_event.set()
     logging.info("👑 Эта Render-копия стала leader; запускаем фоновые worker-ы")
     logging.info(
-        "🌐 Multi-provider v6.32: "
+        "🌐 Multi-provider v6.35: "
         f"ProxyScrape Premium={'ON' if PROXYSCRAPE_PREMIUM_API_KEY else 'OFF'}, "
         f"Webshare={'ON (' + str(len(WEBSHARE_API_KEYS)) + ' account(s))' if WEBSHARE_API_KEYS else 'OFF'}, "
         f"Webshare first-batch={'ON (1-2 unique-host slots; extra keys=bandwidth)' if WEBSHARE_FIRST_BATCH else 'OFF'}, "
@@ -11062,11 +11392,19 @@ def start_leader_workers():
         f"premium403-throttle/circuit={PREMIUM_BLOCK_THROTTLE_STREAK}/{PREMIUM_BLOCK_CIRCUIT_STREAK}"
     )
     logging.info(
-        f"🧭 External FREE v6.32: HProxy={'ON' if HPROXY_FREE_ENABLED else 'OFF'} "
+        f"🧭 External FREE v6.35: HProxy={'ON' if HPROXY_FREE_ENABLED else 'OFF'} "
         f"(HTTPS, elite+anonymous, cap={HPROXY_FREE_ELITE_LIMIT + HPROXY_FREE_ANON_LIMIT}), "
         f"Databay={'ON' if DATABAY_FREE_ENABLED else 'OFF'} "
         f"(HTTPS strict+fast, elite+anonymous, cap={DATABAY_FREE_ELITE_LIMIT + DATABAY_FREE_ANON_LIMIT}); "
-        f"slots={EXTERNAL_FREE_EARLY_SLOTS} early/{EXTERNAL_FREE_ESCALATED_SLOTS} escalated"
+        f"slots={EXTERNAL_FREE_EARLY_SLOTS} early/{EXTERNAL_FREE_ESCALATED_SLOTS} escalated, "
+        f"neutral_preflight={EXTERNAL_FREE_PREFLIGHT_SLOTS}"
+    )
+    logging.info(
+        f"⚡ Adaptive discovery v6.35: {PROBE_CONCURRENCY}→{PROBE_ESCALATED_CONCURRENCY}→"
+        f"{PROBE_DEEP_CONCURRENCY}→{PROBE_BURST_CONCURRENCY}→{PROBE_MAX_CONCURRENCY} workers "
+        f"at ~0/{PROBE_ESCALATE_AFTER:.0f}/{PROBE_DEEP_ESCALATE_AFTER:.0f}/"
+        f"{PROBE_BURST_ESCALATE_AFTER:.0f}/{PROBE_MAX_ESCALATE_AFTER:.0f}s; "
+        f"7/8-worker burst only while RSS<{PROBE_BURST_MEMORY_CEILING_MB} MB"
     )
     rss = _memory_rss_mb()
     logging.info(
@@ -11076,6 +11414,8 @@ def start_leader_workers():
     )
 
     threading.Thread(target=telegram_listener, daemon=True, name='telegram-listener').start()
+    logging.info("📨 Telegram intake v6.35: text+caption+URL/text_link entities; eBay-сообщения больше не игнорируются молча")
+    logging.info(f"🌉 Handoff-safe v6.35: recent-good transient scout failures are isolated for {WEBSHARE_HANDOFF_TRANSIENT_COOLDOWN:.0f}s; main cooldown untouched")
     threading.Thread(target=connection_watchdog, daemon=True, name='connection-watchdog').start()
     threading.Thread(target=memory_guard_worker, daemon=True, name='memory-guard-worker').start()
     threading.Thread(target=restart_sticky_persist_worker, daemon=True, name='restart-sticky-persist').start()
@@ -11122,7 +11462,7 @@ def leader_supervisor():
 @app.route('/')
 def index():
     role = "leader" if leader_active_event.is_set() else "standby"
-    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.32 HProxy+Databay, {role})"
+    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.35 HandoffSafe+ReliableTelegram+AdaptiveBurst, {role})"
 
 
 @app.route('/health')
