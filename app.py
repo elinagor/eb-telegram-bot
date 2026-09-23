@@ -122,8 +122,35 @@ PROBE_MAX_ESCALATE_AFTER = max(
     PROBE_BURST_ESCALATE_AFTER + 5.0,
     float(os.getenv("PROBE_MAX_ESCALATE_AFTER", "38")),
 )
+# V6.37: 9/10 workers are NOT a normal discovery width. They unlock only after a
+# genuinely long outage measured across discovery cycles (the normal 75-second cycle
+# can restart without resetting this outage age). This lets us scan a large bad pool
+# faster after 1-2 minutes without increasing the usual eBay burst.
+PROBE_LONG_OUTAGE_CONCURRENCY = max(
+    PROBE_MAX_CONCURRENCY,
+    min(int(os.getenv("PROBE_LONG_OUTAGE_CONCURRENCY", "9")), 9),
+)
+PROBE_LONG_OUTAGE_AFTER = max(60.0, float(os.getenv("PROBE_LONG_OUTAGE_AFTER", "75")))
+PROBE_EXTREME_OUTAGE_CONCURRENCY = max(
+    PROBE_LONG_OUTAGE_CONCURRENCY,
+    min(int(os.getenv("PROBE_EXTREME_OUTAGE_CONCURRENCY", "10")), 10),
+)
+PROBE_EXTREME_OUTAGE_AFTER = max(
+    PROBE_LONG_OUTAGE_AFTER + 15.0,
+    float(os.getenv("PROBE_EXTREME_OUTAGE_AFTER", "120")),
+)
 PROBE_BURST_MEMORY_CEILING_MB = max(
     340, min(int(os.getenv("PROBE_BURST_MEMORY_CEILING_MB", "390")), 420)
+)
+# 9/10-worker mode gets a stricter memory gate than the existing 7/8 burst. With the
+# observed production RSS around 245-326 MB this still leaves substantial headroom
+# below Render's 512 MB cap, while refusing long-outage escalation if RSS is elevated.
+PROBE_LONG_OUTAGE_MEMORY_CEILING_MB = max(
+    320,
+    min(
+        int(os.getenv("PROBE_LONG_OUTAGE_MEMORY_CEILING_MB", "370")),
+        PROBE_BURST_MEMORY_CEILING_MB,
+    ),
 )
 PROBE_CONNECT_TIMEOUT = float(os.getenv("PROBE_CONNECT_TIMEOUT", "3.5"))
 # В старой версии после 45 сек. timeout искусственно увеличивался до 4.5/12 и один
@@ -298,7 +325,7 @@ PROXY_QUALITY_BAD_TTL = max(20, int(os.getenv("PROXY_QUALITY_BAD_TTL", "45")))
 # v6.20 за ~53 минуты сделал ~1684 neutral quality-checks; при этом для быстрого failover
 # реально достаточно короткой первой wave из 4 verified-free. Поэтому держим ~8 свежих
 # HTTPS-capable резервов, а не 12+, и уменьшаем тяжёлый background batch без потери fallback.
-PROXY_PREFLIGHT_WARM_BATCH = max(4, min(int(os.getenv("PROXY_PREFLIGHT_WARM_BATCH", "12")), 24))
+PROXY_PREFLIGHT_WARM_BATCH = max(4, min(int(os.getenv("PROXY_PREFLIGHT_WARM_BATCH", "15")), 30))
 # V6.26 AdaptiveFast: keep the same reserve depth, but limit simultaneous TLS handshakes.
 # This does NOT slow the 15-27 second main eBay checks; it only lowers background peak RAM.
 PROXY_PREFLIGHT_WARM_CONCURRENCY = max(
@@ -306,14 +333,14 @@ PROXY_PREFLIGHT_WARM_CONCURRENCY = max(
 )
 PROXY_PREFLIGHT_WARM_INTERVAL = max(10.0, float(os.getenv("PROXY_PREFLIGHT_WARM_INTERVAL", "20")))
 PROXY_PREFLIGHT_RESERVE_TARGET = max(
-    4, min(int(os.getenv("PROXY_PREFLIGHT_RESERVE_TARGET", "8")), 24)
+    4, min(int(os.getenv("PROXY_PREFLIGHT_RESERVE_TARGET", "10")), 30)
 )
 PROXY_PREFLIGHT_MAINTENANCE_BATCH = max(
-    2, min(int(os.getenv("PROXY_PREFLIGHT_MAINTENANCE_BATCH", "4")), 8)
+    2, min(int(os.getenv("PROXY_PREFLIGHT_MAINTENANCE_BATCH", "5")), 10)
 )
 PROXY_PREFLIGHT_RETAIN_MAX = max(
     PROXY_PREFLIGHT_RESERVE_TARGET,
-    min(int(os.getenv("PROXY_PREFLIGHT_RETAIN_MAX", "48")), 96),
+    min(int(os.getenv("PROXY_PREFLIGHT_RETAIN_MAX", "60")), 120),
 )
 
 # Если первый fixed request уже висел очень долго, второй recovery только откладывает failover.
@@ -364,10 +391,10 @@ def _collect_proxio_api_keys():
 
     Supported forms:
       * PROXIO_API_KEYS="key1,key2,..."
-      * PROXIO_API_KEY / PROXIO_API_KEY_1 ... PROXIO_API_KEY_8
+      * PROXIO_API_KEY / PROXIO_API_KEY_1 ... PROXIO_API_KEY_16
 
     A single API request uses exactly one key. Keys are rotated so five 100-call/day
-    accounts act as one quota pool instead of five parallel API calls.
+    accounts act as one quota pool instead of parallel API calls.
     """
     values = []
     legacy = (os.getenv("PROXIO_API_KEY") or "").strip()
@@ -379,7 +406,7 @@ def _collect_proxio_api_keys():
             value = value.strip()
             if value:
                 values.append(value)
-    for idx in range(1, 9):
+    for idx in range(1, 17):
         value = (os.getenv(f"PROXIO_API_KEY_{idx}") or "").strip()
         if value:
             values.append(value)
@@ -499,7 +526,7 @@ EXTERNAL_FREE_ESCALATED_SLOTS = max(EXTERNAL_FREE_EARLY_SLOTS, min(int(os.getenv
 # Small neutral TLS/CONNECT warm-check budget for HProxy+Databay+Proxio. It never calls eBay
 # and shares the existing SmartReserve worker pool, so it does not add concurrent
 # background threads beyond the already bounded preflight executor.
-EXTERNAL_FREE_PREFLIGHT_SLOTS = max(0, min(int(os.getenv("EXTERNAL_FREE_PREFLIGHT_SLOTS", "4")), 4))
+EXTERNAL_FREE_PREFLIGHT_SLOTS = max(0, min(int(os.getenv("EXTERNAL_FREE_PREFLIGHT_SLOTS", "5")), 6))
 EXTERNAL_FREE_STATS_INTERVAL = max(60, int(os.getenv("EXTERNAL_FREE_STATS_INTERVAL", "300")))
 
 # Background SmartReserve may hold 12+ verified free proxies, but the real log showed that
@@ -3586,16 +3613,17 @@ class ProxyManager:
             self.last_used[chosen] = now
         return chosen
 
-    def get_external_quality_preflight_candidates(self, limit=4, excluded_hosts=None):
+    def get_external_quality_preflight_candidates(self, limit=5, excluded_hosts=None):
         """Neutral TLS/CONNECT candidates from HProxy/Databay/Proxio.
 
-        At most four existing SmartReserve slots are used; this never increases thread or
-        eBay-request concurrency. Fairness is source-first (one unknown candidate from each
-        enabled feed before any feed receives a second slot), so Proxio is sampled without
-        crowding out the proven HProxy/Databay paths. Successful preflight keeps source credit
-        when the proxy later moves through warm reserve.
+        Uses up to the configured SmartReserve external slots (five by default in v6.37); this
+        never increases eBay-request concurrency and still runs inside the bounded SmartReserve
+        executor. Fairness is
+        source-first (one unknown candidate from each enabled feed before any feed receives a
+        second slot), so Proxio is sampled without crowding out the proven HProxy/Databay paths.
+        Successful preflight keeps source credit when the proxy later moves through warm reserve.
         """
-        limit = max(0, min(int(limit or 0), 4))
+        limit = max(0, min(int(limit or 0), EXTERNAL_FREE_PREFLIGHT_SLOTS))
         if limit <= 0 or not PROXY_QUALITY_PREFLIGHT_ENABLED:
             return []
         excluded_hosts = set(excluded_hosts or ())
@@ -10417,7 +10445,7 @@ def fetch_ebay_html_with_fixed_pair():
     # construction itself ever failed, background workers must not remain paused by a
     # stale event. From this point main failover owns the network/memory budget.
     executor = ThreadPoolExecutor(
-        max_workers=PROBE_MAX_CONCURRENCY,
+        max_workers=PROBE_EXTREME_OUTAGE_CONCURRENCY,
         thread_name_prefix='proxy-probe',
     )
     main_discovery_active_event.set()
@@ -10446,21 +10474,38 @@ def fetch_ebay_html_with_fixed_pair():
                 PROBE_ESCALATED_CONCURRENCY if elapsed_now >= PROBE_ESCALATE_AFTER else PROBE_CONCURRENCY
             )
             reason = f'burst-memory-cap RSS≈{rss_now:.0f}MB'
-        elif elapsed_now >= PROBE_MAX_ESCALATE_AFTER:
-            desired = PROBE_MAX_CONCURRENCY
-            reason = f'elapsed={elapsed_now:.1f}s'
-        elif elapsed_now >= PROBE_BURST_ESCALATE_AFTER:
-            desired = PROBE_BURST_CONCURRENCY
-            reason = f'elapsed={elapsed_now:.1f}s'
-        elif elapsed_now >= PROBE_DEEP_ESCALATE_AFTER:
-            desired = PROBE_DEEP_CONCURRENCY
-            reason = f'elapsed={elapsed_now:.1f}s'
-        elif elapsed_now >= PROBE_ESCALATE_AFTER:
-            desired = PROBE_ESCALATED_CONCURRENCY
-            reason = f'elapsed={elapsed_now:.1f}s'
         else:
-            desired = PROBE_CONCURRENCY
-            reason = f'elapsed={elapsed_now:.1f}s'
+            outage_elapsed, _, _ = _connection_outage_snapshot()
+            # V6.37 long-outage acceleration. A stricter RSS gate prevents the two extra
+            # full-page responses from consuming the last memory reserve. When memory is
+            # elevated we keep the proven <=8-worker ladder instead of disabling discovery.
+            if (
+                outage_elapsed >= PROBE_EXTREME_OUTAGE_AFTER
+                and (rss_now is None or rss_now < PROBE_LONG_OUTAGE_MEMORY_CEILING_MB)
+            ):
+                desired = PROBE_EXTREME_OUTAGE_CONCURRENCY
+                reason = f'outage={outage_elapsed:.1f}s, elapsed={elapsed_now:.1f}s'
+            elif (
+                outage_elapsed >= PROBE_LONG_OUTAGE_AFTER
+                and (rss_now is None or rss_now < PROBE_LONG_OUTAGE_MEMORY_CEILING_MB)
+            ):
+                desired = PROBE_LONG_OUTAGE_CONCURRENCY
+                reason = f'outage={outage_elapsed:.1f}s, elapsed={elapsed_now:.1f}s'
+            elif elapsed_now >= PROBE_MAX_ESCALATE_AFTER:
+                desired = PROBE_MAX_CONCURRENCY
+                reason = f'elapsed={elapsed_now:.1f}s'
+            elif elapsed_now >= PROBE_BURST_ESCALATE_AFTER:
+                desired = PROBE_BURST_CONCURRENCY
+                reason = f'elapsed={elapsed_now:.1f}s'
+            elif elapsed_now >= PROBE_DEEP_ESCALATE_AFTER:
+                desired = PROBE_DEEP_CONCURRENCY
+                reason = f'elapsed={elapsed_now:.1f}s'
+            elif elapsed_now >= PROBE_ESCALATE_AFTER:
+                desired = PROBE_ESCALATED_CONCURRENCY
+                reason = f'elapsed={elapsed_now:.1f}s'
+            else:
+                desired = PROBE_CONCURRENCY
+                reason = f'elapsed={elapsed_now:.1f}s'
 
         if desired != last_concurrency_logged:
             if last_concurrency_logged is not None:
@@ -10469,7 +10514,6 @@ def fetch_ebay_html_with_fixed_pair():
                 )
             last_concurrency_logged = desired
         return desired
-
     def maybe_mid_refresh_standard():
         nonlocal standard_mid_refresh_used
         if standard_mid_refresh_used:
@@ -10805,8 +10849,30 @@ def fetch_ebay_html_with_fixed_pair():
             attempts += 1
             kind = batch_kinds.get(proxy, 'Probe')
             source = provider_manager.source_fast(proxy)
-            if source == 'free' and kind not in ('HProxy probe', 'Databay probe'):
-                external_free_manager.claim_credit(proxy, 'proxyscrape')
+            if source == 'free':
+                # Preserve the original external-feed attribution when a HProxy/Databay/Proxio
+                # endpoint was neutral-preflighted earlier and is now consumed through the
+                # generic warm/re-probe path. v6.37 previously preserved only a *direct*
+                # "Proxio reserve probe", so successful warm Proxio candidates could still be
+                # misreported as ProxyScrape. Fresh generic/emergency ProxyScrape candidates
+                # are explicitly credited to proxyscrape.
+                direct_external_kinds = ('HProxy probe', 'Databay probe', 'Proxio reserve probe')
+                preserve_external_kinds = (
+                    'HTTPS reserve', 'Warm standby', 'Re-probe',
+                    'Transient re-probe', 'Final known-good re-probe',
+                )
+                existing_external_source = external_free_manager.credit_source_fast(proxy)
+                if kind in direct_external_kinds:
+                    pass  # get_external_free_candidates() already claimed the exact source.
+                elif (
+                    kind in preserve_external_kinds
+                    and existing_external_source in ('hproxy', 'databay', 'proxio')
+                ):
+                    # Refresh diagnostic credit so the following discovery/fixed result and
+                    # winner are attributed to the source that actually supplied this reserve.
+                    external_free_manager.claim_credit(proxy, existing_external_source)
+                else:
+                    external_free_manager.claim_credit(proxy, 'proxyscrape')
             if source != 'free' and kind == 'Probe':
                 kind = 'Premium probe' if source == 'proxyscrape_premium' else 'Webshare rescue'
             limit_label = f"{MAX_SEARCH_ATTEMPTS}+1" if is_final_extra else str(MAX_SEARCH_ATTEMPTS)
@@ -11790,7 +11856,7 @@ def bot_worker():
     seen_line = f"\n📚 В базе: {seen_total} товаров." if seen_total is not None else ""
     send_telegram_message(
         startup_line +
-        "\n🇬🇧 eBay UK monitor v6.36 ProxioReserveQuotaSafe+HandoffSafe+ReliableTelegram+AdaptiveBurst работает." +
+        "\n🇬🇧 eBay UK monitor v6.37r ProxioStatsFix+DeepReserve+Adaptive10+HandoffSafe работает." +
         seen_line +
         "\nКоманды: /stop /start /list (/auctions) /delauction НОМЕР_ЛОТА"
         "\nМожно отправить ссылку на eBay-аукцион — сохраню точное время и напомню заранее."
@@ -11861,7 +11927,7 @@ def start_leader_workers():
     leader_active_event.set()
     logging.info("👑 Эта Render-копия стала leader; запускаем фоновые worker-ы")
     logging.info(
-        "🌐 Multi-provider v6.36: "
+        "🌐 Multi-provider v6.37r: "
         f"ProxyScrape Premium={'ON' if PROXYSCRAPE_PREMIUM_API_KEY else 'OFF'}, "
         f"Webshare={'ON (' + str(len(WEBSHARE_API_KEYS)) + ' account(s))' if WEBSHARE_API_KEYS else 'OFF'}, "
         f"Webshare first-batch={'ON (1-2 unique-host slots; extra keys=bandwidth)' if WEBSHARE_FIRST_BATCH else 'OFF'}, "
@@ -11872,7 +11938,7 @@ def start_leader_workers():
     proxio_calls_day = int((86400 + PROXIO_FREE_REFRESH - 1) // PROXIO_FREE_REFRESH) if PROXIO_FREE_ENABLED else 0
     proxio_calls_per_key = (proxio_calls_day / len(PROXIO_API_KEYS)) if PROXIO_API_KEYS else 0.0
     logging.info(
-        f"🧭 External sources v6.36: HProxy={'ON' if HPROXY_FREE_ENABLED else 'OFF'} "
+        f"🧭 External sources v6.37r: HProxy={'ON' if HPROXY_FREE_ENABLED else 'OFF'} "
         f"(HTTPS, elite+anonymous, cap={HPROXY_FREE_ELITE_LIMIT + HPROXY_FREE_ANON_LIMIT}), "
         f"Databay={'ON' if DATABAY_FREE_ENABLED else 'OFF'} "
         f"(HTTPS strict+fast, elite+anonymous, cap={DATABAY_FREE_ELITE_LIMIT + DATABAY_FREE_ANON_LIMIT}), "
@@ -11880,14 +11946,16 @@ def start_leader_workers():
         f"(Elite HTTPS, cap={PROXIO_SNAPSHOT_LIMIT}, refresh={PROXIO_FREE_REFRESH}s, "
         f"designed≈{proxio_calls_day} calls/day total≈{proxio_calls_per_key:.1f}/key); "
         f"eBay slots={EXTERNAL_FREE_EARLY_SLOTS} early/{EXTERNAL_FREE_ESCALATED_SLOTS} escalated, "
-        f"neutral_preflight={EXTERNAL_FREE_PREFLIGHT_SLOTS}, global ceiling={PROBE_MAX_CONCURRENCY}"
+        f"neutral_preflight={EXTERNAL_FREE_PREFLIGHT_SLOTS}, normal ceiling={PROBE_MAX_CONCURRENCY}, long-outage ceiling={PROBE_EXTREME_OUTAGE_CONCURRENCY}"
     )
     logging.info(
-        f"⚡ Adaptive discovery v6.36: {PROBE_CONCURRENCY}→{PROBE_ESCALATED_CONCURRENCY}→"
-        f"{PROBE_DEEP_CONCURRENCY}→{PROBE_BURST_CONCURRENCY}→{PROBE_MAX_CONCURRENCY} workers "
-        f"at ~0/{PROBE_ESCALATE_AFTER:.0f}/{PROBE_DEEP_ESCALATE_AFTER:.0f}/"
-        f"{PROBE_BURST_ESCALATE_AFTER:.0f}/{PROBE_MAX_ESCALATE_AFTER:.0f}s; "
-        f"7/8-worker burst only while RSS<{PROBE_BURST_MEMORY_CEILING_MB} MB"
+        f"⚡ Adaptive discovery v6.37r: normal {PROBE_CONCURRENCY}→{PROBE_ESCALATED_CONCURRENCY}→"
+        f"{PROBE_DEEP_CONCURRENCY}→{PROBE_BURST_CONCURRENCY}→{PROBE_MAX_CONCURRENCY} at "
+        f"~0/{PROBE_ESCALATE_AFTER:.0f}/{PROBE_DEEP_ESCALATE_AFTER:.0f}/"
+        f"{PROBE_BURST_ESCALATE_AFTER:.0f}/{PROBE_MAX_ESCALATE_AFTER:.0f}s; long-outage "
+        f"{PROBE_LONG_OUTAGE_CONCURRENCY}@{PROBE_LONG_OUTAGE_AFTER:.0f}s→"
+        f"{PROBE_EXTREME_OUTAGE_CONCURRENCY}@{PROBE_EXTREME_OUTAGE_AFTER:.0f}s only while "
+        f"RSS<{PROBE_LONG_OUTAGE_MEMORY_CEILING_MB} MB"
     )
     rss = _memory_rss_mb()
     logging.info(
@@ -11897,8 +11965,8 @@ def start_leader_workers():
     )
 
     threading.Thread(target=telegram_listener, daemon=True, name='telegram-listener').start()
-    logging.info("📨 Telegram intake v6.36: text+caption+URL/text_link entities; eBay-сообщения больше не игнорируются молча")
-    logging.info(f"🌉 Handoff-safe v6.36: recent-good transient scout failures are isolated for {WEBSHARE_HANDOFF_TRANSIENT_COOLDOWN:.0f}s; main cooldown untouched")
+    logging.info("📨 Telegram intake v6.37r: text+caption+URL/text_link entities; eBay-сообщения больше не игнорируются молча")
+    logging.info(f"🌉 Handoff-safe v6.37r: recent-good transient scout failures are isolated for {WEBSHARE_HANDOFF_TRANSIENT_COOLDOWN:.0f}s; main cooldown untouched")
     threading.Thread(target=connection_watchdog, daemon=True, name='connection-watchdog').start()
     threading.Thread(target=memory_guard_worker, daemon=True, name='memory-guard-worker').start()
     threading.Thread(target=restart_sticky_persist_worker, daemon=True, name='restart-sticky-persist').start()
@@ -11945,7 +12013,7 @@ def leader_supervisor():
 @app.route('/')
 def index():
     role = "leader" if leader_active_event.is_set() else "standby"
-    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.36 ProxioReserveQuotaSafe+HandoffSafe+ReliableTelegram+AdaptiveBurst, {role})"
+    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.37r ProxioStatsFix+DeepReserve+Adaptive10+HandoffSafe, {role})"
 
 
 @app.route('/health')
