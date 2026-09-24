@@ -140,15 +140,16 @@ PROBE_EXTREME_OUTAGE_AFTER = max(
     float(os.getenv("PROBE_EXTREME_OUTAGE_AFTER", "120")),
 )
 PROBE_BURST_MEMORY_CEILING_MB = max(
-    340, min(int(os.getenv("PROBE_BURST_MEMORY_CEILING_MB", "390")), 420)
+    340, min(int(os.getenv("PROBE_BURST_MEMORY_CEILING_MB", "420")), 420)
 )
-# 9/10-worker mode gets a stricter memory gate than the existing 7/8 burst. With the
-# observed production RSS around 245-326 MB this still leaves substantial headroom
-# below Render's 512 MB cap, while refusing long-outage escalation if RSS is elevated.
+# 9/10-worker mode gets a stricter memory gate than the existing 7/8 burst.
+# Production RSS is now commonly around 390-398 MB, so v6.38 allows emergency
+# acceleration while still keeping separate 410/420 MB gates below the 450/485 MB
+# high/emergency protection thresholds.
 PROBE_LONG_OUTAGE_MEMORY_CEILING_MB = max(
     320,
     min(
-        int(os.getenv("PROBE_LONG_OUTAGE_MEMORY_CEILING_MB", "370")),
+        int(os.getenv("PROBE_LONG_OUTAGE_MEMORY_CEILING_MB", "410")),
         PROBE_BURST_MEMORY_CEILING_MB,
     ),
 )
@@ -274,6 +275,12 @@ AUCTION_LINK_RETRY_MAX = max(AUCTION_LINK_RETRY_BASE, int(os.getenv("AUCTION_LIN
 # а запланированный retry ждёт ровно до next_attempt (с cap этим значением).
 AUCTION_LINK_WORKER_IDLE = max(30, int(os.getenv("AUCTION_LINK_WORKER_IDLE", "60")))
 AUCTION_LINK_DB_ERROR_WAIT = max(10, int(os.getenv("AUCTION_LINK_DB_ERROR_WAIT", "15")))
+# New queue rows get a short DB-side grace so the Telegram yellow status_message_id can be
+# attached before the worker is allowed to finish the job. The handler activates the row
+# immediately after the send attempt, so this adds no normal latency; it only closes a race
+# and provides a crash-safe fallback if Render dies between INSERT and Telegram send.
+# Default 75s covers Telegram's bounded retry path; normal jobs are activated immediately.
+AUCTION_LINK_STATUS_GRACE = max(15, min(int(os.getenv("AUCTION_LINK_STATUS_GRACE", "75")), 120))
 
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 LONDON_TZ = ZoneInfo("Europe/London")
@@ -358,7 +365,20 @@ MEMORY_GUARD_INTERVAL = max(5.0, float(os.getenv("MEMORY_GUARD_INTERVAL", "10"))
 MEMORY_SOFT_MB = max(220, int(os.getenv("MEMORY_SOFT_MB", "330")))
 MEMORY_HIGH_MB = max(MEMORY_SOFT_MB + 40, int(os.getenv("MEMORY_HIGH_MB", "450")))
 MEMORY_EMERGENCY_MB = max(MEMORY_HIGH_MB + 20, min(int(os.getenv("MEMORY_EMERGENCY_MB", "485")), 500))
-MEMORY_CLEAR_MB = min(MEMORY_HIGH_MB - 30, max(180, int(os.getenv("MEMORY_CLEAR_MB", "360"))))
+# Clear HIGH pressure below the current production baseline window instead of the old 360 MB.
+# This keeps 40 MB hysteresis below HIGH=450 while avoiding a latched pressure event after a spike.
+MEMORY_CLEAR_MB = min(MEMORY_HIGH_MB - 30, max(180, int(os.getenv("MEMORY_CLEAR_MB", "410"))))
+# V6.39: user-submitted auction links are durable/important and must not be starved merely
+# because optional background work is paused at HIGH memory. Keep the global HIGH/EMERGENCY
+# protection unchanged, but allow ONE memory-throttled auction job below a separate ceiling.
+# 490 MB leaves ~22 MB below Render's 512 MB hard limit; at HIGH memory auction reserve
+# fetching is serialized to one response at a time to avoid a multi-page burst.
+AUCTION_USER_MEMORY_LIMIT_MB = min(
+    495, max(MEMORY_HIGH_MB + 10, int(os.getenv("AUCTION_USER_MEMORY_LIMIT_MB", "490")))
+)
+AUCTION_HIGH_MEMORY_FETCH_PARALLEL = max(
+    1, min(int(os.getenv("AUCTION_HIGH_MEMORY_FETCH_PARALLEL", "1")), 2)
+)
 PROXY_REPUTATION_TTL = max(1800, int(os.getenv("PROXY_REPUTATION_TTL", "21600")))
 PROXY_REPUTATION_MAX = max(1000, int(os.getenv("PROXY_REPUTATION_MAX", "7000")))
 PROVIDER_UNIQUE_STATS_CAP = max(500, int(os.getenv("PROVIDER_UNIQUE_STATS_CAP", "4096")))
@@ -741,6 +761,23 @@ def _memory_maintenance(reason='', force=False):
         elif rss <= MEMORY_CLEAR_MB:
             memory_pressure_event.clear()
     return rss
+
+
+def _auction_user_memory_ready():
+    """Return (ready, rss_mb) for a durable user-submitted auction job.
+
+    HIGH memory still pauses optional background workers, but it must not indefinitely
+    starve the user's auction queue.  Before allowing a job above MEMORY_HIGH_MB we force
+    GC/malloc_trim once; only the dedicated near-hard ceiling blocks the job.
+    """
+    rss = _memory_rss_mb()
+    if not MEMORY_GUARD_ENABLED or rss is None:
+        return True, rss
+    if rss >= MEMORY_HIGH_MB:
+        cleaned = _memory_maintenance('auction priority', force=True)
+        if cleaned is not None:
+            rss = cleaned
+    return rss < AUCTION_USER_MEMORY_LIMIT_MB, rss
 
 
 def memory_guard_worker():
@@ -3616,7 +3653,7 @@ class ProxyManager:
     def get_external_quality_preflight_candidates(self, limit=5, excluded_hosts=None):
         """Neutral TLS/CONNECT candidates from HProxy/Databay/Proxio.
 
-        Uses up to the configured SmartReserve external slots (five by default in v6.37); this
+        Uses up to the configured SmartReserve external slots (five by default in v6.38); this
         never increases eBay-request concurrency and still runs inside the bounded SmartReserve
         executor. Fairness is
         source-first (one unknown candidate from each enabled feed before any feed receives a
@@ -4978,9 +5015,9 @@ def enqueue_auction_link(url):
                     cur.execute(
                         """
                         INSERT INTO auction_link_queue (queue_key, item_id, url, next_attempt)
-                        VALUES (%s,%s,%s,NOW())
+                        VALUES (%s,%s,%s,NOW() + (%s * INTERVAL '1 second'))
                         """,
-                        (key, item_id, canonical),
+                        (key, item_id, canonical, AUCTION_LINK_STATUS_GRACE),
                     )
                     is_new = True
             elif duplicate_state.get('state') == 'queued':
@@ -4988,16 +5025,20 @@ def enqueue_auction_link(url):
         conn.commit()
 
     if is_new:
-        logging.info(f"📥 Auction link durably queued: key={key}, item={item_id or 'unknown'}")
+        logging.info(
+            f"📥 Auction link durably queued: key={key}, item={item_id or 'unknown'}, "
+            f"status_grace={AUCTION_LINK_STATUS_GRACE}s"
+        )
+        # Wake immediately so the worker can observe the durable row. next_attempt grace
+        # prevents it from processing before Telegram status_message_id is attached.
         auction_link_wakeup_event.set()
     elif duplicate_state and duplicate_state.get('state') == 'queued':
-        # Do not reset attempt_count/backoff on accidental duplicate messages, but wake the
-        # worker in case next_attempt is already due.
+        # Do not reset attempt_count/backoff on accidental duplicate messages. The caller
+        # wakes the worker only after any Telegram response for this update is handled.
         logging.info(
             f"♻️ Duplicate auction link already queued: key={key}, item={item_id or 'unknown'}, "
             f"attempt={int(duplicate_state.get('attempt_count') or 0)}"
         )
-        auction_link_wakeup_event.set()
     elif duplicate_state is not None:
         logging.info(
             f"♻️ Duplicate auction already durable: item={item_id or 'unknown'}, "
@@ -5064,6 +5105,26 @@ def set_auction_link_status_message(queue_key, message_id):
             )
             changed = cur.rowcount > 0
         conn.commit()
+    return changed
+
+
+def activate_auction_link_job(queue_key):
+    """Make a newly queued job due only after its Telegram status send attempt is finished."""
+    if not queue_key:
+        return False
+    with get_db_connection('ebay_uk_auction_link_activate') as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE auction_link_queue
+                SET next_attempt=LEAST(next_attempt, NOW()), updated_at=NOW()
+                WHERE queue_key=%s
+                """,
+                (queue_key,),
+            )
+            changed = cur.rowcount > 0
+        conn.commit()
+    auction_link_wakeup_event.set()
     return changed
 
 
@@ -6081,16 +6142,24 @@ def _telegram_message_raw_url_candidates(message):
 
 
 def extract_ebay_urls_from_telegram_message(message):
-    """Robust eBay URL extraction for Telegram messages/captions/entities."""
+    """Robust eBay URL extraction, deduped by eBay ItemID when available.
+
+    Telegram may expose ONE pasted link twice: once in message text/entity and again in
+    ``link_preview_options.url`` (often with different tracking/query parameters). Raw-URL
+    dedupe is therefore insufficient and previously produced a false duplicate notice.
+    """
     urls = []
-    seen = set()
+    seen_identity = set()
     for raw in _telegram_message_raw_url_candidates(message):
-        # ``raw`` may already be normalized by extract_ebay_urls() or may come directly
-        # from a Telegram text_link entity.
         normalized = _normalize_ebay_url_candidate(raw)
-        if normalized and normalized not in seen:
-            seen.add(normalized)
-            urls.append(normalized)
+        if not normalized:
+            continue
+        item_id = extract_ebay_item_id_any(normalized)
+        identity = f"item:{item_id}" if item_id else f"url:{normalized}"
+        if identity in seen_identity:
+            continue
+        seen_identity.add(identity)
+        urls.append(normalized)
     return urls
 
 
@@ -6525,14 +6594,25 @@ def fetch_auction_pages(
 
     pending_candidates = list(candidates[:max_reserve_proxies])
     if pending_candidates:
+        auction_parallel = AUCTION_FETCH_PARALLEL
+        rss_now = _memory_rss_mb() if MEMORY_GUARD_ENABLED else None
+        if memory_pressure_event.is_set() or (rss_now is not None and rss_now >= MEMORY_HIGH_MB):
+            auction_parallel = min(auction_parallel, AUCTION_HIGH_MEMORY_FETCH_PARALLEL)
+            logging.info(
+                f"🧠 Auction high-memory mode: RSS≈{rss_now:.0f} MB; "
+                f"reserve fetch concurrency={auction_parallel}"
+                if rss_now is not None else
+                f"🧠 Auction high-memory mode: reserve fetch concurrency={auction_parallel}"
+            )
+        auction_parallel = max(1, auction_parallel)
         executor = ThreadPoolExecutor(
-            max_workers=min(AUCTION_FETCH_PARALLEL, len(pending_candidates)),
+            max_workers=min(auction_parallel, len(pending_candidates)),
             thread_name_prefix='auction-fetch',
         )
         future_to_proxy = {}
 
         def submit_next():
-            while pending_candidates and len(future_to_proxy) < AUCTION_FETCH_PARALLEL:
+            while pending_candidates and len(future_to_proxy) < auction_parallel:
                 proxy = pending_candidates.pop(0)
                 future_to_proxy[executor.submit(worker, proxy)] = proxy
 
@@ -8543,8 +8623,12 @@ def _reconcile_completed_auction_queue_job(item_id, status_message_id, state):
 
 
 def auction_link_worker():
-    logging.info("🔗 Worker надёжной очереди eBay-аукционов запущен")
+    logging.info(
+        f"🔗 Worker надёжной очереди eBay-аукционов запущен: "
+        f"priority_memory_limit={AUCTION_USER_MEMORY_LIMIT_MB}MB"
+    )
     db_ready_event.wait()
+    last_memory_wait_log = 0.0
     while True:
         try:
             # Clear ДО чтения БД: если enqueue случится после этого момента,
@@ -8559,10 +8643,23 @@ def auction_link_worker():
 
             queue_key, item_id, url, status_message_id, attempt_count, created_at = job
 
-            # Main new-item monitor has priority over auction enrichment under failover/RAM
-            # pressure. The job stays due in PostgreSQL (no attempt/backoff increment), so
-            # it resumes within a couple seconds when the main path is stable.
-            if main_discovery_active_event.is_set() or memory_pressure_event.is_set():
+            # Main failover still has priority because it is rebuilding the only proven eBay
+            # route. Generic HIGH memory, however, must NOT indefinitely starve a durable
+            # user-submitted auction. Auction jobs have their own near-hard ceiling and switch
+            # reserve fetching to one response at a time while HIGH memory is active.
+            if main_discovery_active_event.is_set():
+                auction_link_wakeup_event.wait(timeout=2.0)
+                continue
+
+            auction_memory_ready, auction_rss = _auction_user_memory_ready()
+            if not auction_memory_ready:
+                now_mono = time.monotonic()
+                if now_mono - last_memory_wait_log >= 30.0:
+                    logging.warning(
+                        f"🧠 Auction user-job сохранён в очереди, но RSS≈{auction_rss:.0f} MB "
+                        f">= auction ceiling {AUCTION_USER_MEMORY_LIMIT_MB} MB; повторим после cleanup"
+                    )
+                    last_memory_wait_log = now_mono
                 auction_link_wakeup_event.wait(timeout=2.0)
                 continue
 
@@ -8598,6 +8695,8 @@ def auction_link_worker():
             finally:
                 auction_user_job_active_event.clear()
                 auction_status_wakeup_event.set()
+                proxy_preflight_wakeup_event.set()
+                webshare_handoff_wakeup_event.set()
 
             if result == 'retry':
                 postpone_auction_link_job(queue_key, attempt_count, 'proxy_or_html_temporarily_unavailable')
@@ -9434,13 +9533,22 @@ def telegram_listener():
                                             f"Telegram update {update_id}: получено {len(ebay_urls)} eBay URL; "
                                             "обрабатываем первые 20"
                                         )
+                                    handled_auction_keys = set()
                                     for ebay_url in ebay_urls[:20]:
                                         (
                                             key, item_id, canonical_url, existing_message_id,
                                             is_new, duplicate_state
                                         ) = enqueue_auction_link(ebay_url)
+                                        if key in handled_auction_keys:
+                                            logging.info(
+                                                f"♻️ Same-update auction duplicate suppressed: "
+                                                f"update={update_id}, key={key}"
+                                            )
+                                            continue
+                                        handled_auction_keys.add(key)
                                         if duplicate_state is not None:
                                             send_duplicate_auction_notice(item_id, canonical_url, duplicate_state)
+                                            auction_link_wakeup_event.set()
                                             continue
                                         # Одно компактное жёлтое status-сообщение. Оно не накапливается:
                                         # после получения результата бот отредактирует ЭТО ЖЕ сообщение в pending/exact.
@@ -9465,6 +9573,10 @@ def telegram_listener():
                                                     "но Telegram не подтвердил жёлтый status-message; "
                                                     "финальный результат всё равно будет опубликован worker-ом"
                                                 )
+                                            # Only now release the new row to the worker. If this handler
+                                            # crashes before activation, DB next_attempt safety grace will
+                                            # release it automatically, so the auction still cannot be lost.
+                                            activate_auction_link_job(key)
                                 elif telegram_message_has_ebay_signal(message):
                                     # Critical anti-silence guard: never ACK an eBay-looking update
                                     # without telling the user that its URL could not be parsed.
@@ -10078,7 +10190,12 @@ def webshare_handoff_worker():
             # Handoff is an optimization, not a reason to compete with the main failover
             # for RAM. Under pressure/discovery we keep the proven Webshare fixed alive
             # and resume the free-scout as soon as the main path is stable.
-            if main_discovery_active_event.is_set() or memory_pressure_event.is_set() or main_fixed_request_lock.locked():
+            if (
+                main_discovery_active_event.is_set()
+                or memory_pressure_event.is_set()
+                or auction_user_job_active_event.is_set()
+                or main_fixed_request_lock.locked()
+            ):
                 webshare_handoff_wakeup_event.wait(timeout=5.0)
                 webshare_handoff_wakeup_event.clear()
                 continue
@@ -10476,7 +10593,7 @@ def fetch_ebay_html_with_fixed_pair():
             reason = f'burst-memory-cap RSS≈{rss_now:.0f}MB'
         else:
             outage_elapsed, _, _ = _connection_outage_snapshot()
-            # V6.37 long-outage acceleration. A stricter RSS gate prevents the two extra
+            # V6.38 long-outage acceleration. A stricter RSS gate prevents the two extra
             # full-page responses from consuming the last memory reserve. When memory is
             # elevated we keep the proven <=8-worker ladder instead of disabling discovery.
             if (
@@ -11711,6 +11828,7 @@ def proxy_preflight_warm_worker():
                 or fixed_proxy is None
                 or main_discovery_active_event.is_set()
                 or memory_pressure_event.is_set()
+                or auction_user_job_active_event.is_set()
                 or main_fixed_request_lock.locked()
             ):
                 proxy_preflight_wakeup_event.wait(timeout=PROXY_PREFLIGHT_WARM_INTERVAL)
@@ -11856,7 +11974,7 @@ def bot_worker():
     seen_line = f"\n📚 В базе: {seen_total} товаров." if seen_total is not None else ""
     send_telegram_message(
         startup_line +
-        "\n🇬🇧 eBay UK monitor v6.37r ProxioStatsFix+DeepReserve+Adaptive10+HandoffSafe работает." +
+        "\n🇬🇧 eBay UK monitor v6.39 AuctionPriority+Dedup+Adaptive10+HandoffSafe работает." +
         seen_line +
         "\nКоманды: /stop /start /list (/auctions) /delauction НОМЕР_ЛОТА"
         "\nМожно отправить ссылку на eBay-аукцион — сохраню точное время и напомню заранее."
@@ -11927,7 +12045,7 @@ def start_leader_workers():
     leader_active_event.set()
     logging.info("👑 Эта Render-копия стала leader; запускаем фоновые worker-ы")
     logging.info(
-        "🌐 Multi-provider v6.37r: "
+        "🌐 Multi-provider v6.39: "
         f"ProxyScrape Premium={'ON' if PROXYSCRAPE_PREMIUM_API_KEY else 'OFF'}, "
         f"Webshare={'ON (' + str(len(WEBSHARE_API_KEYS)) + ' account(s))' if WEBSHARE_API_KEYS else 'OFF'}, "
         f"Webshare first-batch={'ON (1-2 unique-host slots; extra keys=bandwidth)' if WEBSHARE_FIRST_BATCH else 'OFF'}, "
@@ -11938,7 +12056,7 @@ def start_leader_workers():
     proxio_calls_day = int((86400 + PROXIO_FREE_REFRESH - 1) // PROXIO_FREE_REFRESH) if PROXIO_FREE_ENABLED else 0
     proxio_calls_per_key = (proxio_calls_day / len(PROXIO_API_KEYS)) if PROXIO_API_KEYS else 0.0
     logging.info(
-        f"🧭 External sources v6.37r: HProxy={'ON' if HPROXY_FREE_ENABLED else 'OFF'} "
+        f"🧭 External sources v6.39: HProxy={'ON' if HPROXY_FREE_ENABLED else 'OFF'} "
         f"(HTTPS, elite+anonymous, cap={HPROXY_FREE_ELITE_LIMIT + HPROXY_FREE_ANON_LIMIT}), "
         f"Databay={'ON' if DATABAY_FREE_ENABLED else 'OFF'} "
         f"(HTTPS strict+fast, elite+anonymous, cap={DATABAY_FREE_ELITE_LIMIT + DATABAY_FREE_ANON_LIMIT}), "
@@ -11949,7 +12067,7 @@ def start_leader_workers():
         f"neutral_preflight={EXTERNAL_FREE_PREFLIGHT_SLOTS}, normal ceiling={PROBE_MAX_CONCURRENCY}, long-outage ceiling={PROBE_EXTREME_OUTAGE_CONCURRENCY}"
     )
     logging.info(
-        f"⚡ Adaptive discovery v6.37r: normal {PROBE_CONCURRENCY}→{PROBE_ESCALATED_CONCURRENCY}→"
+        f"⚡ Adaptive discovery v6.39: normal {PROBE_CONCURRENCY}→{PROBE_ESCALATED_CONCURRENCY}→"
         f"{PROBE_DEEP_CONCURRENCY}→{PROBE_BURST_CONCURRENCY}→{PROBE_MAX_CONCURRENCY} at "
         f"~0/{PROBE_ESCALATE_AFTER:.0f}/{PROBE_DEEP_ESCALATE_AFTER:.0f}/"
         f"{PROBE_BURST_ESCALATE_AFTER:.0f}/{PROBE_MAX_ESCALATE_AFTER:.0f}s; long-outage "
@@ -11959,14 +12077,20 @@ def start_leader_workers():
     )
     rss = _memory_rss_mb()
     logging.info(
-        f"🧠 MemorySafe: RSS≈{rss:.0f} MB, soft/high/emergency={MEMORY_SOFT_MB}/{MEMORY_HIGH_MB}/{MEMORY_EMERGENCY_MB} MB; "
+        f"🧠 MemorySafe: RSS≈{rss:.0f} MB, soft/clear/high/emergency={MEMORY_SOFT_MB}/{MEMORY_CLEAR_MB}/{MEMORY_HIGH_MB}/{MEMORY_EMERGENCY_MB} MB; "
+        f"burst/long-outage gates={PROBE_BURST_MEMORY_CEILING_MB}/{PROBE_LONG_OUTAGE_MEMORY_CEILING_MB} MB; "
         f"background TLS workers={PROXY_PREFLIGHT_WARM_CONCURRENCY}" if rss is not None else
-        f"🧠 MemorySafe enabled: soft/high/emergency={MEMORY_SOFT_MB}/{MEMORY_HIGH_MB}/{MEMORY_EMERGENCY_MB} MB"
+        f"🧠 MemorySafe enabled: soft/clear/high/emergency={MEMORY_SOFT_MB}/{MEMORY_CLEAR_MB}/{MEMORY_HIGH_MB}/{MEMORY_EMERGENCY_MB} MB; "
+        f"burst/long-outage gates={PROBE_BURST_MEMORY_CEILING_MB}/{PROBE_LONG_OUTAGE_MEMORY_CEILING_MB} MB"
     )
 
     threading.Thread(target=telegram_listener, daemon=True, name='telegram-listener').start()
-    logging.info("📨 Telegram intake v6.37r: text+caption+URL/text_link entities; eBay-сообщения больше не игнорируются молча")
-    logging.info(f"🌉 Handoff-safe v6.37r: recent-good transient scout failures are isolated for {WEBSHARE_HANDOFF_TRANSIENT_COOLDOWN:.0f}s; main cooldown untouched")
+    logging.info(
+        f"📨 Telegram intake v6.39: ItemID-dedupe ON; auction priority memory ceiling="
+        f"{AUCTION_USER_MEMORY_LIMIT_MB}MB, high-memory fetch workers={AUCTION_HIGH_MEMORY_FETCH_PARALLEL}, "
+        f"status_grace={AUCTION_LINK_STATUS_GRACE}s"
+    )
+    logging.info(f"🌉 Handoff-safe v6.39: recent-good transient scout failures are isolated for {WEBSHARE_HANDOFF_TRANSIENT_COOLDOWN:.0f}s; main cooldown untouched")
     threading.Thread(target=connection_watchdog, daemon=True, name='connection-watchdog').start()
     threading.Thread(target=memory_guard_worker, daemon=True, name='memory-guard-worker').start()
     threading.Thread(target=restart_sticky_persist_worker, daemon=True, name='restart-sticky-persist').start()
@@ -12013,7 +12137,7 @@ def leader_supervisor():
 @app.route('/')
 def index():
     role = "leader" if leader_active_event.is_set() else "standby"
-    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.37r ProxioStatsFix+DeepReserve+Adaptive10+HandoffSafe, {role})"
+    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.39 AuctionPriority+Dedup+Adaptive10+HandoffSafe, {role})"
 
 
 @app.route('/health')
