@@ -439,7 +439,14 @@ PROXIO_API_KEYS = _collect_proxio_api_keys()
 PROXYSCRAPE_PREMIUM_API_KEY = (os.getenv("PROXYSCRAPE_PREMIUM_API_KEY") or "").strip()
 PROXYSCRAPE_PREMIUM_SUBACCOUNT_ID = (os.getenv("PROXYSCRAPE_PREMIUM_SUBACCOUNT_ID") or "").strip()
 PROVIDER_API_TIMEOUT = max(3.0, min(float(os.getenv("PROVIDER_API_TIMEOUT", "10")), 20.0))
-PROXYSCRAPE_PREMIUM_REFRESH = max(30, int(os.getenv("PROXYSCRAPE_PREMIUM_REFRESH", "60")))
+# V6.40: Premium trial/shared datacenter list is cached as a BACKUP tier. The current
+# 7-day trial exposes a stable 100-IP list, so refreshing every minute adds API/log churn
+# without improving failover. Startup still fetches it immediately; 5 min is enough thereafter.
+PROXYSCRAPE_PREMIUM_REFRESH = max(60, int(os.getenv("PROXYSCRAPE_PREMIUM_REFRESH", "300")))
+# Keep Premium out of the first fast wave. It becomes available only when discovery is
+# genuinely struggling, or immediately in emergency/exhaustion paths.
+PREMIUM_UNLOCK_AFTER = max(5.0, float(os.getenv("PREMIUM_UNLOCK_AFTER", "12")))
+PREMIUM_UNLOCK_ATTEMPTS = max(8, int(os.getenv("PREMIUM_UNLOCK_ATTEMPTS", "20")))
 WEBSHARE_REFRESH = max(60, int(os.getenv("WEBSHARE_REFRESH", "300")))
 WEBSHARE_STATS_REFRESH = max(300, int(os.getenv("WEBSHARE_STATS_REFRESH", "600")))
 
@@ -3781,7 +3788,7 @@ class ProxyManager:
                     break
         return chosen
 
-    def get_candidate_batch(self, batch_size, tried_hosts=None, preferred_scheme=None, allow_webshare=False):
+    def get_candidate_batch(self, batch_size, tried_hosts=None, preferred_scheme=None, allow_webshare=False, allow_premium=True):
         """Выдаёт несколько proxy с уникальными IP и разумным mix HTTP/SOCKS5.
 
         Раньше небольшой bonus HTTP приводил к тому, что при большом пуле первые десятки
@@ -3835,6 +3842,8 @@ class ProxyManager:
             fresh_usable = []
             recycled_usable = []
             for p in candidates:
+                if (not allow_premium) and provider_manager.source_fast(p) == 'proxyscrape_premium':
+                    continue
                 if self.bad_until.get(p, 0) > now:
                     continue
                 host = _proxy_host(p)
@@ -5821,11 +5830,13 @@ def send_telegram_message(
     preview_url=None,
     preview_small=True,
     return_message_id=False,
+    disable_notification=False,
 ):
     payload = {
         'chat_id': TELEGRAM_CHAT_ID,
         'text': message,
         'parse_mode': parse_mode,
+        'disable_notification': bool(disable_notification),
     }
     _apply_link_preview_payload(payload, disable_preview, preview_url, preview_small)
     if reply_markup is not None:
@@ -5957,6 +5968,67 @@ def edit_message_reply_markup(message_id, reply_markup=None):
     }
     result = _telegram_post('editMessageReplyMarkup', payload, timeout=8, max_attempts=2)
     return bool(result and result.get('ok', True))
+
+
+def configure_telegram_command_ui():
+    """Install a durable Telegram command-menu fallback for the private control chat.
+
+    Reply keyboards are client-side UI and some Telegram clients can temporarily collapse
+    them around reconnect/restart. setMyCommands + setChatMenuButton gives the user a second,
+    server-side path to /auctions without typing it manually. It does not replace the normal
+    persistent reply keyboard; both are kept.
+    """
+    commands = [
+        {'command': 'auctions', 'description': 'Показать мои аукционы'},
+        {'command': 'start', 'description': 'Возобновить основной мониторинг'},
+        {'command': 'stop', 'description': 'Приостановить основной мониторинг'},
+        {'command': 'delauction', 'description': 'Удалить аукцион по номеру лота'},
+    ]
+    scope = {'type': 'chat', 'chat_id': TELEGRAM_CHAT_ID}
+    commands_result = _telegram_post(
+        'setMyCommands',
+        {'commands': commands, 'scope': scope},
+        timeout=8,
+        max_attempts=3,
+    )
+    menu_result = _telegram_post(
+        'setChatMenuButton',
+        {'chat_id': TELEGRAM_CHAT_ID, 'menu_button': {'type': 'commands'}},
+        timeout=8,
+        max_attempts=3,
+    )
+    ok_commands = bool(commands_result and commands_result.get('ok', True))
+    ok_menu = bool(menu_result and menu_result.get('ok', True))
+    if ok_commands and ok_menu:
+        logging.info('⌨️ Telegram UI: command menu installed as restart-safe fallback')
+    else:
+        logging.warning(
+            f"⚠️ Telegram UI fallback partially unavailable: commands={ok_commands}, menu={ok_menu}; "
+            "persistent reply keyboard will still be published by startup message"
+        )
+    return ok_commands and ok_menu
+
+
+def reassert_main_reply_keyboard(reason='manual'):
+    """Re-publish the persistent '📋 Аукционы' reply keyboard without a loud notification."""
+    ok = send_telegram_message(
+        "⌨️ <b>Панель управления восстановлена</b>\n"
+        "Кнопка «📋 Аукционы» снова закреплена под полем ввода.",
+        reply_markup=bot_main_reply_keyboard(),
+        disable_preview=True,
+        disable_notification=True,
+    )
+    if ok:
+        logging.info(f"⌨️ Telegram reply keyboard reasserted ({reason})")
+    else:
+        logging.warning(f"⚠️ Telegram reply keyboard reassert failed ({reason})")
+    return ok
+
+
+def _retry_reply_keyboard_after_startup_failure():
+    """One bounded delayed retry; duplicate control notice is preferable to a missing UI."""
+    time.sleep(8.0)
+    reassert_main_reply_keyboard('startup-retry')
 
 
 def auction_message_keyboard(item_id, url, include_list=False):
@@ -8694,6 +8766,10 @@ def auction_link_worker():
                 continue
             finally:
                 auction_user_job_active_event.clear()
+                # V6.41: auction/search pages can temporarily keep several large HTML/DOM
+                # objects alive. Auction jobs are rare, so an immediate trim here is cheap
+                # and avoids carrying their high-water mark into the next main 1.6 MB parse.
+                _memory_maintenance('auction job done', force=True)
                 auction_status_wakeup_event.set()
                 proxy_preflight_wakeup_event.set()
                 webshare_handoff_wakeup_event.set()
@@ -9510,6 +9586,10 @@ def telegram_listener():
                             elif text in ('/auctions', '/list', '📋 Аукционы', 'Аукционы'):
                                 # Persistent button and slash command deliberately share one handler.
                                 send_auction_list()
+                                # If the user had to type a slash command/plain text, actively restore
+                                # the one-tap reply button as well. A button press needs no extra message.
+                                if text in ('/auctions', '/list', 'Аукционы'):
+                                    reassert_main_reply_keyboard('manual-auctions-command')
                             elif text.startswith('/delauction'):
                                 parts = text.split(maxsplit=1)
                                 if len(parts) != 2 or not re.fullmatch(r'\d{9,19}', parts[1].strip()):
@@ -10568,6 +10648,7 @@ def fetch_ebay_html_with_fixed_pair():
     main_discovery_active_event.set()
     future_to_proxy = {}
     last_concurrency_logged = None
+    premium_backup_unlock_logged = False
 
     def desired_concurrency():
         nonlocal last_concurrency_logged
@@ -10581,7 +10662,12 @@ def fetch_ebay_html_with_fixed_pair():
             reason = f'emergency-memory RSS≈{rss_now:.0f}MB'
         # Real protective mode starts at 450 MB by default. Check RSS directly as well as
         # the background Event so a fast discovery spike cannot wait for the next 10-sec guard tick.
-        elif (rss_now is not None and rss_now >= MEMORY_HIGH_MB) or memory_pressure_event.is_set():
+        elif (rss_now is not None and rss_now >= MEMORY_HIGH_MB) or (rss_now is None and memory_pressure_event.is_set()):
+            # V6.41: use fresh RSS as the authority whenever it is available. The HIGH
+            # event intentionally has deep hysteresis for optional background workers and
+            # may remain set after RSS falls back into the 420-449 MB plateau. Letting that
+            # stale latch force urgent main failover to 4 workers forever is unnecessary:
+            # the next branch still caps elevated RSS to the proven 5/6-worker ladder.
             desired = PROBE_CONCURRENCY
             reason = f'high-memory RSS≈{rss_now:.0f}MB' if rss_now is not None else 'memory-pressure'
         # Do not enter 7/8-worker burst when RSS is already elevated. This intermediate
@@ -10700,7 +10786,7 @@ def fetch_ebay_html_with_fixed_pair():
 
     def submit_more():
         """Поддерживает rolling in-flight probe и один безопасный последний re-probe."""
-        nonlocal attempts, refreshed_after_exhaustion, final_reprobe_used
+        nonlocal attempts, refreshed_after_exhaustion, final_reprobe_used, premium_backup_unlock_logged
 
         elapsed_now = time.monotonic() - started
         if elapsed_now >= SEARCH_TIME_BUDGET:
@@ -10862,15 +10948,17 @@ def fetch_ebay_html_with_fixed_pair():
             )
             external_need = min(max(0, need - len(batch)), external_slot_cap)
             if external_need > 0:
-                premium_usable = provider_manager.has_usable_premium()
-                include_proxio = (elapsed_for_mix >= PROBE_ESCALATE_AFTER) or (not premium_usable)
+                # V6.40: Premium is now a backup tier, so its mere availability must not
+                # delay Proxio. HProxy/Databay/Proxio all compete for the early bounded
+                # external slots from the first wave; round-robin keeps one source from
+                # monopolising those slots. Premium itself stays gated below.
                 external_rows = proxy_manager.get_external_free_candidates(
                     max_total=external_need,
                     excluded_hosts=(
                         tried_hosts | inflight_hosts | {_proxy_host(p) for p in batch}
                     ),
-                    include_proxio=include_proxio,
-                    prefer_proxio=(not premium_usable),
+                    include_proxio=True,
+                    prefer_proxio=False,
                 )
                 for ext_proxy, ext_source in external_rows:
                     if len(batch) >= need:
@@ -10897,11 +10985,26 @@ def fetch_ebay_html_with_fixed_pair():
                         or attempts >= WEBSHARE_UNLOCK_ATTEMPTS
                     )
                 )
+                premium_backup_allowed = (
+                    elapsed_for_provider >= PREMIUM_UNLOCK_AFTER
+                    or attempts >= PREMIUM_UNLOCK_ATTEMPTS
+                )
+                if (
+                    premium_backup_allowed
+                    and not premium_backup_unlock_logged
+                    and provider_manager.has_usable_premium()
+                ):
+                    logging.info(
+                        f"🔷 Premium backup unlocked: elapsed={elapsed_for_provider:.1f}s, "
+                        f"attempts={attempts}; primary free/Proxio/HProxy/Databay paths had first chance"
+                    )
+                    premium_backup_unlock_logged = True
                 normal_batch = proxy_manager.get_candidate_batch(
                     remaining_need,
                     tried_hosts=tried_hosts | {_proxy_host(p) for p in batch},
                     preferred_scheme=preferred_scheme,
                     allow_webshare=allow_webshare,
+                    allow_premium=premium_backup_allowed,
                 )
                 for p in normal_batch:
                     batch.append(p)
@@ -10917,6 +11020,7 @@ def fetch_ebay_html_with_fixed_pair():
                     tried_hosts=tried_hosts,
                     preferred_scheme=preferred_scheme,
                     allow_webshare=True,
+                    allow_premium=True,
                 )
                 for p in batch:
                     batch_kinds[p] = 'Emergency probe'
@@ -10929,6 +11033,7 @@ def fetch_ebay_html_with_fixed_pair():
                     tried_hosts=tried_hosts,
                     preferred_scheme=preferred_scheme,
                     allow_webshare=True,
+                    allow_premium=True,
                 )
                 for p in batch:
                     batch_kinds[p] = 'Emergency probe'
@@ -11855,6 +11960,17 @@ def proxy_preflight_warm_worker():
                     if quality_before < PROXY_PREFLIGHT_RESERVE_TARGET
                     else PROXY_PREFLIGHT_MAINTENANCE_BATCH
                 )
+                # V6.41: once RSS reaches the same 420 MB burst gate used by main discovery,
+                # keep this OPTIONAL background worker in maintenance mode. This reduces
+                # simultaneous TLS/CONNECT objects while preserving a small warm reserve.
+                # HIGH memory still pauses the worker entirely via the guard above.
+                reserve_rss = _memory_rss_mb() if MEMORY_GUARD_ENABLED else None
+                reserve_elevated = (
+                    reserve_rss is not None
+                    and reserve_rss >= PROBE_BURST_MEMORY_CEILING_MB
+                )
+                if reserve_elevated:
+                    batch_limit = min(batch_limit, PROXY_PREFLIGHT_MAINTENANCE_BATCH)
                 # Reserve a small part of the existing preflight batch for HProxy/Databay/Proxio.
                 # These checks are neutral CONNECT+TLS only (no eBay), so bad external
                 # endpoints are filtered before they can consume scarce discovery slots.
@@ -11877,8 +11993,11 @@ def proxy_preflight_warm_worker():
                 external_ok = 0
                 reason_counts = {}
                 if candidates:
+                    reserve_workers = PROXY_PREFLIGHT_WARM_CONCURRENCY
+                    if reserve_elevated:
+                        reserve_workers = min(reserve_workers, 2)
                     with ThreadPoolExecutor(
-                        max_workers=min(PROXY_PREFLIGHT_WARM_CONCURRENCY, len(candidates)),
+                        max_workers=min(reserve_workers, len(candidates)),
                         thread_name_prefix='proxy-quality-preflight',
                     ) as executor:
                         future_map = {
@@ -11912,9 +12031,13 @@ def proxy_preflight_warm_worker():
                         f", external_preflight={external_checked}/{external_ok}"
                         if external_checked else ""
                     )
+                    mem_suffix = (
+                        f", elevated_memory≈{reserve_rss:.0f}MB/batch≤{batch_limit}/workers≤2"
+                        if reserve_elevated else ""
+                    )
                     logging.info(
                         f"🧪 Smart reserve: HTTPS-ready={quality_after}, TCP-only={tcp_after}; "
-                        f"проверено={checked}, quality_ok={ok_count}{ext_suffix}, failures[{failure_summary}]"
+                        f"проверено={checked}, quality_ok={ok_count}{ext_suffix}{mem_suffix}, failures[{failure_summary}]"
                     )
             else:
                 candidates = proxy_manager.get_preflight_candidates(
@@ -11972,15 +12095,24 @@ def bot_worker():
 
     seen_total = get_seen_count_cached()
     seen_line = f"\n📚 В базе: {seen_total} товаров." if seen_total is not None else ""
-    send_telegram_message(
+    startup_keyboard_ok = send_telegram_message(
         startup_line +
-        "\n🇬🇧 eBay UK monitor v6.39 AuctionPriority+Dedup+Adaptive10+HandoffSafe работает." +
+        "\n🇬🇧 eBay UK monitor v6.41 MemoryPlateauSafe+TelegramUI+PremiumBackup+AuctionPriority работает." +
         seen_line +
         "\nКоманды: /stop /start /list (/auctions) /delauction НОМЕР_ЛОТА"
         "\nМожно отправить ссылку на eBay-аукцион — сохраню точное время и напомню заранее."
         "\nКнопка «📋 Аукционы» открывает тот же список, что и /auctions.",
         reply_markup=bot_main_reply_keyboard(),
     )
+    if startup_keyboard_ok:
+        logging.info("⌨️ Telegram persistent reply keyboard published at leader startup")
+    else:
+        logging.warning("⚠️ Startup message/keyboard was not confirmed by Telegram; scheduling one UI retry")
+        threading.Thread(
+            target=_retry_reply_keyboard_after_startup_failure,
+            daemon=True,
+            name='telegram-ui-retry',
+        ).start()
     while True:
         if is_paused:
             time.sleep(2)
@@ -12044,19 +12176,27 @@ def start_leader_workers():
     db_ready_event.set()
     leader_active_event.set()
     logging.info("👑 Эта Render-копия стала leader; запускаем фоновые worker-ы")
+    # Telegram API metadata is useful but must never delay eBay/auction workers at deploy.
+    threading.Thread(
+        target=configure_telegram_command_ui,
+        daemon=True,
+        name='telegram-ui-config',
+    ).start()
     logging.info(
-        "🌐 Multi-provider v6.39: "
+        "🌐 Multi-provider v6.41: "
         f"ProxyScrape Premium={'ON' if PROXYSCRAPE_PREMIUM_API_KEY else 'OFF'}, "
         f"Webshare={'ON (' + str(len(WEBSHARE_API_KEYS)) + ' account(s))' if WEBSHARE_API_KEYS else 'OFF'}, "
         f"Webshare first-batch={'ON (1-2 unique-host slots; extra keys=bandwidth)' if WEBSHARE_FIRST_BATCH else 'OFF'}, "
         f"bridge-handoff={WEBSHARE_HANDOFF_AFTER:.0f}s, warm-first-wave={WARM_STANDBY_TOTAL_LIMIT}, "
         f"ws403-circuit={WEBSHARE_BLOCK_CIRCUIT_STREAK}, "
-        f"premium403-throttle/circuit={PREMIUM_BLOCK_THROTTLE_STREAK}/{PREMIUM_BLOCK_CIRCUIT_STREAK}"
+        f"premium403-throttle/circuit={PREMIUM_BLOCK_THROTTLE_STREAK}/{PREMIUM_BLOCK_CIRCUIT_STREAK}, "
+        f"premium-backup-unlock={PREMIUM_UNLOCK_AFTER:.0f}s/{PREMIUM_UNLOCK_ATTEMPTS} attempts, "
+        f"premium-refresh={PROXYSCRAPE_PREMIUM_REFRESH}s"
     )
     proxio_calls_day = int((86400 + PROXIO_FREE_REFRESH - 1) // PROXIO_FREE_REFRESH) if PROXIO_FREE_ENABLED else 0
     proxio_calls_per_key = (proxio_calls_day / len(PROXIO_API_KEYS)) if PROXIO_API_KEYS else 0.0
     logging.info(
-        f"🧭 External sources v6.39: HProxy={'ON' if HPROXY_FREE_ENABLED else 'OFF'} "
+        f"🧭 External sources v6.41: HProxy={'ON' if HPROXY_FREE_ENABLED else 'OFF'} "
         f"(HTTPS, elite+anonymous, cap={HPROXY_FREE_ELITE_LIMIT + HPROXY_FREE_ANON_LIMIT}), "
         f"Databay={'ON' if DATABAY_FREE_ENABLED else 'OFF'} "
         f"(HTTPS strict+fast, elite+anonymous, cap={DATABAY_FREE_ELITE_LIMIT + DATABAY_FREE_ANON_LIMIT}), "
@@ -12067,7 +12207,7 @@ def start_leader_workers():
         f"neutral_preflight={EXTERNAL_FREE_PREFLIGHT_SLOTS}, normal ceiling={PROBE_MAX_CONCURRENCY}, long-outage ceiling={PROBE_EXTREME_OUTAGE_CONCURRENCY}"
     )
     logging.info(
-        f"⚡ Adaptive discovery v6.39: normal {PROBE_CONCURRENCY}→{PROBE_ESCALATED_CONCURRENCY}→"
+        f"⚡ Adaptive discovery v6.41: normal {PROBE_CONCURRENCY}→{PROBE_ESCALATED_CONCURRENCY}→"
         f"{PROBE_DEEP_CONCURRENCY}→{PROBE_BURST_CONCURRENCY}→{PROBE_MAX_CONCURRENCY} at "
         f"~0/{PROBE_ESCALATE_AFTER:.0f}/{PROBE_DEEP_ESCALATE_AFTER:.0f}/"
         f"{PROBE_BURST_ESCALATE_AFTER:.0f}/{PROBE_MAX_ESCALATE_AFTER:.0f}s; long-outage "
@@ -12086,11 +12226,11 @@ def start_leader_workers():
 
     threading.Thread(target=telegram_listener, daemon=True, name='telegram-listener').start()
     logging.info(
-        f"📨 Telegram intake v6.39: ItemID-dedupe ON; auction priority memory ceiling="
+        f"📨 Telegram intake v6.41: ItemID-dedupe ON; auction priority memory ceiling="
         f"{AUCTION_USER_MEMORY_LIMIT_MB}MB, high-memory fetch workers={AUCTION_HIGH_MEMORY_FETCH_PARALLEL}, "
         f"status_grace={AUCTION_LINK_STATUS_GRACE}s"
     )
-    logging.info(f"🌉 Handoff-safe v6.39: recent-good transient scout failures are isolated for {WEBSHARE_HANDOFF_TRANSIENT_COOLDOWN:.0f}s; main cooldown untouched")
+    logging.info(f"🌉 Handoff-safe v6.41: recent-good transient scout failures are isolated for {WEBSHARE_HANDOFF_TRANSIENT_COOLDOWN:.0f}s; main cooldown untouched")
     threading.Thread(target=connection_watchdog, daemon=True, name='connection-watchdog').start()
     threading.Thread(target=memory_guard_worker, daemon=True, name='memory-guard-worker').start()
     threading.Thread(target=restart_sticky_persist_worker, daemon=True, name='restart-sticky-persist').start()
@@ -12137,7 +12277,7 @@ def leader_supervisor():
 @app.route('/')
 def index():
     role = "leader" if leader_active_event.is_set() else "standby"
-    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.39 AuctionPriority+Dedup+Adaptive10+HandoffSafe, {role})"
+    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.41 MemoryPlateauSafe+TelegramUI+PremiumBackup+AuctionPriority, {role})"
 
 
 @app.route('/health')
