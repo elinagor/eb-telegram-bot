@@ -368,6 +368,21 @@ MEMORY_EMERGENCY_MB = max(MEMORY_HIGH_MB + 20, min(int(os.getenv("MEMORY_EMERGEN
 # Clear HIGH pressure below the current production baseline window instead of the old 360 MB.
 # This keeps 40 MB hysteresis below HIGH=450 while avoiding a latched pressure event after a spike.
 MEMORY_CLEAR_MB = min(MEMORY_HIGH_MB - 30, max(180, int(os.getenv("MEMORY_CLEAR_MB", "410"))))
+# V6.43: production now has a stable high-memory plateau around 460-465 MB. Completely
+# disabling the TLS-only SmartReserve at HIGH leaves only 1-2 warm proxies and makes a
+# difficult failover depend entirely on fresh discovery. Allow a tiny reserve ONLY in the
+# idle gap, below a conservative ceiling, with one worker and at most two TLS checks.
+# It never downloads an eBay page and still stops well below the emergency ceiling.
+PROXY_PREFLIGHT_HIGH_MEMORY_CEILING_MB = min(
+    MEMORY_EMERGENCY_MB - 12,
+    max(MEMORY_HIGH_MB + 5, int(os.getenv("PROXY_PREFLIGHT_HIGH_MEMORY_CEILING_MB", "468"))),
+)
+PROXY_PREFLIGHT_HIGH_MEMORY_BATCH = max(
+    1, min(int(os.getenv("PROXY_PREFLIGHT_HIGH_MEMORY_BATCH", "2")), 4)
+)
+PROXY_PREFLIGHT_HIGH_MEMORY_CONCURRENCY = max(
+    1, min(int(os.getenv("PROXY_PREFLIGHT_HIGH_MEMORY_CONCURRENCY", "1")), 2)
+)
 # V6.39: user-submitted auction links are durable/important and must not be starved merely
 # because optional background work is paused at HIGH memory. Keep the global HIGH/EMERGENCY
 # protection unchanged, but allow ONE memory-throttled auction job below a separate ceiling.
@@ -447,6 +462,16 @@ PROXYSCRAPE_PREMIUM_REFRESH = max(60, int(os.getenv("PROXYSCRAPE_PREMIUM_REFRESH
 # genuinely struggling, or immediately in emergency/exhaustion paths.
 PREMIUM_UNLOCK_AFTER = max(5.0, float(os.getenv("PREMIUM_UNLOCK_AFTER", "12")))
 PREMIUM_UNLOCK_ATTEMPTS = max(8, int(os.getenv("PREMIUM_UNLOCK_ATTEMPTS", "20")))
+# V6.43: "allow Premium" in the generic batch is not a guarantee that a Premium
+# endpoint is ever selected when the free pool is large. After a genuinely difficult
+# discovery, reserve exactly ONE eligible Premium endpoint so the paid trial remains a
+# real late backup without displacing the stronger HProxy/Databay/Proxio early paths.
+PREMIUM_FORCE_BACKUP_AFTER = max(
+    PREMIUM_UNLOCK_AFTER, float(os.getenv("PREMIUM_FORCE_BACKUP_AFTER", "20"))
+)
+PREMIUM_FORCE_BACKUP_ATTEMPTS = max(
+    PREMIUM_UNLOCK_ATTEMPTS, int(os.getenv("PREMIUM_FORCE_BACKUP_ATTEMPTS", "32"))
+)
 WEBSHARE_REFRESH = max(60, int(os.getenv("WEBSHARE_REFRESH", "300")))
 WEBSHARE_STATS_REFRESH = max(300, int(os.getenv("WEBSHARE_STATS_REFRESH", "600")))
 
@@ -757,10 +782,16 @@ def _memory_maintenance(reason='', force=False):
         _release_python_memory(force_trim=True)
         after = _memory_rss_mb()
         if after is not None and (force or before >= MEMORY_HIGH_MB):
-            logging.info(
-                f"🧠 Memory cleanup{(' (' + reason + ')') if reason else ''}: "
-                f"RSS {before:.0f}→{after:.0f} MB"
-            )
+            # V6.43: at the new ~460 MB stable plateau the 10-second guard often trims
+            # 0-1 MB and used to flood the log with no-op cleanup lines. Keep the cleanup
+            # itself unchanged for safety; suppress only low-value guard logging. Forced,
+            # parse/discovery cleanups and meaningful >=2 MB guard releases remain visible.
+            released_mb = before - after
+            if force or reason != 'guard' or released_mb >= 2.0:
+                logging.info(
+                    f"🧠 Memory cleanup{(' (' + reason + ')') if reason else ''}: "
+                    f"RSS {before:.0f}→{after:.0f} MB"
+                )
         rss = after if after is not None else before
     if rss is not None:
         if rss >= MEMORY_HIGH_MB:
@@ -3625,6 +3656,39 @@ class ProxyManager:
         if not provider_manager.claim_webshare_half_open():
             return None
         with self.lock:
+            self.last_used[chosen] = now
+        return chosen
+
+    def get_premium_backup_candidate(self, excluded_hosts=None):
+        """Return one eligible Premium endpoint for the late backup tier.
+
+        Unlike the generic mixed candidate batch, this method guarantees source selection
+        but still respects provider circuit state plus per-proxy/host cooldowns. It is used
+        at most once per discovery by the v6.43 late-backup gate.
+        """
+        excluded_hosts = set(excluded_hosts or ())
+        raw = provider_manager.candidates(include_webshare=False)
+        if not raw:
+            return None
+        now = time.time()
+        with self.lock:
+            self._cleanup_bad_locked()
+            rows = []
+            for proxy in raw:
+                if provider_manager.source_fast(proxy) != 'proxyscrape_premium':
+                    continue
+                host = _proxy_host(proxy)
+                if not host or host in excluded_hosts:
+                    continue
+                if self.bad_until.get(proxy, 0) > now or self.host_bad_until.get(host, 0) > now:
+                    continue
+                if self.soft_host_penalty_until.get(host, 0) > now:
+                    continue
+                rows.append(proxy)
+            if not rows:
+                return None
+            rows.sort(key=lambda p: self._candidate_score_locked(p, now), reverse=True)
+            chosen = rows[0]
             self.last_used[chosen] = now
         return chosen
 
@@ -8766,7 +8830,7 @@ def auction_link_worker():
                 continue
             finally:
                 auction_user_job_active_event.clear()
-                # V6.41: auction/search pages can temporarily keep several large HTML/DOM
+                # V6.43: auction/search pages can temporarily keep several large HTML/DOM
                 # objects alive. Auction jobs are rare, so an immediate trim here is cheap
                 # and avoids carrying their high-water mark into the next main 1.6 MB parse.
                 _memory_maintenance('auction job done', force=True)
@@ -10649,6 +10713,7 @@ def fetch_ebay_html_with_fixed_pair():
     future_to_proxy = {}
     last_concurrency_logged = None
     premium_backup_unlock_logged = False
+    premium_forced_backup_used = False
 
     def desired_concurrency():
         nonlocal last_concurrency_logged
@@ -10663,7 +10728,7 @@ def fetch_ebay_html_with_fixed_pair():
         # Real protective mode starts at 450 MB by default. Check RSS directly as well as
         # the background Event so a fast discovery spike cannot wait for the next 10-sec guard tick.
         elif (rss_now is not None and rss_now >= MEMORY_HIGH_MB) or (rss_now is None and memory_pressure_event.is_set()):
-            # V6.41: use fresh RSS as the authority whenever it is available. The HIGH
+            # V6.43: use fresh RSS as the authority whenever it is available. The HIGH
             # event intentionally has deep hysteresis for optional background workers and
             # may remain set after RSS falls back into the 420-449 MB plateau. Letting that
             # stale latch force urgent main failover to 4 workers forever is unnecessary:
@@ -10786,7 +10851,7 @@ def fetch_ebay_html_with_fixed_pair():
 
     def submit_more():
         """Поддерживает rolling in-flight probe и один безопасный последний re-probe."""
-        nonlocal attempts, refreshed_after_exhaustion, final_reprobe_used, premium_backup_unlock_logged
+        nonlocal attempts, refreshed_after_exhaustion, final_reprobe_used, premium_backup_unlock_logged, premium_forced_backup_used
 
         elapsed_now = time.monotonic() - started
         if elapsed_now >= SEARCH_TIME_BUDGET:
@@ -10831,13 +10896,14 @@ def fetch_ebay_html_with_fixed_pair():
                 active_ws_accounts = provider_manager.usable_webshare_account_count()
                 unique_ws_hosts = provider_manager.webshare_unique_host_count()
                 # Multiple keys often expose the SAME 10 exit IPs. Treat extra accounts
-                # as bandwidth capacity, not artificial IP diversity. With two funded
-                # accounts we can afford two different Webshare exits early, but never
-                # consume 3/4 first-wave workers just because more credentials exist.
+                # as bandwidth capacity, not artificial IP diversity. V6.43 production
+                # showed the new Webshare attempts in this hour adding only 403s while
+                # HProxy/Databay/Proxio kept producing winners. Reserve only ONE early
+                # Webshare exit; a second worker is more valuable for the independent pools.
                 ws_first_limit = min(
                     active_ws_accounts,
                     unique_ws_hosts,
-                    2,
+                    1,
                     max(1, need - 1) if need > 1 else 1,
                 )
                 ws_rescues = proxy_manager.get_webshare_rescue_candidates(
@@ -10853,6 +10919,50 @@ def fetch_ebay_html_with_fixed_pair():
                         break
                     batch.append(ws_rescue)
                     batch_kinds[ws_rescue] = 'Webshare bridge'
+
+            # Determine provider gates before the rolling slot-fillers. Once the late
+            # Premium threshold is due, one eligible Premium endpoint must get the NEXT
+            # available worker slot; putting this after warm/external selection can starve
+            # it indefinitely because rolling discovery commonly has only one free slot.
+            elapsed_for_provider = time.monotonic() - started
+            premium_backup_allowed = (
+                elapsed_for_provider >= PREMIUM_UNLOCK_AFTER
+                or attempts >= PREMIUM_UNLOCK_ATTEMPTS
+            )
+            if (
+                premium_backup_allowed
+                and not premium_backup_unlock_logged
+                and provider_manager.has_usable_premium()
+            ):
+                logging.info(
+                    f"🔷 Premium backup unlocked: elapsed={elapsed_for_provider:.1f}s, "
+                    f"attempts={attempts}; primary free/Proxio/HProxy/Databay paths had first chance"
+                )
+                premium_backup_unlock_logged = True
+
+            premium_force_due = (
+                elapsed_for_provider >= PREMIUM_FORCE_BACKUP_AFTER
+                or attempts >= PREMIUM_FORCE_BACKUP_ATTEMPTS
+            )
+            if (
+                len(batch) < need
+                and premium_force_due
+                and not premium_forced_backup_used
+            ):
+                premium_backup = proxy_manager.get_premium_backup_candidate(
+                    excluded_hosts=(
+                        tried_hosts | inflight_hosts | {_proxy_host(p) for p in batch}
+                    )
+                )
+                if premium_backup is not None:
+                    batch.append(premium_backup)
+                    batch_kinds[premium_backup] = 'Premium backup'
+                    premium_forced_backup_used = True
+                    logging.info(
+                        f"🔷 Guaranteed late Premium backup probe reserved: "
+                        f"elapsed={elapsed_for_provider:.1f}s, attempts={attempts}, "
+                        f"proxy {_proxy_log_name(premium_backup)}"
+                    )
 
             # V6.28: while the shared Webshare 403-circuit is active, allow exactly one
             # controlled half-open probe roughly once per minute. This is intentionally
@@ -10973,7 +11083,6 @@ def fetch_ebay_html_with_fixed_pair():
 
             remaining_need = need - len(batch)
             if remaining_need > 0:
-                elapsed_for_provider = time.monotonic() - started
                 first_wave_has_webshare = any(
                     kind == 'Webshare bridge' for kind in batch_kinds.values()
                 )
@@ -10985,20 +11094,7 @@ def fetch_ebay_html_with_fixed_pair():
                         or attempts >= WEBSHARE_UNLOCK_ATTEMPTS
                     )
                 )
-                premium_backup_allowed = (
-                    elapsed_for_provider >= PREMIUM_UNLOCK_AFTER
-                    or attempts >= PREMIUM_UNLOCK_ATTEMPTS
-                )
-                if (
-                    premium_backup_allowed
-                    and not premium_backup_unlock_logged
-                    and provider_manager.has_usable_premium()
-                ):
-                    logging.info(
-                        f"🔷 Premium backup unlocked: elapsed={elapsed_for_provider:.1f}s, "
-                        f"attempts={attempts}; primary free/Proxio/HProxy/Databay paths had first chance"
-                    )
-                    premium_backup_unlock_logged = True
+
                 normal_batch = proxy_manager.get_candidate_batch(
                     remaining_need,
                     tried_hosts=tried_hosts | {_proxy_host(p) for p in batch},
@@ -11926,13 +12022,32 @@ def proxy_preflight_warm_worker():
 
     while True:
         try:
+            reserve_rss_gate = _memory_rss_mb() if MEMORY_GUARD_ENABLED else None
+            # Fresh RSS is authoritative here. The background Event is intentionally
+            # hysteretic and may lag a new >HIGH spike for up to one guard interval.
+            # Never allow a full reserve batch merely because the Event has not caught up yet.
+            reserve_pressure = bool(
+                memory_pressure_event.is_set()
+                or (
+                    reserve_rss_gate is not None
+                    and reserve_rss_gate >= MEMORY_HIGH_MB
+                )
+            )
+            reserve_high_micro = bool(
+                reserve_pressure
+                and reserve_rss_gate is not None
+                and reserve_rss_gate < PROXY_PREFLIGHT_HIGH_MEMORY_CEILING_MB
+            )
             if (
                 not PROXY_PREFLIGHT_ENABLED
                 or PROXY_PREFLIGHT_WARM_BATCH <= 0
                 or is_paused
                 or fixed_proxy is None
                 or main_discovery_active_event.is_set()
-                or memory_pressure_event.is_set()
+                or (
+                    reserve_pressure
+                    and not reserve_high_micro
+                )
                 or auction_user_job_active_event.is_set()
                 or main_fixed_request_lock.locked()
             ):
@@ -11951,6 +12066,20 @@ def proxy_preflight_warm_worker():
             # это примерно одним скачиванием в минуту; warm reserve при refresh сохраняется.
             proxy_manager.refresh_proxies(force=False, emergency=False)
 
+            # Metadata refreshes above can take a few seconds. Re-check ownership immediately
+            # before opening any reserve sockets so a main/auction request that started during
+            # that window is not needlessly overlapped by optional background preflight.
+            if (
+                is_paused
+                or fixed_proxy is None
+                or main_discovery_active_event.is_set()
+                or auction_user_job_active_event.is_set()
+                or main_fixed_request_lock.locked()
+            ):
+                proxy_preflight_wakeup_event.wait(timeout=PROXY_PREFLIGHT_WARM_INTERVAL)
+                proxy_preflight_wakeup_event.clear()
+                continue
+
             excluded = {_proxy_host(fixed_proxy)} if fixed_proxy else set()
 
             if PROXY_QUALITY_PREFLIGHT_ENABLED:
@@ -11960,16 +12089,33 @@ def proxy_preflight_warm_worker():
                     if quality_before < PROXY_PREFLIGHT_RESERVE_TARGET
                     else PROXY_PREFLIGHT_MAINTENANCE_BATCH
                 )
-                # V6.41: once RSS reaches the same 420 MB burst gate used by main discovery,
+                # V6.43: once RSS reaches the same 420 MB burst gate used by main discovery,
                 # keep this OPTIONAL background worker in maintenance mode. This reduces
                 # simultaneous TLS/CONNECT objects while preserving a small warm reserve.
                 # HIGH memory still pauses the worker entirely via the guard above.
                 reserve_rss = _memory_rss_mb() if MEMORY_GUARD_ENABLED else None
+                # Re-check after metadata refresh: direct RSS is authoritative even if the
+                # hysteretic Event has not been set yet by the 10-second guard worker.
+                reserve_pressure = bool(
+                    memory_pressure_event.is_set()
+                    or (reserve_rss is not None and reserve_rss >= MEMORY_HIGH_MB)
+                )
+                reserve_high_micro = bool(
+                    reserve_pressure
+                    and reserve_rss is not None
+                    and reserve_rss < PROXY_PREFLIGHT_HIGH_MEMORY_CEILING_MB
+                )
+                if reserve_pressure and not reserve_high_micro:
+                    proxy_preflight_wakeup_event.wait(timeout=PROXY_PREFLIGHT_WARM_INTERVAL)
+                    proxy_preflight_wakeup_event.clear()
+                    continue
                 reserve_elevated = (
                     reserve_rss is not None
                     and reserve_rss >= PROBE_BURST_MEMORY_CEILING_MB
                 )
-                if reserve_elevated:
+                if reserve_high_micro:
+                    batch_limit = min(batch_limit, PROXY_PREFLIGHT_HIGH_MEMORY_BATCH)
+                elif reserve_elevated:
                     batch_limit = min(batch_limit, PROXY_PREFLIGHT_MAINTENANCE_BATCH)
                 # Reserve a small part of the existing preflight batch for HProxy/Databay/Proxio.
                 # These checks are neutral CONNECT+TLS only (no eBay), so bad external
@@ -11994,7 +12140,11 @@ def proxy_preflight_warm_worker():
                 reason_counts = {}
                 if candidates:
                     reserve_workers = PROXY_PREFLIGHT_WARM_CONCURRENCY
-                    if reserve_elevated:
+                    if reserve_high_micro:
+                        reserve_workers = min(
+                            reserve_workers, PROXY_PREFLIGHT_HIGH_MEMORY_CONCURRENCY
+                        )
+                    elif reserve_elevated:
                         reserve_workers = min(reserve_workers, 2)
                     with ThreadPoolExecutor(
                         max_workers=min(reserve_workers, len(candidates)),
@@ -12031,22 +12181,59 @@ def proxy_preflight_warm_worker():
                         f", external_preflight={external_checked}/{external_ok}"
                         if external_checked else ""
                     )
-                    mem_suffix = (
-                        f", elevated_memory≈{reserve_rss:.0f}MB/batch≤{batch_limit}/workers≤2"
-                        if reserve_elevated else ""
-                    )
+                    if reserve_high_micro:
+                        mem_suffix = (
+                            f", HIGH-micro≈{reserve_rss:.0f}MB/"
+                            f"batch≤{batch_limit}/workers≤{reserve_workers}"
+                        )
+                    elif reserve_elevated:
+                        mem_suffix = (
+                            f", elevated_memory≈{reserve_rss:.0f}MB/batch≤{batch_limit}/workers≤2"
+                        )
+                    else:
+                        mem_suffix = ""
                     logging.info(
                         f"🧪 Smart reserve: HTTPS-ready={quality_after}, TCP-only={tcp_after}; "
                         f"проверено={checked}, quality_ok={ok_count}{ext_suffix}{mem_suffix}, failures[{failure_summary}]"
                     )
             else:
+                # TCP-only fallback is uncommon, but it must obey exactly the same memory
+                # envelope as the HTTPS/TLS reserve path. Otherwise disabling quality
+                # preflight via ENV could accidentally bypass HIGH-micro throttling.
+                reserve_rss = _memory_rss_mb() if MEMORY_GUARD_ENABLED else None
+                reserve_pressure = bool(
+                    memory_pressure_event.is_set()
+                    or (reserve_rss is not None and reserve_rss >= MEMORY_HIGH_MB)
+                )
+                reserve_high_micro = bool(
+                    reserve_pressure
+                    and reserve_rss is not None
+                    and reserve_rss < PROXY_PREFLIGHT_HIGH_MEMORY_CEILING_MB
+                )
+                if reserve_pressure and not reserve_high_micro:
+                    proxy_preflight_wakeup_event.wait(timeout=PROXY_PREFLIGHT_WARM_INTERVAL)
+                    proxy_preflight_wakeup_event.clear()
+                    continue
+                reserve_elevated = bool(
+                    reserve_rss is not None
+                    and reserve_rss >= PROBE_BURST_MEMORY_CEILING_MB
+                )
+                tcp_batch_limit = PROXY_PREFLIGHT_WARM_BATCH
+                tcp_workers = PROXY_PREFLIGHT_WARM_CONCURRENCY
+                if reserve_high_micro:
+                    tcp_batch_limit = min(tcp_batch_limit, PROXY_PREFLIGHT_HIGH_MEMORY_BATCH)
+                    tcp_workers = min(tcp_workers, PROXY_PREFLIGHT_HIGH_MEMORY_CONCURRENCY)
+                elif reserve_elevated:
+                    tcp_batch_limit = min(tcp_batch_limit, PROXY_PREFLIGHT_MAINTENANCE_BATCH)
+                    tcp_workers = min(tcp_workers, 2)
+
                 candidates = proxy_manager.get_preflight_candidates(
-                    PROXY_PREFLIGHT_WARM_BATCH,
+                    tcp_batch_limit,
                     excluded_hosts=excluded,
                 )
                 if candidates:
                     with ThreadPoolExecutor(
-                        max_workers=min(PROXY_PREFLIGHT_WARM_CONCURRENCY, len(candidates)),
+                        max_workers=min(tcp_workers, len(candidates)),
                         thread_name_prefix='proxy-preflight',
                     ) as executor:
                         futures = [executor.submit(_tcp_preflight_proxy, p, True) for p in candidates]
@@ -12058,8 +12245,19 @@ def proxy_preflight_warm_worker():
                                     ok_count += 1
                             except Exception:
                                 pass
+                    mem_suffix = ""
+                    if reserve_high_micro:
+                        mem_suffix = (
+                            f", HIGH-micro≈{reserve_rss:.0f}MB/"
+                            f"batch≤{tcp_batch_limit}/workers≤{tcp_workers}"
+                        )
+                    elif reserve_elevated:
+                        mem_suffix = (
+                            f", elevated_memory≈{reserve_rss:.0f}MB/"
+                            f"batch≤{tcp_batch_limit}/workers≤{tcp_workers}"
+                        )
                     logging.info(
-                        f"🧪 TCP reserve fallback: живых {ok_count}/{len(candidates)}"
+                        f"🧪 TCP reserve fallback: живых {ok_count}/{len(candidates)}{mem_suffix}"
                     )
 
             proxy_preflight_wakeup_event.wait(timeout=PROXY_PREFLIGHT_WARM_INTERVAL)
@@ -12097,7 +12295,7 @@ def bot_worker():
     seen_line = f"\n📚 В базе: {seen_total} товаров." if seen_total is not None else ""
     startup_keyboard_ok = send_telegram_message(
         startup_line +
-        "\n🇬🇧 eBay UK monitor v6.41 MemoryPlateauSafe+TelegramUI+PremiumBackup+AuctionPriority работает." +
+        "\n🇬🇧 eBay UK monitor v6.43 MemoryPlateauSafe+TelegramUI+PremiumBackup+AuctionPriority работает." +
         seen_line +
         "\nКоманды: /stop /start /list (/auctions) /delauction НОМЕР_ЛОТА"
         "\nМожно отправить ссылку на eBay-аукцион — сохраню точное время и напомню заранее."
@@ -12183,20 +12381,21 @@ def start_leader_workers():
         name='telegram-ui-config',
     ).start()
     logging.info(
-        "🌐 Multi-provider v6.41: "
+        "🌐 Multi-provider v6.43: "
         f"ProxyScrape Premium={'ON' if PROXYSCRAPE_PREMIUM_API_KEY else 'OFF'}, "
         f"Webshare={'ON (' + str(len(WEBSHARE_API_KEYS)) + ' account(s))' if WEBSHARE_API_KEYS else 'OFF'}, "
-        f"Webshare first-batch={'ON (1-2 unique-host slots; extra keys=bandwidth)' if WEBSHARE_FIRST_BATCH else 'OFF'}, "
+        f"Webshare first-batch={'ON (1 unique-host slot; extra keys=bandwidth)' if WEBSHARE_FIRST_BATCH else 'OFF'}, "
         f"bridge-handoff={WEBSHARE_HANDOFF_AFTER:.0f}s, warm-first-wave={WARM_STANDBY_TOTAL_LIMIT}, "
         f"ws403-circuit={WEBSHARE_BLOCK_CIRCUIT_STREAK}, "
         f"premium403-throttle/circuit={PREMIUM_BLOCK_THROTTLE_STREAK}/{PREMIUM_BLOCK_CIRCUIT_STREAK}, "
         f"premium-backup-unlock={PREMIUM_UNLOCK_AFTER:.0f}s/{PREMIUM_UNLOCK_ATTEMPTS} attempts, "
+        f"premium-guarantee={PREMIUM_FORCE_BACKUP_AFTER:.0f}s/{PREMIUM_FORCE_BACKUP_ATTEMPTS} attempts (forced≤1/discovery), "
         f"premium-refresh={PROXYSCRAPE_PREMIUM_REFRESH}s"
     )
     proxio_calls_day = int((86400 + PROXIO_FREE_REFRESH - 1) // PROXIO_FREE_REFRESH) if PROXIO_FREE_ENABLED else 0
     proxio_calls_per_key = (proxio_calls_day / len(PROXIO_API_KEYS)) if PROXIO_API_KEYS else 0.0
     logging.info(
-        f"🧭 External sources v6.41: HProxy={'ON' if HPROXY_FREE_ENABLED else 'OFF'} "
+        f"🧭 External sources v6.43: HProxy={'ON' if HPROXY_FREE_ENABLED else 'OFF'} "
         f"(HTTPS, elite+anonymous, cap={HPROXY_FREE_ELITE_LIMIT + HPROXY_FREE_ANON_LIMIT}), "
         f"Databay={'ON' if DATABAY_FREE_ENABLED else 'OFF'} "
         f"(HTTPS strict+fast, elite+anonymous, cap={DATABAY_FREE_ELITE_LIMIT + DATABAY_FREE_ANON_LIMIT}), "
@@ -12207,7 +12406,7 @@ def start_leader_workers():
         f"neutral_preflight={EXTERNAL_FREE_PREFLIGHT_SLOTS}, normal ceiling={PROBE_MAX_CONCURRENCY}, long-outage ceiling={PROBE_EXTREME_OUTAGE_CONCURRENCY}"
     )
     logging.info(
-        f"⚡ Adaptive discovery v6.41: normal {PROBE_CONCURRENCY}→{PROBE_ESCALATED_CONCURRENCY}→"
+        f"⚡ Adaptive discovery v6.43: normal {PROBE_CONCURRENCY}→{PROBE_ESCALATED_CONCURRENCY}→"
         f"{PROBE_DEEP_CONCURRENCY}→{PROBE_BURST_CONCURRENCY}→{PROBE_MAX_CONCURRENCY} at "
         f"~0/{PROBE_ESCALATE_AFTER:.0f}/{PROBE_DEEP_ESCALATE_AFTER:.0f}/"
         f"{PROBE_BURST_ESCALATE_AFTER:.0f}/{PROBE_MAX_ESCALATE_AFTER:.0f}s; long-outage "
@@ -12219,18 +12418,20 @@ def start_leader_workers():
     logging.info(
         f"🧠 MemorySafe: RSS≈{rss:.0f} MB, soft/clear/high/emergency={MEMORY_SOFT_MB}/{MEMORY_CLEAR_MB}/{MEMORY_HIGH_MB}/{MEMORY_EMERGENCY_MB} MB; "
         f"burst/long-outage gates={PROBE_BURST_MEMORY_CEILING_MB}/{PROBE_LONG_OUTAGE_MEMORY_CEILING_MB} MB; "
-        f"background TLS workers={PROXY_PREFLIGHT_WARM_CONCURRENCY}" if rss is not None else
+        f"background TLS workers={PROXY_PREFLIGHT_WARM_CONCURRENCY}, "
+        f"HIGH-micro<{PROXY_PREFLIGHT_HIGH_MEMORY_CEILING_MB}MB="
+        f"{PROXY_PREFLIGHT_HIGH_MEMORY_BATCH} probe/{PROXY_PREFLIGHT_HIGH_MEMORY_CONCURRENCY} worker" if rss is not None else
         f"🧠 MemorySafe enabled: soft/clear/high/emergency={MEMORY_SOFT_MB}/{MEMORY_CLEAR_MB}/{MEMORY_HIGH_MB}/{MEMORY_EMERGENCY_MB} MB; "
         f"burst/long-outage gates={PROBE_BURST_MEMORY_CEILING_MB}/{PROBE_LONG_OUTAGE_MEMORY_CEILING_MB} MB"
     )
 
     threading.Thread(target=telegram_listener, daemon=True, name='telegram-listener').start()
     logging.info(
-        f"📨 Telegram intake v6.41: ItemID-dedupe ON; auction priority memory ceiling="
+        f"📨 Telegram intake v6.43: ItemID-dedupe ON; auction priority memory ceiling="
         f"{AUCTION_USER_MEMORY_LIMIT_MB}MB, high-memory fetch workers={AUCTION_HIGH_MEMORY_FETCH_PARALLEL}, "
         f"status_grace={AUCTION_LINK_STATUS_GRACE}s"
     )
-    logging.info(f"🌉 Handoff-safe v6.41: recent-good transient scout failures are isolated for {WEBSHARE_HANDOFF_TRANSIENT_COOLDOWN:.0f}s; main cooldown untouched")
+    logging.info(f"🌉 Handoff-safe v6.43: recent-good transient scout failures are isolated for {WEBSHARE_HANDOFF_TRANSIENT_COOLDOWN:.0f}s; main cooldown untouched")
     threading.Thread(target=connection_watchdog, daemon=True, name='connection-watchdog').start()
     threading.Thread(target=memory_guard_worker, daemon=True, name='memory-guard-worker').start()
     threading.Thread(target=restart_sticky_persist_worker, daemon=True, name='restart-sticky-persist').start()
@@ -12277,7 +12478,7 @@ def leader_supervisor():
 @app.route('/')
 def index():
     role = "leader" if leader_active_event.is_set() else "standby"
-    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.41 MemoryPlateauSafe+TelegramUI+PremiumBackup+AuctionPriority, {role})"
+    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.43 MemoryPlateauSafe+TelegramUI+PremiumBackup+AuctionPriority, {role})"
 
 
 @app.route('/health')
