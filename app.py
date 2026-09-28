@@ -279,7 +279,7 @@ AUCTION_PENDING_CLOSE_RETRY = max(60, min(int(os.getenv("AUCTION_PENDING_CLOSE_R
 AUCTION_PENDING_MIN_DELAY = max(60, int(os.getenv("AUCTION_PENDING_MIN_DELAY", "300")))
 AUCTION_PENDING_WINDOW_MARGIN = max(30, int(os.getenv("AUCTION_PENDING_WINDOW_MARGIN", "120")))
 AUCTION_PENDING_MINUTE_MARGIN = max(5, int(os.getenv("AUCTION_PENDING_MINUTE_MARGIN", "15")))
-# V6.46: eBay search-card часто показывает countdown только до минуты. После ДВУХ
+# V6.47: eBay search-card часто показывает countdown только до минуты. После ДВУХ
 # согласованных наблюдений пересечение может стать очень узким (например 37 секунд),
 # но всё ещё пересекать границу двух календарных минут. Раньше такой лот оставался
 # жёлтым и перепроверялся каждые ~3 минуты часами. Если уже есть предыдущее
@@ -618,6 +618,22 @@ PROXIO_FREE_ENABLED = bool(PROXIO_API_KEYS) and os.getenv("PROXIO_FREE_ENABLED",
 EXTERNAL_FREE_API_TIMEOUT = max(3.0, min(float(os.getenv("EXTERNAL_FREE_API_TIMEOUT", "8")), 15.0))
 HPROXY_FREE_REFRESH = max(60, int(os.getenv("HPROXY_FREE_REFRESH", "60")))
 DATABAY_FREE_REFRESH = max(120, int(os.getenv("DATABAY_FREE_REFRESH", "300")))
+# Databay officially publishes both the filtered JSON API and stable protocol hotlinks.
+# The public API occasionally returns edge/CDN 401/429 even though Databay documents it
+# as no-key. Keep the filtered API as primary, but fall back to their official HTTPS
+# hotlink instead of dropping the whole source. If both paths fail, last_refresh is
+# advanced so we back off until the normal refresh interval instead of hammering the API.
+DATABAY_FREE_API_URL = (os.getenv("DATABAY_FREE_API_URL") or "https://databay.com/api/v1/proxy-list").strip()
+DATABAY_FREE_HOTLINK_URL = (
+    os.getenv("DATABAY_FREE_HOTLINK_URL") or "https://databay.com/free-proxy-list/https.txt"
+).strip()
+DATABAY_FREE_HOTLINK_LIMIT = max(
+    50, min(int(os.getenv("DATABAY_FREE_HOTLINK_LIMIT", "250")), 500)
+)
+DATABAY_FREE_HTTP_HEADERS = {
+    "Accept": "application/json,text/plain;q=0.9,*/*;q=0.5",
+    "User-Agent": "Mozilla/5.0 (compatible; eBayUKMonitor/6.47; +https://databay.com/free-proxy-list)",
+}
 
 # Proxio says its live list is re-tested roughly every five minutes, so refreshing faster
 # only burns API quota without adding useful freshness. The user currently has 100 calls/day
@@ -2393,15 +2409,34 @@ class ExternalFreeSourceManager:
         return list(dict.fromkeys((elite or []) + (anon or [])))
 
     def _fetch_databay_group(self, anonymity, limit):
+        """Filtered Databay API path.
+
+        Returns (rows, status_text). A non-200 response is not treated as an authentication
+        requirement because Databay documents this public endpoint as no-key; _fetch_databay
+        will immediately try Databay's official HTTPS hotlink instead.
+        """
         params = {
             'protocol': 'https', 'ssl': 'strict', 'speed': 'fast',
             'anonymity': anonymity, 'format': 'json', 'limit': int(limit), 'page': 1,
         }
-        resp = requests.get('https://databay.com/api/v1/proxy-list', params=params, timeout=EXTERNAL_FREE_API_TIMEOUT)
+        try:
+            resp = requests.get(
+                DATABAY_FREE_API_URL,
+                params=params,
+                headers=DATABAY_FREE_HTTP_HEADERS,
+                timeout=EXTERNAL_FREE_API_TIMEOUT,
+            )
+        except Exception as e:
+            return None, f"network:{type(e).__name__}"
+
         if resp.status_code != 200:
-            logging.warning(f"Databay free API HTTP {resp.status_code}; keep previous snapshot")
-            return None
-        rows = self._rows_from_json(resp.json())
+            return None, f"HTTP {int(resp.status_code)}"
+
+        try:
+            rows = self._rows_from_json(resp.json())
+        except Exception as e:
+            return None, f"json:{type(e).__name__}"
+
         out = []
         for row in rows:
             if not isinstance(row, dict):
@@ -2409,16 +2444,92 @@ class ExternalFreeSourceManager:
             proxy = self._normalize_http_proxy(row.get('ip') or row.get('host'), row.get('port'))
             if proxy:
                 out.append(proxy)
+        return out, "HTTP 200"
+
+    def _fetch_databay_hotlink(self):
+        """Fallback to Databay's documented, no-key HTTPS hotlink.
+
+        The file contract is deliberately simple: two optional comment lines followed by
+        one IP:PORT per line. These are still passed through our existing neutral
+        TLS/CONNECT preflight before they receive an eBay slot.
+        """
+        try:
+            resp = requests.get(
+                DATABAY_FREE_HOTLINK_URL,
+                headers={
+                    "Accept": "text/plain,*/*;q=0.5",
+                    "User-Agent": DATABAY_FREE_HTTP_HEADERS["User-Agent"],
+                },
+                timeout=EXTERNAL_FREE_API_TIMEOUT,
+            )
+        except Exception as e:
+            logging.warning(
+                f"Databay HTTPS hotlink unavailable ({type(e).__name__}); keep previous snapshot"
+            )
+            return None
+
+        if resp.status_code != 200:
+            logging.warning(
+                f"Databay HTTPS hotlink HTTP {resp.status_code}; keep previous snapshot"
+            )
+            return None
+
+        out = []
+        seen = set()
+        for raw in (resp.text or '').splitlines():
+            row = raw.strip()
+            if not row or row.startswith('#'):
+                continue
+            # Databay's current public hotlink contract is IP:PORT. Ignore malformed rows
+            # rather than ever converting them into a questionable proxy URL.
+            if row.count(':') != 1:
+                continue
+            host, port = row.rsplit(':', 1)
+            proxy = self._normalize_http_proxy(host, port)
+            if not proxy or proxy in seen:
+                continue
+            seen.add(proxy)
+            out.append(proxy)
+            if len(out) >= DATABAY_FREE_HOTLINK_LIMIT:
+                break
+
+        if not out:
+            logging.warning("Databay HTTPS hotlink returned no valid IP:PORT rows; keep previous snapshot")
+            return None
+
+        logging.info(
+            f"🟦 Databay official HTTPS hotlink fallback loaded: {len(out)} endpoint(s)"
+        )
         return out
 
     def _fetch_databay(self):
         if not DATABAY_FREE_ENABLED:
             return []
-        elite = self._fetch_databay_group('elite', DATABAY_FREE_ELITE_LIMIT)
-        anon = self._fetch_databay_group('anonymous', DATABAY_FREE_ANON_LIMIT)
-        if elite is None and anon is None:
-            return None
-        return list(dict.fromkeys((elite or []) + (anon or [])))
+
+        elite, elite_status = self._fetch_databay_group('elite', DATABAY_FREE_ELITE_LIMIT)
+
+        # Auth/rate responses apply to the same public API edge, so do not waste a second
+        # request for the anonymous filter. Go straight to Databay's documented hotlink.
+        if elite_status in ('HTTP 401', 'HTTP 403', 'HTTP 429'):
+            logging.warning(
+                f"Databay filtered API unavailable ({elite_status}); "
+                "switching to official HTTPS hotlink fallback"
+            )
+            return self._fetch_databay_hotlink()
+
+        anon, anon_status = self._fetch_databay_group('anonymous', DATABAY_FREE_ANON_LIMIT)
+
+        if elite is not None or anon is not None:
+            merged = list(dict.fromkeys((elite or []) + (anon or [])))
+            if merged:
+                return merged
+
+        logging.warning(
+            "Databay filtered API unavailable "
+            f"(elite={elite_status}, anonymous={anon_status}); "
+            "switching to official HTTPS hotlink fallback"
+        )
+        return self._fetch_databay_hotlink()
 
     @staticmethod
     def _proxio_number(value, default=None):
@@ -2716,6 +2827,12 @@ class ExternalFreeSourceManager:
 
                     rows = result
                     if rows is None:
+                        # Databay's public API can transiently fail at its edge. If both the
+                        # filtered API and the official hotlink are unavailable, count this
+                        # as the scheduled refresh attempt so repeated main cycles do not
+                        # hammer Databay and trigger an avoidable 429.
+                        if source == 'databay':
+                            self.last_refresh[source] = stamp
                         continue
                     self.snapshots[source] = list(rows)
                     self.last_refresh[source] = stamp
@@ -8678,7 +8795,7 @@ def _save_pending_from_observation(observation, original_url, notify=True, refin
         )
         return 'exact'
 
-    # V6.46: do not keep a user auction yellow for hours merely because a very narrow,
+    # V6.47: do not keep a user auction yellow for hours merely because a very narrow,
     # repeatedly-confirmed countdown window crosses a UTC minute boundary. The early edge
     # is deliberately used as the reminder anchor: notifications can be up to ~75 s early,
     # but cannot be late if the real end remains inside the confirmed overlap.
@@ -12857,7 +12974,7 @@ def bot_worker():
     seen_line = f"\n📚 В базе: {seen_total} товаров." if seen_total is not None else ""
     startup_keyboard_ok = send_telegram_message(
         startup_line +
-        "\n🇬🇧 eBay UK monitor v6.46 AuctionConsensusSafe+BalancedOutage+MemorySelfHeal работает." +
+        "\n🇬🇧 eBay UK monitor v6.47 AuctionConsensusSafe+BalancedOutage+MemorySelfHeal работает." +
         seen_line +
         "\nКоманды: /stop /start /list (/auctions) /delauction НОМЕР_ЛОТА"
         "\nМожно отправить ссылку на eBay-аукцион — надёжно сохраню окончание и включу напоминания заранее."
@@ -12943,7 +13060,7 @@ def start_leader_workers():
         name='telegram-ui-config',
     ).start()
     logging.info(
-        "🌐 Multi-provider v6.46: "
+        "🌐 Multi-provider v6.47: "
         f"ProxyScrape Premium={'ON' if PROXYSCRAPE_PREMIUM_API_KEY else 'OFF'}, "
         f"Webshare={'ON (' + str(len(WEBSHARE_API_KEYS)) + ' account(s))' if WEBSHARE_API_KEYS else 'OFF'}, "
         f"Webshare first-batch={'ON (1 unique-host slot; extra keys=bandwidth)' if WEBSHARE_FIRST_BATCH else 'OFF'}, "
@@ -12957,10 +13074,11 @@ def start_leader_workers():
     proxio_calls_day = int((86400 + PROXIO_FREE_REFRESH - 1) // PROXIO_FREE_REFRESH) if PROXIO_FREE_ENABLED else 0
     proxio_calls_per_key = (proxio_calls_day / len(PROXIO_API_KEYS)) if PROXIO_API_KEYS else 0.0
     logging.info(
-        f"🧭 External sources v6.46: HProxy={'ON' if HPROXY_FREE_ENABLED else 'OFF'} "
+        f"🧭 External sources v6.47: HProxy={'ON' if HPROXY_FREE_ENABLED else 'OFF'} "
         f"(HTTPS, elite+anonymous, cap={HPROXY_FREE_ELITE_LIMIT + HPROXY_FREE_ANON_LIMIT}), "
         f"Databay={'ON' if DATABAY_FREE_ENABLED else 'OFF'} "
-        f"(HTTPS strict+fast, elite+anonymous, cap={DATABAY_FREE_ELITE_LIMIT + DATABAY_FREE_ANON_LIMIT}), "
+        f"(HTTPS strict+fast API + official HTTPS hotlink fallback, "
+        f"cap={DATABAY_FREE_ELITE_LIMIT + DATABAY_FREE_ANON_LIMIT}), "
         f"Proxio={'ON (' + str(len(PROXIO_API_KEYS)) + ' key(s))' if PROXIO_FREE_ENABLED else 'OFF'} "
         f"(Elite HTTPS, cap={PROXIO_SNAPSHOT_LIMIT}, refresh={PROXIO_FREE_REFRESH}s, "
         f"designed≈{proxio_calls_day} calls/day total≈{proxio_calls_per_key:.1f}/key); "
@@ -12969,7 +13087,7 @@ def start_leader_workers():
         f"long/extreme/ultra ceilings={PROBE_LONG_OUTAGE_CONCURRENCY}/{PROBE_EXTREME_OUTAGE_CONCURRENCY}/{PROBE_ULTRA_OUTAGE_CONCURRENCY}"
     )
     logging.info(
-        f"⚡ Adaptive discovery v6.46: normal {PROBE_CONCURRENCY}→{PROBE_ESCALATED_CONCURRENCY}→"
+        f"⚡ Adaptive discovery v6.47: normal {PROBE_CONCURRENCY}→{PROBE_ESCALATED_CONCURRENCY}→"
         f"{PROBE_DEEP_CONCURRENCY}→{PROBE_BURST_CONCURRENCY}→{PROBE_MAX_CONCURRENCY} at "
         f"~0/{PROBE_ESCALATE_AFTER:.0f}/{PROBE_DEEP_ESCALATE_AFTER:.0f}/"
         f"{PROBE_BURST_ESCALATE_AFTER:.0f}/{PROBE_MAX_ESCALATE_AFTER:.0f}s; long-outage "
@@ -12994,12 +13112,12 @@ def start_leader_workers():
 
     threading.Thread(target=telegram_listener, daemon=True, name='telegram-listener').start()
     logging.info(
-        f"📨 Telegram intake v6.46: ItemID-dedupe ON; auction priority memory ceiling="
+        f"📨 Telegram intake v6.47: ItemID-dedupe ON; auction priority memory ceiling="
         f"{AUCTION_USER_MEMORY_LIMIT_MB}MB, high-memory fetch workers={AUCTION_HIGH_MEMORY_FETCH_PARALLEL}, "
         f"status_grace={AUCTION_LINK_STATUS_GRACE}s; long-outage low-impact="
         f"{AUCTION_DURING_DISCOVERY_AFTER:.0f}s/RSS<{AUCTION_DURING_DISCOVERY_MEMORY_CEILING_MB}MB"
     )
-    logging.info(f"🌉 Handoff-safe v6.46: recent-good transient scout failures are isolated for {WEBSHARE_HANDOFF_TRANSIENT_COOLDOWN:.0f}s; main cooldown untouched")
+    logging.info(f"🌉 Handoff-safe v6.47: recent-good transient scout failures are isolated for {WEBSHARE_HANDOFF_TRANSIENT_COOLDOWN:.0f}s; main cooldown untouched")
     threading.Thread(target=connection_watchdog, daemon=True, name='connection-watchdog').start()
     threading.Thread(target=memory_guard_worker, daemon=True, name='memory-guard-worker').start()
     threading.Thread(target=restart_sticky_persist_worker, daemon=True, name='restart-sticky-persist').start()
@@ -13027,7 +13145,7 @@ def leader_supervisor():
         try:
             logging.info(
                 f"🔐 PostgreSQL leader-lock получен (pid={os.getpid()}); "
-                "инициализируем v6.46 leader workers"
+                "инициализируем v6.47 leader workers"
             )
             start_leader_workers()
             # Держим session-level advisory lock отдельным соединением.
@@ -13050,7 +13168,7 @@ def leader_supervisor():
 @app.route('/')
 def index():
     role = "leader" if leader_active_event.is_set() else "standby"
-    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.46 AuctionConsensusSafe+BalancedOutage+MemorySelfHeal, {role})"
+    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.47 AuctionConsensusSafe+BalancedOutage+MemorySelfHeal, {role})"
 
 
 @app.route('/health')
@@ -13062,7 +13180,7 @@ def health():
 
 if __name__ == "__main__":
     logging.info(
-        f"🚀 Render process v6.46 started (pid={os.getpid()}); "
+        f"🚀 Render process v6.47 started (pid={os.getpid()}); "
         "Flask запускается сразу, фоновые worker-ы ждут PostgreSQL leader-lock"
     )
     # Flask привязывается к PORT сразу, чтобы новый Render instance прошёл health/port check.
