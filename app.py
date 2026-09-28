@@ -383,17 +383,53 @@ PROXY_PREFLIGHT_HIGH_MEMORY_BATCH = max(
 PROXY_PREFLIGHT_HIGH_MEMORY_CONCURRENCY = max(
     1, min(int(os.getenv("PROXY_PREFLIGHT_HIGH_MEMORY_CONCURRENCY", "1")), 2)
 )
-# V6.39: user-submitted auction links are durable/important and must not be starved merely
-# because optional background work is paused at HIGH memory. Keep the global HIGH/EMERGENCY
-# protection unchanged, but allow ONE memory-throttled auction job below a separate ceiling.
-# 490 MB leaves ~22 MB below Render's 512 MB hard limit; at HIGH memory auction reserve
-# fetching is serialized to one response at a time to avoid a multi-page burst.
+# V6.39/V6.44: user-submitted auction links are durable/important and must not be starved
+# merely because optional background work is paused at HIGH memory. At the same time, the
+# 2026-09-28 log proved that the process can plateau near the hard limit, so keep auction
+# network work below 485 MB by default. The durable queue waits safely above that ceiling.
 AUCTION_USER_MEMORY_LIMIT_MB = min(
-    495, max(MEMORY_HIGH_MB + 10, int(os.getenv("AUCTION_USER_MEMORY_LIMIT_MB", "490")))
+    490, max(MEMORY_HIGH_MB + 10, int(os.getenv("AUCTION_USER_MEMORY_LIMIT_MB", "485")))
 )
 AUCTION_HIGH_MEMORY_FETCH_PARALLEL = max(
     1, min(int(os.getenv("AUCTION_HIGH_MEMORY_FETCH_PARALLEL", "1")), 2)
 )
+
+# V6.44 MemorySelfHeal: the 2026-09-28 production log showed a qualitatively different
+# state from the earlier ~465 MB plateau: after gc.collect()+malloc_trim the process could
+# remain around 511-512 MB and transiently reach 522-523 MB. At that point repeatedly
+# calling GC is not enough; native libcurl/allocator high-water can remain resident.
+#
+# Stage 1 is non-disruptive: when normal GC/trim still leaves RSS >=485 MB, close stale/idle curl sessions, discard only
+# rebuildable preflight/outage caches, run full GC + malloc_trim, then continue normally.
+# Stage 2 is a controlled PROCESS recycle only if post-reclaim RSS is still dangerously
+# high. Render restarts the web process; PostgreSQL keeps seen_items, auction queues/state,
+# and restart-sticky metadata, so this is safer than waiting for an arbitrary OOM kill.
+MEMORY_RECOVERY_TRIGGER_MB = max(
+    MEMORY_EMERGENCY_MB,
+    min(int(os.getenv("MEMORY_RECOVERY_TRIGGER_MB", "485")), 505),
+)
+MEMORY_RECYCLE_MB = max(
+    MEMORY_RECOVERY_TRIGGER_MB + 5,
+    min(int(os.getenv("MEMORY_RECYCLE_MB", "500")), 510),
+)
+MEMORY_HARD_RECYCLE_MB = max(
+    MEMORY_RECYCLE_MB + 5,
+    min(int(os.getenv("MEMORY_HARD_RECYCLE_MB", "510")), 520),
+)
+MEMORY_RECYCLE_SUSTAIN_SECONDS = max(
+    30.0, float(os.getenv("MEMORY_RECYCLE_SUSTAIN_SECONDS", "60"))
+)
+MEMORY_RECOVERY_COOLDOWN_SECONDS = max(
+    20.0, float(os.getenv("MEMORY_RECOVERY_COOLDOWN_SECONDS", "45"))
+)
+MEMORY_RECYCLE_BOOT_GRACE_SECONDS = max(
+    120.0, float(os.getenv("MEMORY_RECYCLE_BOOT_GRACE_SECONDS", "300"))
+)
+MEMORY_SELF_RECYCLE_ENABLED = (
+    os.getenv("MEMORY_SELF_RECYCLE_ENABLED", "true").strip().lower()
+    not in ("0", "false", "no", "off")
+)
+
 PROXY_REPUTATION_TTL = max(1800, int(os.getenv("PROXY_REPUTATION_TTL", "21600")))
 PROXY_REPUTATION_MAX = max(1000, int(os.getenv("PROXY_REPUTATION_MAX", "7000")))
 PROVIDER_UNIQUE_STATS_CAP = max(500, int(os.getenv("PROVIDER_UNIQUE_STATS_CAP", "4096")))
@@ -735,6 +771,8 @@ def wake_auction_workers():
     auction_status_wakeup_event.set()
 
 # ============ MEMORY SAFETY (Render 512 MB) ============
+_process_started_monotonic = time.monotonic()
+memory_recycle_started_event = threading.Event()
 _malloc_trim = None
 try:
     _libc = ctypes.CDLL(None)
@@ -801,6 +839,156 @@ def _memory_maintenance(reason='', force=False):
     return rss
 
 
+def _drop_rebuildable_memory_caches():
+    """Drop only transient caches that are safe to rebuild after a critical RSS event.
+
+    Never touches fixed proxy/profile identity, provider credentials, seen_items, auction
+    queues/state, or durable PostgreSQL data. This is deliberately conservative.
+    """
+    dropped = {}
+    pm = globals().get('proxy_manager')
+    if pm is not None:
+        try:
+            with pm.lock:
+                cache_names = (
+                    'preflight_ok_until', 'preflight_bad_until', 'preflight_last_result',
+                    'preflight_latency_ms', 'quality_ok_until', 'quality_bad_until',
+                    'quality_last_result', 'quality_latency_ms', 'outage_host_last_probe',
+                    'outage_proxy_last_probe', 'handoff_scout_bad_until',
+                )
+                total = 0
+                for name in cache_names:
+                    bucket = getattr(pm, name, None)
+                    if isinstance(bucket, dict):
+                        total += len(bucket)
+                        bucket.clear()
+                dropped['proxy_transient'] = total
+        except Exception:
+            pass
+
+    # Auction proxy reputation is only an optimization. Expired/old entries can be
+    # forgotten safely; a later auction request simply proves a reserve again.
+    auction_lock = globals().get('auction_proxy_state_lock')
+    if auction_lock is not None:
+        try:
+            with auction_lock:
+                total = 0
+                for name in (
+                    'auction_proxy_bad_until', 'auction_proxy_host_bad_until',
+                    'auction_proxy_fail_streak', 'auction_proxy_success_at',
+                ):
+                    bucket = globals().get(name)
+                    if isinstance(bucket, dict):
+                        total += len(bucket)
+                        bucket.clear()
+                dropped['auction_transient'] = total
+        except Exception:
+            pass
+    return dropped
+
+
+def _close_idle_memory_heavy_sessions():
+    """Close only sessions that are not currently in use.
+
+    fixed_proxy/fixed_profile are intentionally preserved. The next main request creates
+    a fresh Session on the same proven endpoint; if it fails, normal failover runs.
+    """
+    closed = []
+
+    # Discard a proved-but-not-yet-adopted Webshare handoff session first.
+    handoff_lock = globals().get('webshare_handoff_state_lock')
+    if handoff_lock is not None:
+        try:
+            with handoff_lock:
+                ready = globals().get('webshare_handoff_ready')
+                if ready is not None:
+                    globals()['webshare_handoff_ready'] = None
+                    try:
+                        close_session(ready[2])
+                    except Exception:
+                        pass
+                    closed.append('handoff')
+        except Exception:
+            pass
+
+    # Recycle the long-lived fixed curl Session only in an idle window.
+    request_lock = globals().get('main_fixed_request_lock')
+    if request_lock is not None:
+        acquired = False
+        try:
+            acquired = request_lock.acquire(blocking=False)
+            if acquired:
+                session = globals().get('fixed_session')
+                if session is not None:
+                    globals()['fixed_session'] = None
+                    try:
+                        close_session(session)
+                    except Exception:
+                        pass
+                    closed.append('fixed')
+        except Exception:
+            pass
+        finally:
+            if acquired:
+                try:
+                    request_lock.release()
+                except Exception:
+                    pass
+    return closed
+
+
+def _emergency_memory_reclaim(reason='critical'):
+    """One bounded emergency reclaim pass, returning the post-reclaim RSS."""
+    before = _memory_rss_mb()
+    closed = _close_idle_memory_heavy_sessions()
+    dropped = _drop_rebuildable_memory_caches()
+    _release_python_memory(force_trim=True)
+    after = _memory_rss_mb()
+    logging.warning(
+        f"🧯 Emergency memory reclaim ({reason}): "
+        f"RSS {before:.0f}→{after:.0f} MB; "
+        f"sessions={','.join(closed) if closed else 'none'}, caches={dropped}"
+        if before is not None and after is not None else
+        f"🧯 Emergency memory reclaim ({reason}) completed"
+    )
+    return after
+
+
+def _memory_recycle_safe_window():
+    """Prefer a clean gap, but never block the hard-RSS escape path forever."""
+    if main_discovery_active_event.is_set() or auction_user_job_active_event.is_set():
+        return False
+    lock = globals().get('main_fixed_request_lock')
+    return not (lock is not None and lock.locked())
+
+
+def _controlled_memory_recycle(rss, reason):
+    """Exit only the current process so Render can cold-start it with a fresh heap.
+
+    All correctness-critical state is already durable in PostgreSQL. restart-sticky is
+    continuously persisted after successful main requests; auction queue rows are committed
+    before network processing and reconcile after restart.
+    """
+    if memory_recycle_started_event.is_set():
+        return
+    memory_recycle_started_event.set()
+    try:
+        proxy = globals().get('fixed_proxy')
+        if proxy:
+            _queue_restart_sticky_persist(proxy, force=True)
+    except Exception:
+        pass
+    logging.critical(
+        f"🧠♻️ Controlled memory recycle: RSS≈{rss:.0f} MB ({reason}). "
+        "Process exits intentionally before an uncontrolled OOM; Render should restart it, "
+        "then PostgreSQL/restart-sticky resume the normal monitor and durable auctions."
+    )
+    # StreamHandler flushes every record; a tiny yield also lets the async sticky worker
+    # observe the event when the DB is healthy, without allocating another synchronous DB session.
+    time.sleep(0.25)
+    os._exit(75)
+
+
 def _auction_user_memory_ready():
     """Return (ready, rss_mb) for a durable user-submitted auction job.
 
@@ -825,11 +1013,51 @@ def memory_guard_worker():
         return
     last_state = None
     last_report = 0.0
+    last_emergency_reclaim = 0.0
+    recycle_pressure_since = None
     while True:
         try:
             rss = _memory_maintenance('guard', force=False)
             high = memory_pressure_event.is_set()
             now_mono = time.monotonic()
+
+            # V6.44: ordinary gc/malloc_trim is insufficient when native/libcurl allocator
+            # high-water becomes the new baseline. First try a non-disruptive reclaim.
+            if (
+                rss is not None
+                and rss >= MEMORY_RECOVERY_TRIGGER_MB
+                and (now_mono - last_emergency_reclaim) >= MEMORY_RECOVERY_COOLDOWN_SECONDS
+            ):
+                rss = _emergency_memory_reclaim('guard')
+                last_emergency_reclaim = now_mono
+                if rss is not None and rss >= MEMORY_HIGH_MB:
+                    memory_pressure_event.set()
+                elif rss is not None and rss <= MEMORY_CLEAR_MB:
+                    memory_pressure_event.clear()
+                high = memory_pressure_event.is_set()
+
+            # Sustained post-reclaim critical RSS gets a controlled cold heap instead of
+            # waiting for Render to OOM-kill the process at an arbitrary code location.
+            if rss is not None and rss >= MEMORY_RECYCLE_MB:
+                if recycle_pressure_since is None:
+                    recycle_pressure_since = now_mono
+                pressure_age = now_mono - recycle_pressure_since
+                process_age = now_mono - _process_started_monotonic
+                hard = rss >= MEMORY_HARD_RECYCLE_MB
+                sustained = pressure_age >= MEMORY_RECYCLE_SUSTAIN_SECONDS
+                boot_grace_ok = process_age >= MEMORY_RECYCLE_BOOT_GRACE_SECONDS
+                if (
+                    MEMORY_SELF_RECYCLE_ENABLED
+                    and (hard or (sustained and boot_grace_ok))
+                    and (_memory_recycle_safe_window() or hard)
+                ):
+                    _controlled_memory_recycle(
+                        rss,
+                        'hard ceiling' if hard else f'sustained {pressure_age:.0f}s',
+                    )
+            else:
+                recycle_pressure_since = None
+
             if rss is not None and now_mono - last_report >= 300:
                 logging.info(
                     f"🧠 RSS≈{rss:.0f} MB; discovery={'ON' if main_discovery_active_event.is_set() else 'OFF'}, "
@@ -840,7 +1068,8 @@ def memory_guard_worker():
                 if high:
                     logging.warning(
                         f"🧠 High memory pressure: RSS≈{rss:.0f} MB; "
-                        f"pause background reserve and cap discovery until memory falls (emergency≈{MEMORY_EMERGENCY_MB} MB)"
+                        f"pause background reserve and cap discovery until memory falls "
+                        f"(emergency≈{MEMORY_EMERGENCY_MB} MB, recycle≈{MEMORY_RECYCLE_MB} MB)"
                     )
                 elif last_state is True:
                     logging.info(f"🧠 Memory pressure cleared: RSS≈{rss:.0f} MB")
@@ -9867,6 +10096,7 @@ def _make_request(proxy, profile, session=None, timeout=None, request_kind="unkn
             logging.error(f"Не удалось создать session для {profile['name']}: {e}")
             return tracked_return('profile_error', None, None)
 
+    response = None
     try:
         # Параметр request() переопределяет timeout Session — это позволяет
         # discovery быстро отбрасывать медленные proxy, не затрагивая fixed session.
@@ -9889,7 +10119,7 @@ def _make_request(proxy, profile, session=None, timeout=None, request_kind="unkn
         )
 
         if response.status_code == 200:
-            blocked, reason = _is_ebay_block_page(response)
+            blocked, reason = _is_ebay_block_page(response, body_text)
             if blocked:
                 logging.warning(
                     f"🚫 ПОДТВЕРЖДЁННАЯ защита eBay ({reason}) "
@@ -9967,6 +10197,15 @@ def _make_request(proxy, profile, session=None, timeout=None, request_kind="unkn
         ):
             return tracked_return('proxy_rejected', None, None if own_session else session)
         return tracked_return('proxy_error', None, None if own_session else session)
+    finally:
+        # V6.44: never leave a curl_cffi Response object/native receive buffer to cyclic GC.
+        # body_text is already an independent Python string; closing the Response releases
+        # transfer-side resources while the Session itself remains reusable.
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
 
 
 def _tcp_preflight_proxy(proxy, force=False):
@@ -12295,7 +12534,7 @@ def bot_worker():
     seen_line = f"\n📚 В базе: {seen_total} товаров." if seen_total is not None else ""
     startup_keyboard_ok = send_telegram_message(
         startup_line +
-        "\n🇬🇧 eBay UK monitor v6.43 MemoryPlateauSafe+TelegramUI+PremiumBackup+AuctionPriority работает." +
+        "\n🇬🇧 eBay UK monitor v6.44 MemorySelfHeal+TelegramUI+PremiumBackup+AuctionPriority работает." +
         seen_line +
         "\nКоманды: /stop /start /list (/auctions) /delauction НОМЕР_ЛОТА"
         "\nМожно отправить ссылку на eBay-аукцион — сохраню точное время и напомню заранее."
@@ -12381,7 +12620,7 @@ def start_leader_workers():
         name='telegram-ui-config',
     ).start()
     logging.info(
-        "🌐 Multi-provider v6.43: "
+        "🌐 Multi-provider v6.44: "
         f"ProxyScrape Premium={'ON' if PROXYSCRAPE_PREMIUM_API_KEY else 'OFF'}, "
         f"Webshare={'ON (' + str(len(WEBSHARE_API_KEYS)) + ' account(s))' if WEBSHARE_API_KEYS else 'OFF'}, "
         f"Webshare first-batch={'ON (1 unique-host slot; extra keys=bandwidth)' if WEBSHARE_FIRST_BATCH else 'OFF'}, "
@@ -12395,7 +12634,7 @@ def start_leader_workers():
     proxio_calls_day = int((86400 + PROXIO_FREE_REFRESH - 1) // PROXIO_FREE_REFRESH) if PROXIO_FREE_ENABLED else 0
     proxio_calls_per_key = (proxio_calls_day / len(PROXIO_API_KEYS)) if PROXIO_API_KEYS else 0.0
     logging.info(
-        f"🧭 External sources v6.43: HProxy={'ON' if HPROXY_FREE_ENABLED else 'OFF'} "
+        f"🧭 External sources v6.44: HProxy={'ON' if HPROXY_FREE_ENABLED else 'OFF'} "
         f"(HTTPS, elite+anonymous, cap={HPROXY_FREE_ELITE_LIMIT + HPROXY_FREE_ANON_LIMIT}), "
         f"Databay={'ON' if DATABAY_FREE_ENABLED else 'OFF'} "
         f"(HTTPS strict+fast, elite+anonymous, cap={DATABAY_FREE_ELITE_LIMIT + DATABAY_FREE_ANON_LIMIT}), "
@@ -12406,7 +12645,7 @@ def start_leader_workers():
         f"neutral_preflight={EXTERNAL_FREE_PREFLIGHT_SLOTS}, normal ceiling={PROBE_MAX_CONCURRENCY}, long-outage ceiling={PROBE_EXTREME_OUTAGE_CONCURRENCY}"
     )
     logging.info(
-        f"⚡ Adaptive discovery v6.43: normal {PROBE_CONCURRENCY}→{PROBE_ESCALATED_CONCURRENCY}→"
+        f"⚡ Adaptive discovery v6.44: normal {PROBE_CONCURRENCY}→{PROBE_ESCALATED_CONCURRENCY}→"
         f"{PROBE_DEEP_CONCURRENCY}→{PROBE_BURST_CONCURRENCY}→{PROBE_MAX_CONCURRENCY} at "
         f"~0/{PROBE_ESCALATE_AFTER:.0f}/{PROBE_DEEP_ESCALATE_AFTER:.0f}/"
         f"{PROBE_BURST_ESCALATE_AFTER:.0f}/{PROBE_MAX_ESCALATE_AFTER:.0f}s; long-outage "
@@ -12417,6 +12656,8 @@ def start_leader_workers():
     rss = _memory_rss_mb()
     logging.info(
         f"🧠 MemorySafe: RSS≈{rss:.0f} MB, soft/clear/high/emergency={MEMORY_SOFT_MB}/{MEMORY_CLEAR_MB}/{MEMORY_HIGH_MB}/{MEMORY_EMERGENCY_MB} MB; "
+        f"self-heal/recycle/hard={MEMORY_RECOVERY_TRIGGER_MB}/{MEMORY_RECYCLE_MB}/{MEMORY_HARD_RECYCLE_MB} MB "
+        f"({'ON' if MEMORY_SELF_RECYCLE_ENABLED else 'OFF'}); "
         f"burst/long-outage gates={PROBE_BURST_MEMORY_CEILING_MB}/{PROBE_LONG_OUTAGE_MEMORY_CEILING_MB} MB; "
         f"background TLS workers={PROXY_PREFLIGHT_WARM_CONCURRENCY}, "
         f"HIGH-micro<{PROXY_PREFLIGHT_HIGH_MEMORY_CEILING_MB}MB="
@@ -12427,11 +12668,11 @@ def start_leader_workers():
 
     threading.Thread(target=telegram_listener, daemon=True, name='telegram-listener').start()
     logging.info(
-        f"📨 Telegram intake v6.43: ItemID-dedupe ON; auction priority memory ceiling="
+        f"📨 Telegram intake v6.44: ItemID-dedupe ON; auction priority memory ceiling="
         f"{AUCTION_USER_MEMORY_LIMIT_MB}MB, high-memory fetch workers={AUCTION_HIGH_MEMORY_FETCH_PARALLEL}, "
         f"status_grace={AUCTION_LINK_STATUS_GRACE}s"
     )
-    logging.info(f"🌉 Handoff-safe v6.43: recent-good transient scout failures are isolated for {WEBSHARE_HANDOFF_TRANSIENT_COOLDOWN:.0f}s; main cooldown untouched")
+    logging.info(f"🌉 Handoff-safe v6.44: recent-good transient scout failures are isolated for {WEBSHARE_HANDOFF_TRANSIENT_COOLDOWN:.0f}s; main cooldown untouched")
     threading.Thread(target=connection_watchdog, daemon=True, name='connection-watchdog').start()
     threading.Thread(target=memory_guard_worker, daemon=True, name='memory-guard-worker').start()
     threading.Thread(target=restart_sticky_persist_worker, daemon=True, name='restart-sticky-persist').start()
@@ -12478,7 +12719,7 @@ def leader_supervisor():
 @app.route('/')
 def index():
     role = "leader" if leader_active_event.is_set() else "standby"
-    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.43 MemoryPlateauSafe+TelegramUI+PremiumBackup+AuctionPriority, {role})"
+    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.44 MemorySelfHeal+TelegramUI+PremiumBackup+AuctionPriority, {role})"
 
 
 @app.route('/health')
