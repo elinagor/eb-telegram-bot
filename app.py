@@ -279,6 +279,17 @@ AUCTION_PENDING_CLOSE_RETRY = max(60, min(int(os.getenv("AUCTION_PENDING_CLOSE_R
 AUCTION_PENDING_MIN_DELAY = max(60, int(os.getenv("AUCTION_PENDING_MIN_DELAY", "300")))
 AUCTION_PENDING_WINDOW_MARGIN = max(30, int(os.getenv("AUCTION_PENDING_WINDOW_MARGIN", "120")))
 AUCTION_PENDING_MINUTE_MARGIN = max(5, int(os.getenv("AUCTION_PENDING_MINUTE_MARGIN", "15")))
+# V6.46: eBay search-card часто показывает countdown только до минуты. После ДВУХ
+# согласованных наблюдений пересечение может стать очень узким (например 37 секунд),
+# но всё ещё пересекать границу двух календарных минут. Раньше такой лот оставался
+# жёлтым и перепроверялся каждые ~3 минуты часами. Если уже есть предыдущее
+# пересекающееся наблюдение и итоговое окно <=75 сек., этого более чем достаточно
+# для reminders 60/30/10/5: используем РАННЮЮ границу как безопасный trigger anchor,
+# чтобы напоминание могло прийти чуть раньше, но не позже реального окончания.
+AUCTION_PENDING_CONSENSUS_ARM_WINDOW = max(
+    30,
+    min(int(os.getenv("AUCTION_PENDING_CONSENSUS_ARM_WINDOW", "75")), 120),
+)
 
 # Пользовательские auction-ссылки храним в PostgreSQL до успешной проверки.
 # Если прямо сейчас нет рабочего proxy, ссылка НЕ отклоняется и НЕ теряется при deploy/restart:
@@ -4822,13 +4833,23 @@ def init_db():
                     reminder_30_sent BOOLEAN NOT NULL DEFAULT FALSE,
                     reminder_10_sent BOOLEAN NOT NULL DEFAULT FALSE,
                     reminder_5_sent BOOLEAN NOT NULL DEFAULT FALSE,
-                    last_status_check TIMESTAMPTZ NULL
+                    last_status_check TIMESTAMPTZ NULL,
+                    timing_confidence TEXT NOT NULL DEFAULT 'exact',
+                    end_window_latest_utc TIMESTAMPTZ NULL
                 )
                 """
             )
             cur.execute(
                 "ALTER TABLE auction_reminders "
                 "ADD COLUMN IF NOT EXISTS last_status_check TIMESTAMPTZ NULL"
+            )
+            cur.execute(
+                "ALTER TABLE auction_reminders "
+                "ADD COLUMN IF NOT EXISTS timing_confidence TEXT NOT NULL DEFAULT 'exact'"
+            )
+            cur.execute(
+                "ALTER TABLE auction_reminders "
+                "ADD COLUMN IF NOT EXISTS end_window_latest_utc TIMESTAMPTZ NULL"
             )
             cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_auction_reminders_end_time "
@@ -5207,8 +5228,16 @@ def _initial_reminder_flags(end_time_utc):
     return {60: False, 30: False, 10: False, 5: False}
 
 
-def save_auction_reminder(item_id, url, title, end_time_utc):
+def save_auction_reminder(
+    item_id, url, title, end_time_utc,
+    timing_confidence='exact', end_window_latest_utc=None,
+):
     end_time_utc = _ensure_aware_utc(end_time_utc)
+    timing_confidence = str(timing_confidence or 'exact')
+    end_window_latest_utc = (
+        _ensure_aware_utc(end_window_latest_utc)
+        if end_window_latest_utc is not None else None
+    )
     flags = _initial_reminder_flags(end_time_utc)
     with get_db_connection() as conn:
         with conn.cursor() as cur:
@@ -5216,12 +5245,15 @@ def save_auction_reminder(item_id, url, title, end_time_utc):
                 """
                 INSERT INTO auction_reminders (
                     item_id, url, title, end_time_utc,
-                    reminder_60_sent, reminder_30_sent, reminder_10_sent, reminder_5_sent
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    reminder_60_sent, reminder_30_sent, reminder_10_sent, reminder_5_sent,
+                    timing_confidence, end_window_latest_utc
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (item_id) DO UPDATE SET
                     url = EXCLUDED.url,
                     title = EXCLUDED.title,
                     end_time_utc = EXCLUDED.end_time_utc,
+                    timing_confidence = EXCLUDED.timing_confidence,
+                    end_window_latest_utc = EXCLUDED.end_window_latest_utc,
                     updated_at = NOW(),
                     reminder_60_sent = CASE
                         WHEN auction_reminders.end_time_utc = EXCLUDED.end_time_utc
@@ -5243,9 +5275,10 @@ def save_auction_reminder(item_id, url, title, end_time_utc):
                 (
                     item_id, url, title, end_time_utc,
                     flags[60], flags[30], flags[10], flags[5],
+                    timing_confidence, end_window_latest_utc,
                 ),
             )
-            # Exact schedule supersedes any earlier coarse/pending observation.
+            # An armed schedule supersedes any earlier coarse/pending observation.
             cur.execute("DELETE FROM auction_pending WHERE item_id = %s", (item_id,))
         conn.commit()
     wake_auction_workers()
@@ -5266,7 +5299,8 @@ def list_active_auctions(limit=20):
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT item_id, url, title, end_time_utc
+                SELECT item_id, url, title, end_time_utc,
+                       timing_confidence, end_window_latest_utc
                 FROM auction_reminders
                 WHERE end_time_utc > NOW()
                 ORDER BY end_time_utc ASC
@@ -5432,6 +5466,7 @@ def send_duplicate_auction_notice(item_id, canonical_url, state):
         msg = (
             "ℹ️ <b>Этот аукцион уже есть в списке</b> 🇬🇧\n\n"
             f"📦 <b>{title}</b>{end_line}\n\n"
+            "🔔 Напоминания 60 / 30 / 10 / 5 мин. уже активны.\n\n"
             f"🔗 <a href='{html_lib.escape(canonical_url, quote=True)}'>Открыть аукцион на eBay</a>"
         )
     elif kind == 'pending':
@@ -5806,6 +5841,7 @@ def save_pending_auction(
             )
             old = cur.fetchone()
             earliest, latest = new_earliest, new_latest
+            overlap_used = False
             if old:
                 old_earliest = _ensure_aware_utc(old[0])
                 old_latest = _ensure_aware_utc(old[1])
@@ -5815,6 +5851,7 @@ def save_pending_auction(
                 overlap_latest = min(old_latest, new_latest)
                 if overlap_earliest < overlap_latest:
                     earliest, latest = overlap_earliest, overlap_latest
+                    overlap_used = True
             window_seconds = max(1.0, (latest - earliest).total_seconds())
             next_check = _pending_next_check(observed, latest, window_seconds)
             cur.execute(
@@ -5844,7 +5881,7 @@ def save_pending_auction(
             )
         conn.commit()
     wake_auction_workers()
-    return earliest, latest, next_check
+    return earliest, latest, next_check, overlap_used
 
 
 def _pending_window_single_minute(earliest, latest):
@@ -5989,7 +6026,7 @@ def update_verified_auction(item_id, title, new_end_time_utc):
             cur.execute(
                 """
                 SELECT end_time_utc, reminder_60_sent, reminder_30_sent,
-                       reminder_10_sent, reminder_5_sent
+                       reminder_10_sent, reminder_5_sent, timing_confidence
                 FROM auction_reminders WHERE item_id = %s FOR UPDATE
                 """,
                 (item_id,),
@@ -5997,18 +6034,24 @@ def update_verified_auction(item_id, title, new_end_time_utc):
             row = cur.fetchone()
             if not row:
                 return False, False, None, new_end_time_utc
-            old_end, s60, s30, s10, s5 = row
+            old_end, s60, s30, s10, s5, old_confidence = row
             old_end = _ensure_aware_utc(old_end)
             changed = old_end.replace(second=0, microsecond=0) != new_end_time_utc.replace(second=0, microsecond=0)
-            if changed:
+            confidence_upgrade = str(old_confidence or 'exact') != 'exact'
+            if changed or confidence_upgrade:
                 sent = {60: s60, 30: s30, 10: s10, 5: s5}
-                for mins in sent:
-                    if (new_end_time_utc - now).total_seconds() > mins * 60:
-                        sent[mins] = False
+                # A true minute-level change can move future thresholds, so reopen only
+                # thresholds that are still ahead. A same-minute confidence upgrade merely
+                # replaces the safe early anchor by eBay's exact timestamp and preserves flags.
+                if changed:
+                    for mins in sent:
+                        if (new_end_time_utc - now).total_seconds() > mins * 60:
+                            sent[mins] = False
                 cur.execute(
                     """
                     UPDATE auction_reminders
                     SET title=%s, end_time_utc=%s, last_status_check=NOW(), updated_at=NOW(),
+                        timing_confidence='exact', end_window_latest_utc=NULL,
                         reminder_60_sent=%s, reminder_30_sent=%s,
                         reminder_10_sent=%s, reminder_5_sent=%s
                     WHERE item_id=%s
@@ -6021,7 +6064,7 @@ def update_verified_auction(item_id, title, new_end_time_utc):
                     (title, item_id),
                 )
         conn.commit()
-    if changed:
+    if changed or confidence_upgrade:
         wake_auction_workers()
     return True, changed, old_end, new_end_time_utc
 
@@ -6057,17 +6100,17 @@ def _status_check_interval_seconds(remaining):
     if remaining <= 10 * 60:
         return 120          # final validation window
     if remaining <= 30 * 60:
-        return 300
+        return 300          # every 5 min near the 30/10/5 reminder window
     if remaining <= 60 * 60:
-        return 600
+        return 900          # every 15 min
     if remaining <= 2 * 3600:
-        return 1200         # every 20 min
+        return 1800         # every 30 min
     if remaining <= 6 * 3600:
-        return 3600         # every hour
-    if remaining <= 12 * 3600:
         return 7200         # every 2 hours
+    if remaining <= 12 * 3600:
+        return 14400        # every 4 hours
     if remaining <= 24 * 3600:
-        return 10800        # every 3 hours
+        return 21600        # every 6 hours
     return None
 
 
@@ -8605,12 +8648,13 @@ def _save_pending_from_observation(observation, original_url, notify=True, refin
                 item_id,
                 "ℹ️ <b>Аукцион уже сохранён</b> 🇬🇧\n\n"
                 f"📦 <b>{html_lib.escape(_clean_auction_title(existing_exact[2], item_id))}</b>\n\n"
-                f"🕒 Окончание по Киеву: {format_kyiv_datetime(existing_exact[3])}",
+                f"🕒 Окончание по Киеву: {format_kyiv_datetime(existing_exact[3])}\n\n"
+                "🔔 Напоминания 60 / 30 / 10 / 5 мин. уже активны.",
                 reply_markup=auction_message_keyboard(item_id, canonical_url),
                 preview_url=canonical_url,
             )
         return 'existing_exact'
-    earliest, latest, next_check = save_pending_auction(
+    earliest, latest, next_check, overlap_used = save_pending_auction(
         item_id=item_id,
         url=canonical_url,
         title=title,
@@ -8631,6 +8675,31 @@ def _save_pending_from_observation(observation, original_url, notify=True, refin
             'pending:relative_minute_window_consensus',
             notify=(True if refined else notify),
             refined=refined,
+        )
+        return 'exact'
+
+    # V6.46: do not keep a user auction yellow for hours merely because a very narrow,
+    # repeatedly-confirmed countdown window crosses a UTC minute boundary. The early edge
+    # is deliberately used as the reminder anchor: notifications can be up to ~75 s early,
+    # but cannot be late if the real end remains inside the confirmed overlap.
+    consensus_window_seconds = max(0.0, (latest - earliest).total_seconds())
+    if (
+        overlap_used
+        and 'm' in (observation.get('values') or {})
+        and consensus_window_seconds <= AUCTION_PENDING_CONSENSUS_ARM_WINDOW
+    ):
+        safe_anchor = _ensure_aware_utc(earliest).replace(microsecond=0)
+        logging.info(
+            f"✅ Auction narrow countdown consensus: item={item_id}, "
+            f"window={consensus_window_seconds:.1f}s, safe_anchor={safe_anchor.isoformat()}, "
+            f"bounds={earliest.isoformat()}..{latest.isoformat()}"
+        )
+        _finish_exact_auction_save(
+            item_id, title, safe_anchor,
+            'pending:relative_minute_narrow_consensus_safe_early',
+            notify=(True if refined else notify),
+            refined=refined,
+            consensus_window=(earliest, latest),
         )
         return 'exact'
 
@@ -8655,7 +8724,7 @@ def _save_pending_from_observation(observation, original_url, notify=True, refin
     return 'pending'
 
 
-def _finish_exact_auction_save(item_id, title, end_time_utc, parse_source, notify=True, refined=False):
+def _finish_exact_auction_save(item_id, title, end_time_utc, parse_source, notify=True, refined=False, consensus_window=None):
     end_time_utc = _ensure_aware_utc(end_time_utc).replace(microsecond=0)
     remaining = (end_time_utc - datetime.now(timezone.utc)).total_seconds()
     canonical_url = f"https://www.ebay.co.uk/itm/{item_id}"
@@ -8695,18 +8764,43 @@ def _finish_exact_auction_save(item_id, title, end_time_utc, parse_source, notif
             )
         return False
 
-    save_auction_reminder(item_id, canonical_url, title or f'eBay item {item_id}', end_time_utc)
+    save_auction_reminder(
+        item_id, canonical_url, title or f'eBay item {item_id}', end_time_utc,
+        timing_confidence=('countdown_consensus_safe_early' if consensus_window else 'exact'),
+        end_window_latest_utc=(consensus_window[1] if consensus_window else None),
+    )
     mark_auction_status_checked(item_id)
     if notify:
-        header = "✅ <b>Время аукциона уточнено</b> 🇬🇧" if refined else "✅ <b>Аукцион сохранён</b> 🇬🇧"
+        if consensus_window:
+            win_early = _ensure_aware_utc(consensus_window[0])
+            win_late = _ensure_aware_utc(consensus_window[1])
+            width = max(0.0, (win_late - win_early).total_seconds())
+            message = (
+                "✅ <b>Аукцион сохранён — напоминания включены</b> 🇬🇧\n\n"
+                f"📦 <b>{safe_title}</b>\n\n"
+                f"🕒 Подтверждённое окно окончания по Киеву:\n"
+                f"<b>{format_kyiv_datetime(win_early)}</b> — <b>{format_kyiv_datetime(win_late)}</b>\n\n"
+                f"🛡 Для напоминаний используется ранняя граница окна "
+                f"(запас ≈{max(1, int(round(width)))} сек.), поэтому сообщение может прийти "
+                "чуть раньше, но не позже подтверждённого окна.\n\n"
+                "🔔 Напоминания: <b>60 / 30 / 10 / 5 мин.</b>\n\n"
+                "ℹ️ Точное время eBay продолжу перепроверять редко и автоматически; "
+                "если оно станет доступно или изменится, расписание обновится.\n\n"
+                f"🔗 <a href='{html_lib.escape(canonical_url, quote=True)}'>Открыть аукцион на eBay</a>"
+            )
+        else:
+            header = "✅ <b>Время аукциона уточнено</b> 🇬🇧" if refined else "✅ <b>Аукцион сохранён</b> 🇬🇧"
+            message = (
+                header + "\n\n"
+                f"📦 <b>{safe_title}</b>\n\n"
+                f"🕒 Окончание по Киеву: {format_kyiv_datetime(end_time_utc)}\n\n"
+                f"⏳ Осталось: {format_remaining(remaining, with_seconds=False)}\n\n"
+                "🔔 Напоминания: <b>60 / 30 / 10 / 5 мин.</b>\n\n"
+                f"🔗 <a href='{html_lib.escape(canonical_url, quote=True)}'>Открыть аукцион на eBay</a>"
+            )
         publish_auction_status(
             item_id,
-            header + "\n\n"
-            f"📦 <b>{safe_title}</b>\n\n"
-            f"🕒 Окончание по Киеву: {format_kyiv_datetime(end_time_utc)}\n\n"
-            f"⏳ Осталось: {format_remaining(remaining, with_seconds=False)}\n\n"
-            "🔔 Напоминания: <b>60 / 30 / 10 / 5 мин.</b>\n\n"
-            f"🔗 <a href='{html_lib.escape(canonical_url, quote=True)}'>Открыть аукцион на eBay</a>",
+            message,
             reply_markup=auction_message_keyboard(item_id, canonical_url),
             preview_url=canonical_url,
             existing_message_id=status_message_id,
@@ -9100,6 +9194,7 @@ def _reconcile_completed_auction_queue_job(item_id, status_message_id, state):
                 "✅ <b>Аукцион сохранён</b> 🇬🇧\n\n"
                 f"📦 <b>{title}</b>\n\n"
                 f"🕒 Окончание по Киеву: {format_kyiv_datetime(end_dt)}\n\n"
+                "🔔 Напоминания 60 / 30 / 10 / 5 мин. активны.\n\n"
                 f"🔗 <a href='{html_lib.escape(canonical, quote=True)}'>Открыть аукцион на eBay</a>",
                 reply_markup=auction_message_keyboard(item_id, canonical),
                 preview_url=canonical,
@@ -9300,15 +9395,28 @@ def send_auction_list():
     delete_buttons = []
     for idx, (kind, _sort_time, row) in enumerate(entries, 1):
         if kind == 'exact':
-            item_id, url, title, end_time = row
+            item_id, url, title, end_time, timing_confidence, end_window_latest = row
             end_time = _ensure_aware_utc(end_time)
+            end_window_latest = (
+                _ensure_aware_utc(end_window_latest)
+                if end_window_latest is not None else None
+            )
             remaining = max(0, (end_time - now).total_seconds())
             title = _clean_auction_title(title, item_id)
             short_title = title if len(title) <= 100 else title[:97] + '…'
+            if timing_confidence == 'countdown_consensus_safe_early' and end_window_latest:
+                timing_line = (
+                    f"🕒 Подтверждённое окно по Киеву: "
+                    f"{format_kyiv_datetime(end_time)} — {format_kyiv_datetime(end_window_latest)}\n"
+                    "🛡 Напоминания привязаны к ранней границе окна\n"
+                )
+            else:
+                timing_line = f"🕒 Окончание по Киеву: {format_kyiv_datetime(end_time)}\n"
             parts.append(
                 f"\n{idx}) <b>{html_lib.escape(short_title)}</b>\n\n"
                 f"⏳ Осталось: {format_remaining(remaining, with_seconds=False)}\n"
-                f"🕒 По Киеву: {format_kyiv_datetime(end_time)}\n"
+                f"{timing_line}"
+                "🔔 Напоминания: активны (60 / 30 / 10 / 5 мин.)\n"
                 f"🔗 {html_lib.escape(url)}\n"
             )
         elif kind == 'pending':
@@ -12749,10 +12857,10 @@ def bot_worker():
     seen_line = f"\n📚 В базе: {seen_total} товаров." if seen_total is not None else ""
     startup_keyboard_ok = send_telegram_message(
         startup_line +
-        "\n🇬🇧 eBay UK monitor v6.45 BalancedOutage+MemorySelfHeal+AuctionDurable работает." +
+        "\n🇬🇧 eBay UK monitor v6.46 AuctionConsensusSafe+BalancedOutage+MemorySelfHeal работает." +
         seen_line +
         "\nКоманды: /stop /start /list (/auctions) /delauction НОМЕР_ЛОТА"
-        "\nМожно отправить ссылку на eBay-аукцион — сохраню точное время и напомню заранее."
+        "\nМожно отправить ссылку на eBay-аукцион — надёжно сохраню окончание и включу напоминания заранее."
         "\nКнопка «📋 Аукционы» открывает тот же список, что и /auctions.",
         reply_markup=bot_main_reply_keyboard(),
     )
@@ -12835,7 +12943,7 @@ def start_leader_workers():
         name='telegram-ui-config',
     ).start()
     logging.info(
-        "🌐 Multi-provider v6.45: "
+        "🌐 Multi-provider v6.46: "
         f"ProxyScrape Premium={'ON' if PROXYSCRAPE_PREMIUM_API_KEY else 'OFF'}, "
         f"Webshare={'ON (' + str(len(WEBSHARE_API_KEYS)) + ' account(s))' if WEBSHARE_API_KEYS else 'OFF'}, "
         f"Webshare first-batch={'ON (1 unique-host slot; extra keys=bandwidth)' if WEBSHARE_FIRST_BATCH else 'OFF'}, "
@@ -12849,7 +12957,7 @@ def start_leader_workers():
     proxio_calls_day = int((86400 + PROXIO_FREE_REFRESH - 1) // PROXIO_FREE_REFRESH) if PROXIO_FREE_ENABLED else 0
     proxio_calls_per_key = (proxio_calls_day / len(PROXIO_API_KEYS)) if PROXIO_API_KEYS else 0.0
     logging.info(
-        f"🧭 External sources v6.45: HProxy={'ON' if HPROXY_FREE_ENABLED else 'OFF'} "
+        f"🧭 External sources v6.46: HProxy={'ON' if HPROXY_FREE_ENABLED else 'OFF'} "
         f"(HTTPS, elite+anonymous, cap={HPROXY_FREE_ELITE_LIMIT + HPROXY_FREE_ANON_LIMIT}), "
         f"Databay={'ON' if DATABAY_FREE_ENABLED else 'OFF'} "
         f"(HTTPS strict+fast, elite+anonymous, cap={DATABAY_FREE_ELITE_LIMIT + DATABAY_FREE_ANON_LIMIT}), "
@@ -12861,7 +12969,7 @@ def start_leader_workers():
         f"long/extreme/ultra ceilings={PROBE_LONG_OUTAGE_CONCURRENCY}/{PROBE_EXTREME_OUTAGE_CONCURRENCY}/{PROBE_ULTRA_OUTAGE_CONCURRENCY}"
     )
     logging.info(
-        f"⚡ Adaptive discovery v6.45: normal {PROBE_CONCURRENCY}→{PROBE_ESCALATED_CONCURRENCY}→"
+        f"⚡ Adaptive discovery v6.46: normal {PROBE_CONCURRENCY}→{PROBE_ESCALATED_CONCURRENCY}→"
         f"{PROBE_DEEP_CONCURRENCY}→{PROBE_BURST_CONCURRENCY}→{PROBE_MAX_CONCURRENCY} at "
         f"~0/{PROBE_ESCALATE_AFTER:.0f}/{PROBE_DEEP_ESCALATE_AFTER:.0f}/"
         f"{PROBE_BURST_ESCALATE_AFTER:.0f}/{PROBE_MAX_ESCALATE_AFTER:.0f}s; long-outage "
@@ -12886,12 +12994,12 @@ def start_leader_workers():
 
     threading.Thread(target=telegram_listener, daemon=True, name='telegram-listener').start()
     logging.info(
-        f"📨 Telegram intake v6.45: ItemID-dedupe ON; auction priority memory ceiling="
+        f"📨 Telegram intake v6.46: ItemID-dedupe ON; auction priority memory ceiling="
         f"{AUCTION_USER_MEMORY_LIMIT_MB}MB, high-memory fetch workers={AUCTION_HIGH_MEMORY_FETCH_PARALLEL}, "
         f"status_grace={AUCTION_LINK_STATUS_GRACE}s; long-outage low-impact="
         f"{AUCTION_DURING_DISCOVERY_AFTER:.0f}s/RSS<{AUCTION_DURING_DISCOVERY_MEMORY_CEILING_MB}MB"
     )
-    logging.info(f"🌉 Handoff-safe v6.45: recent-good transient scout failures are isolated for {WEBSHARE_HANDOFF_TRANSIENT_COOLDOWN:.0f}s; main cooldown untouched")
+    logging.info(f"🌉 Handoff-safe v6.46: recent-good transient scout failures are isolated for {WEBSHARE_HANDOFF_TRANSIENT_COOLDOWN:.0f}s; main cooldown untouched")
     threading.Thread(target=connection_watchdog, daemon=True, name='connection-watchdog').start()
     threading.Thread(target=memory_guard_worker, daemon=True, name='memory-guard-worker').start()
     threading.Thread(target=restart_sticky_persist_worker, daemon=True, name='restart-sticky-persist').start()
@@ -12917,6 +13025,10 @@ def leader_supervisor():
             continue
 
         try:
+            logging.info(
+                f"🔐 PostgreSQL leader-lock получен (pid={os.getpid()}); "
+                "инициализируем v6.46 leader workers"
+            )
             start_leader_workers()
             # Держим session-level advisory lock отдельным соединением.
             # Если оно умерло, PostgreSQL сам освободит lock. Чтобы старая копия
@@ -12938,7 +13050,7 @@ def leader_supervisor():
 @app.route('/')
 def index():
     role = "leader" if leader_active_event.is_set() else "standby"
-    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.45 BalancedOutage+MemorySelfHeal+AuctionDurable, {role})"
+    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.46 AuctionConsensusSafe+BalancedOutage+MemorySelfHeal, {role})"
 
 
 @app.route('/health')
@@ -12949,6 +13061,10 @@ def health():
 
 
 if __name__ == "__main__":
+    logging.info(
+        f"🚀 Render process v6.46 started (pid={os.getpid()}); "
+        "Flask запускается сразу, фоновые worker-ы ждут PostgreSQL leader-lock"
+    )
     # Flask привязывается к PORT сразу, чтобы новый Render instance прошёл health/port check.
     # Фоновые задачи стартуют только после получения PostgreSQL leader-lock.
     threading.Thread(target=leader_supervisor, daemon=True, name='leader-supervisor').start()
