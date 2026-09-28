@@ -139,6 +139,22 @@ PROBE_EXTREME_OUTAGE_AFTER = max(
     PROBE_LONG_OUTAGE_AFTER + 15.0,
     float(os.getenv("PROBE_EXTREME_OUTAGE_AFTER", "120")),
 )
+# V6.45: only a sustained 3+ minute outage may use two extra workers, and only while
+# RSS is genuinely low. Normal discovery remains unchanged at 4→5→6→7→8→9→10.
+# This is deliberately capped at 12: it trims timeout-heavy scan latency without
+# recreating the old high-RSS burst behaviour on a 512 MB Render instance.
+PROBE_ULTRA_OUTAGE_CONCURRENCY = max(
+    PROBE_EXTREME_OUTAGE_CONCURRENCY,
+    min(int(os.getenv("PROBE_ULTRA_OUTAGE_CONCURRENCY", "12")), 12),
+)
+PROBE_ULTRA_OUTAGE_AFTER = max(
+    PROBE_EXTREME_OUTAGE_AFTER + 30.0,
+    float(os.getenv("PROBE_ULTRA_OUTAGE_AFTER", "180")),
+)
+PROBE_ULTRA_OUTAGE_MEMORY_CEILING_MB = max(
+    260,
+    min(int(os.getenv("PROBE_ULTRA_OUTAGE_MEMORY_CEILING_MB", "330")), 330),
+)
 PROBE_BURST_MEMORY_CEILING_MB = max(
     340, min(int(os.getenv("PROBE_BURST_MEMORY_CEILING_MB", "420")), 420)
 )
@@ -281,6 +297,17 @@ AUCTION_LINK_DB_ERROR_WAIT = max(10, int(os.getenv("AUCTION_LINK_DB_ERROR_WAIT",
 # and provides a crash-safe fallback if Render dies between INSERT and Telegram send.
 # Default 75s covers Telegram's bounded retry path; normal jobs are activated immediately.
 AUCTION_LINK_STATUS_GRACE = max(15, min(int(os.getenv("AUCTION_LINK_STATUS_GRACE", "75")), 120))
+# V6.45: a user-submitted auction must not sit yellow for an entire multi-minute main
+# proxy outage. Give the main monitor the first minute exclusively; after that, when RSS
+# has a large safety margin, allow ONE auction reserve request at a time. This does not
+# start a second full proxy discovery and never increases the main discovery width.
+AUCTION_DURING_DISCOVERY_AFTER = max(
+    45.0, float(os.getenv("AUCTION_DURING_DISCOVERY_AFTER", "60"))
+)
+AUCTION_DURING_DISCOVERY_MEMORY_CEILING_MB = max(
+    260,
+    min(int(os.getenv("AUCTION_DURING_DISCOVERY_MEMORY_CEILING_MB", "330")), 330),
+)
 
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 LONDON_TZ = ZoneInfo("Europe/London")
@@ -637,6 +664,16 @@ PROVIDER_STATS_INTERVAL = max(60, int(os.getenv("PROVIDER_STATS_INTERVAL", "300"
 # Память outage живёт между соседними 75-секундными discovery. Ранее проверенные неизвестные
 # IP не исчезают из пула, но новые IP идут раньше. Known-good всё ещё может получить controlled retry.
 OUTAGE_HOST_MEMORY = max(180, int(os.getenv("OUTAGE_HOST_MEMORY", "600")))
+# V6.45: the 10-minute outage host memory remains strict for eBay blocks, SSL/MITM and
+# CONNECT rejects. A *single* transient timeout/error from an independent external feed
+# may get exactly one second chance after a long outage. This prevents HProxy/Databay/
+# Proxio from disappearing for the whole outage while generic FREE keeps recycling.
+EXTERNAL_TRANSIENT_RETRY_AFTER = max(
+    120.0, float(os.getenv("EXTERNAL_TRANSIENT_RETRY_AFTER", "180"))
+)
+EXTERNAL_TRANSIENT_RETRY_MIN_AGE = max(
+    90.0, float(os.getenv("EXTERNAL_TRANSIENT_RETRY_MIN_AGE", "120"))
+)
 # 403/challenge на auction URL не должен жёстко банить основной monitor, но на короткое время
 # понижает приоритет того же exit IP для другой eBay-поверхности.
 EBAY_CROSS_SOFT_PENALTY = max(30, int(os.getenv("EBAY_CROSS_SOFT_PENALTY", "120")))
@@ -4032,9 +4069,15 @@ class ProxyManager:
         return chosen
 
     def get_external_free_candidates(
-        self, max_total=1, excluded_hosts=None, include_proxio=True, prefer_proxio=False
+        self, max_total=1, excluded_hosts=None, include_proxio=True, prefer_proxio=False,
+        allow_transient_retry=False, transient_min_age=None,
     ):
-        """Return bounded external candidates without increasing global discovery concurrency."""
+        """Return bounded external candidates without increasing global discovery concurrency.
+
+        V6.45 may re-admit an external endpoint once during a sustained outage, but only
+        after a single proxy_timeout/proxy_error, after its normal cooldown has expired,
+        and after a separate minimum age. 403/SSL/CONNECT rejects never use this path.
+        """
         max_total = max(0, min(int(max_total or 0), 2))
         if max_total <= 0:
             return []
@@ -4046,8 +4089,13 @@ class ProxyManager:
         if not order:
             return []
         now = time.time()
+        transient_min_age = (
+            EXTERNAL_TRANSIENT_RETRY_MIN_AGE
+            if transient_min_age is None else max(0.0, float(transient_min_age))
+        )
         chosen = []
         chosen_hosts = set()
+        recycled_candidates = set()
         with self.lock:
             self._cleanup_bad_locked()
             for source in order:
@@ -4062,8 +4110,27 @@ class ProxyManager:
                         continue
                     if self._preflight_state_locked(proxy, now) == 'bad' or self._quality_state_locked(proxy, now) == 'bad':
                         continue
-                    if self._host_recent_outage_locked(host, now) and not self._is_recent_good_locked(proxy, now):
-                        continue
+                    recent_outage = (
+                        self._host_recent_outage_locked(host, now)
+                        and not self._is_recent_good_locked(proxy, now)
+                    )
+                    if recent_outage:
+                        # Exactly ONE controlled second chance for transient transport
+                        # failures. fail_streak must still be 1; after a second failure it
+                        # becomes 2 and remains suppressed for the rest of this outage.
+                        last_probe = self.outage_proxy_last_probe.get(proxy, 0)
+                        failed_at = self.last_failure_at.get(proxy, 0)
+                        if not (
+                            allow_transient_retry
+                            and self.last_failure_result.get(proxy) in ('proxy_timeout', 'proxy_error')
+                            and self.fail_streak.get(proxy, 0) == 1
+                            and last_probe > 0
+                            and failed_at > 0
+                            and (now - last_probe) >= transient_min_age
+                            and (now - failed_at) >= transient_min_age
+                        ):
+                            continue
+                        recycled_candidates.add(proxy)
                     rows.append(proxy)
                 if not rows:
                     continue
@@ -4077,6 +4144,11 @@ class ProxyManager:
                 chosen.append((proxy, source))
                 chosen_hosts.add(_proxy_host(proxy))
                 self.last_used[proxy] = now
+                if proxy in recycled_candidates:
+                    logging.info(
+                        f"♻️ External transient second-chance: {_proxy_log_name(proxy)} "
+                        f"[{source}], age>={transient_min_age:.0f}s"
+                    )
                 if len(chosen) >= max_total:
                     break
         return chosen
@@ -5376,7 +5448,8 @@ def send_duplicate_auction_notice(item_id, canonical_url, state):
         attempt = int(state.get('attempt_count') or 0)
         msg = (
             "ℹ️ <b>Этот аукцион уже находится в надёжной очереди</b> 🇬🇧\n\n"
-            "⏳ Повторно не добавляю. Проверка продолжится автоматически даже после перезапуска Render."
+            "⏳ Повторно не добавляю. Проверка продолжится автоматически даже после перезапуска Render.\n"
+            "🔔 Напоминания 60 / 30 / 10 / 5 мин. включатся только после подтверждения точного времени."
             + (f"\nПопыток: {attempt}" if attempt else '')
             + f"\n\n🔗 <a href='{html_lib.escape(canonical_url, quote=True)}'>Открыть аукцион на eBay</a>"
         )
@@ -6834,6 +6907,7 @@ def fetch_auction_pages(
     penalize_main_failure=True,
     allow_webshare_reserve=True,
     penalize_reserve_blocked=True,
+    allow_pool_refresh=True,
 ):
     """Получает auction/search HTML без полного proxy-discovery.
 
@@ -6922,7 +6996,11 @@ def fetch_auction_pages(
 
     # Если после auction-only cooldown кандидатов мало, один emergency merge расширяет
     # список, но не запускает полный main discovery и не меняет fixed_proxy.
-    if len(candidates) < min(2, max_reserve_proxies) and max_reserve_proxies > len(candidates):
+    if (
+        allow_pool_refresh
+        and len(candidates) < min(2, max_reserve_proxies)
+        and max_reserve_proxies > len(candidates)
+    ):
         proxy_manager.refresh_proxies(force=True, emergency=True)
         extra_need = max(0, max_reserve_proxies - len(candidates))
         if extra_need:
@@ -8568,7 +8646,8 @@ def _save_pending_from_observation(observation, original_url, notify=True, refin
             "🟡 <b>Аукцион сохранён</b> 🇬🇧\n\n"
             f"📦 <b>{safe_title}</b>\n\n"
             f"⏳ Сейчас по eBay: <b>{html_lib.escape(shown_remaining)}</b>\n\n"
-            "🔄 Точное время окончания уточню автоматически.",
+            "🔄 Точное время окончания уточню автоматически.\n"
+            "🔔 Напоминания 60 / 30 / 10 / 5 мин. включатся после подтверждения точного времени.",
             reply_markup=auction_message_keyboard(item_id, canonical_url),
             preview_url=canonical_url,
             persist_pending=True,
@@ -8670,7 +8749,10 @@ def _evaluate_search_pages_for_auction(search_pages, item_id):
     return exact, coarse, had_target
 
 
-def _fetch_exact_item_search_pages(item_id, reserve_if_needed=True, prefer_current_fixed=True):
+def _fetch_exact_item_search_pages(
+    item_id, reserve_if_needed=True, prefer_current_fixed=True,
+    reserve_limit=2, allow_pool_refresh=True,
+):
     """Fetch exact-item search card with route-aware fixed-session handling.
 
     A 403 on /sch/i.html for an ItemID is not enough to condemn a proxy: the same
@@ -8702,9 +8784,10 @@ def _fetch_exact_item_search_pages(item_id, reserve_if_needed=True, prefer_curre
 
     # Reserve search is bounded and may use metered Webshare rescue if available.
     first_pass_hosts = {_proxy_host(p) for _html, _url, p in pages if p}
+    reserve_limit = max(0, min(int(reserve_limit or 0), 2))
     reserve_pages = fetch_auction_pages(
         search_url,
-        max_reserve_proxies=2,
+        max_reserve_proxies=reserve_limit,
         connect_timeout=min(AUCTION_FETCH_CONNECT_TIMEOUT, 4.0),
         read_timeout=min(AUCTION_FETCH_READ_TIMEOUT, 10.0),
         max_pages=2,
@@ -8713,6 +8796,7 @@ def _fetch_exact_item_search_pages(item_id, reserve_if_needed=True, prefer_curre
         exclude_hosts=first_pass_hosts,
         allow_webshare_reserve=True,
         penalize_reserve_blocked=False,
+        allow_pool_refresh=allow_pool_refresh,
     )
     exact2, coarse2, had_target2 = _evaluate_search_pages_for_auction(reserve_pages, item_id)
     return exact2, coarse2, had_target or had_target2, pages + reserve_pages
@@ -8789,11 +8873,66 @@ def _try_resolve_quick_item_pages(pages, original_url, expected_item_id):
     return None
 
 
-def process_auction_link(url):
+
+def _process_auction_link_low_impact(url, expected_item_id):
+    """Try to arm a durable auction during a prolonged main failover without competing with it.
+
+    Network budget is intentionally tiny: one exact-search reserve request, then at most
+    one canonical item-page reserve request on a different host. No emergency proxy-pool
+    refresh is triggered here. A failure simply leaves the PostgreSQL queue row intact.
+    """
+    if not expected_item_id:
+        logging.info("🟡 Low-impact auction: ItemID не распознан; оставляем ссылку в очереди")
+        return 'retry'
+
+    exact, coarse, _had_target, search_pages = _fetch_exact_item_search_pages(
+        expected_item_id,
+        reserve_if_needed=True,
+        prefer_current_fixed=False,
+        reserve_limit=1,
+        allow_pool_refresh=False,
+    )
+    if exact:
+        item_id, title, end_time_utc, source, _status = exact
+        return _finish_exact_auction_save(
+            item_id, title, end_time_utc, source, notify=True
+        )
+    if coarse:
+        return _save_pending_from_observation(coarse, url, notify=True)
+
+    canonical = f"https://www.ebay.co.uk/itm/{expected_item_id}"
+    search_hosts = {_proxy_host(p) for _html, _url, p in search_pages if p}
+    pages = fetch_auction_pages(
+        canonical,
+        max_reserve_proxies=1,
+        connect_timeout=min(AUCTION_FETCH_CONNECT_TIMEOUT, 4.0),
+        read_timeout=min(AUCTION_FETCH_READ_TIMEOUT, 8.0),
+        max_pages=1,
+        canonicalize_item=True,
+        prefer_current_fixed=False,
+        exclude_hosts=search_hosts,
+        allow_webshare_reserve=True,
+        allow_pool_refresh=False,
+    )
+    result = _try_resolve_quick_item_pages(pages, canonical, expected_item_id)
+    if result is not None:
+        return result
+
+    logging.info(
+        f"🟡 Low-impact auction item={expected_item_id}: точное время пока не получено; "
+        "durable queue сохранена, повтор будет по backoff"
+    )
+    return 'retry'
+
+
+def process_auction_link(url, low_impact=False):
     if not _is_allowed_ebay_url(url):
         return 'ignored'
 
     expected_item_id = extract_ebay_item_id_any(url or '')
+    if low_impact:
+        return _process_auction_link_low_impact(url, expected_item_id)
+
     search_pages = []
 
     # 1) First use the already proven persistent fixed Session. A search-route 403 is
@@ -8976,7 +9115,8 @@ def _reconcile_completed_auction_queue_job(item_id, status_message_id, state):
                     "🟡 <b>Аукцион сохранён</b> 🇬🇧\n\n"
                     f"📦 <b>{title}</b>\n\n"
                     f"⏳ Сейчас по eBay: <b>{html_lib.escape(remaining)}</b>\n\n"
-                    "🔄 Точное время окончания уточню автоматически.",
+                    "🔄 Точное время окончания уточню автоматически.\n"
+                    "🔔 Напоминания 60 / 30 / 10 / 5 мин. включатся после подтверждения точного времени.",
                     reply_markup=auction_message_keyboard(item_id, canonical),
                     preview_url=canonical,
                     existing_message_id=status_message_id,
@@ -9012,9 +9152,26 @@ def auction_link_worker():
             # route. Generic HIGH memory, however, must NOT indefinitely starve a durable
             # user-submitted auction. Auction jobs have their own near-hard ceiling and switch
             # reserve fetching to one response at a time while HIGH memory is active.
+            low_impact_during_discovery = False
             if main_discovery_active_event.is_set():
-                auction_link_wakeup_event.wait(timeout=2.0)
-                continue
+                outage_elapsed, _, _ = _connection_outage_snapshot()
+                rss_now = _memory_rss_mb() if MEMORY_GUARD_ENABLED else None
+                can_low_impact = (
+                    outage_elapsed >= AUCTION_DURING_DISCOVERY_AFTER
+                    and (
+                        rss_now is None
+                        or rss_now < AUCTION_DURING_DISCOVERY_MEMORY_CEILING_MB
+                    )
+                )
+                if not can_low_impact:
+                    auction_link_wakeup_event.wait(timeout=2.0)
+                    continue
+                low_impact_during_discovery = True
+                logging.info(
+                    f"🟡 Auction low-impact during main outage: outage={outage_elapsed:.1f}s, "
+                    + (f"RSS≈{rss_now:.0f}MB, " if rss_now is not None else "")
+                    + "network budget=1+1 sequential reserve request"
+                )
 
             auction_memory_ready, auction_rss = _auction_user_memory_ready()
             if not auction_memory_ready:
@@ -9052,7 +9209,9 @@ def auction_link_worker():
                     f"attempt={int(attempt_count or 0) + 1}, queue_age={queue_age:.1f}s"
                 )
                 auction_user_job_active_event.set()
-                result = process_auction_link(url)
+                result = process_auction_link(
+                    url, low_impact=low_impact_during_discovery
+                )
             except Exception as e:
                 logging.error(f"Ошибка обработки auction URL {url}: {e}", exc_info=True)
                 postpone_auction_link_job(queue_key, attempt_count, 'internal_error')
@@ -9161,6 +9320,7 @@ def send_auction_list():
                 f"\n{idx}) <b>{html_lib.escape(short_title)}</b>\n\n"
                 f"⏳ Осталось: {html_lib.escape(shown)}\n"
                 f"🕒 По Киеву: уточняется\n"
+                f"🔔 Напоминания: ждут подтверждения точного времени\n"
                 f"🔗 {html_lib.escape(url)}\n"
             )
         else:
@@ -9169,6 +9329,7 @@ def send_auction_list():
                 f"\n{idx}) <b>Название уточняется</b>\n\n"
                 f"⏳ Осталось: проверяется\n"
                 f"🕒 По Киеву: уточняется\n"
+                f"🔔 Напоминания: ещё не активированы — ждут точного времени\n"
                 f"🔗 {html_lib.escape(url)}\n"
             )
         delete_buttons.append(
@@ -9470,6 +9631,39 @@ def auction_status_worker():
                     time.sleep(random.uniform(0.8, 1.4))
 
                 _cleanup_stale_pending_auctions()
+            elif (
+                main_discovery_active_event.is_set()
+                and elapsed >= AUCTION_DURING_DISCOVERY_AFTER
+                and not auction_user_job_active_event.is_set()
+            ):
+                # Critical reminder protection: if a previously-saved coarse/pending auction
+                # is already within two hours of its latest possible end, do not let a long
+                # main-proxy outage postpone exact-time refinement for many minutes. Use the
+                # same tiny 1+1 sequential reserve budget as a newly submitted auction.
+                rss_now = _memory_rss_mb() if MEMORY_GUARD_ENABLED else None
+                if (
+                    rss_now is None
+                    or rss_now < AUCTION_DURING_DISCOVERY_MEMORY_CEILING_MB
+                ):
+                    pending_rows = get_due_pending_auctions(limit=1)
+                    if pending_rows:
+                        row = pending_rows[0]
+                        item_id, url, title, earliest, latest, remaining_text, clock_text, _next_check = row
+                        latest_utc = _ensure_aware_utc(latest)
+                        remaining_latest = (
+                            latest_utc - datetime.now(timezone.utc)
+                        ).total_seconds()
+                        if 0 < remaining_latest <= 2 * 3600:
+                            logging.info(
+                                f"🟡 Pending auction low-impact refine during outage: "
+                                f"item={item_id}, latest_remaining={remaining_latest:.0f}s, "
+                                + (f"RSS≈{rss_now:.0f}MB" if rss_now is not None else "RSS=unknown")
+                            )
+                            result = _process_auction_link_low_impact(url, str(item_id))
+                            if result == 'retry':
+                                postpone_pending_auction(
+                                    item_id, AUCTION_PENDING_CLOSE_RETRY
+                                )
         except Exception as e:
             logging.error(f"Ошибка auction status worker: {e}", exc_info=True)
         auction_status_wakeup_event.wait(timeout=AUCTION_STATUS_TICK)
@@ -9928,8 +10122,9 @@ def telegram_listener():
                                         if is_new and not existing_message_id:
                                             msg_id = send_telegram_message(
                                                 "🟡 <b>Аукцион добавлен</b> 🇬🇧\n\n"
-                                                "⏳ Проверяю время окончания автоматически.\n"
-                                                "💾 Ссылка уже сохранена в надёжной очереди и не пропадёт после перезапуска Render.",
+                                                "💾 Ссылка уже надёжно сохранена и не пропадёт после перезапуска Render.\n"
+                                                "⏳ Точное время окончания ещё <b>не подтверждено</b>; проверяю автоматически.\n"
+                                                "🔔 Напоминания 60 / 30 / 10 / 5 мин. включатся сразу после подтверждения точного времени.",
                                                 reply_markup=auction_queue_keyboard(canonical_url),
                                                 preview_url=canonical_url,
                                                 return_message_id=True,
@@ -10945,7 +11140,7 @@ def fetch_ebay_html_with_fixed_pair():
     # construction itself ever failed, background workers must not remain paused by a
     # stale event. From this point main failover owns the network/memory budget.
     executor = ThreadPoolExecutor(
-        max_workers=PROBE_EXTREME_OUTAGE_CONCURRENCY,
+        max_workers=PROBE_ULTRA_OUTAGE_CONCURRENCY,
         thread_name_prefix='proxy-probe',
     )
     main_discovery_active_event.set()
@@ -10987,6 +11182,16 @@ def fetch_ebay_html_with_fixed_pair():
             # full-page responses from consuming the last memory reserve. When memory is
             # elevated we keep the proven <=8-worker ladder instead of disabling discovery.
             if (
+                outage_elapsed >= PROBE_ULTRA_OUTAGE_AFTER
+                and (rss_now is None or rss_now < PROBE_ULTRA_OUTAGE_MEMORY_CEILING_MB)
+            ):
+                desired = PROBE_ULTRA_OUTAGE_CONCURRENCY
+                reason = (
+                    f'ultra-outage={outage_elapsed:.1f}s, elapsed={elapsed_now:.1f}s, '
+                    f'RSS≈{rss_now:.0f}MB' if rss_now is not None
+                    else f'ultra-outage={outage_elapsed:.1f}s, elapsed={elapsed_now:.1f}s'
+                )
+            elif (
                 outage_elapsed >= PROBE_EXTREME_OUTAGE_AFTER
                 and (rss_now is None or rss_now < PROBE_LONG_OUTAGE_MEMORY_CEILING_MB)
             ):
@@ -11289,11 +11494,19 @@ def fetch_ebay_html_with_fixed_pair():
 
             # V6.36: Proxio is warmed as reserve while Premium works. It joins direct eBay
             # discovery after the first escalation (~8s), OR immediately when Premium is
-            # unavailable. It consumes the SAME external slot; global workers stay 4→5→6→7→8.
+            # unavailable. It consumes the SAME bounded external slots; global discovery
+            # width is still controlled solely by desired_concurrency().
+            global_outage_elapsed, _, _ = _connection_outage_snapshot()
             external_slot_cap = (
                 EXTERNAL_FREE_ESCALATED_SLOTS
-                if elapsed_for_mix >= PROBE_ESCALATE_AFTER
+                if (
+                    elapsed_for_mix >= PROBE_ESCALATE_AFTER
+                    or global_outage_elapsed >= PROBE_LONG_OUTAGE_AFTER
+                )
                 else EXTERNAL_FREE_EARLY_SLOTS
+            )
+            allow_external_transient_retry = (
+                global_outage_elapsed >= EXTERNAL_TRANSIENT_RETRY_AFTER
             )
             external_need = min(max(0, need - len(batch)), external_slot_cap)
             if external_need > 0:
@@ -11308,6 +11521,8 @@ def fetch_ebay_html_with_fixed_pair():
                     ),
                     include_proxio=True,
                     prefer_proxio=False,
+                    allow_transient_retry=allow_external_transient_retry,
+                    transient_min_age=EXTERNAL_TRANSIENT_RETRY_MIN_AGE,
                 )
                 for ext_proxy, ext_source in external_rows:
                     if len(batch) >= need:
@@ -12534,7 +12749,7 @@ def bot_worker():
     seen_line = f"\n📚 В базе: {seen_total} товаров." if seen_total is not None else ""
     startup_keyboard_ok = send_telegram_message(
         startup_line +
-        "\n🇬🇧 eBay UK monitor v6.44 MemorySelfHeal+TelegramUI+PremiumBackup+AuctionPriority работает." +
+        "\n🇬🇧 eBay UK monitor v6.45 BalancedOutage+MemorySelfHeal+AuctionDurable работает." +
         seen_line +
         "\nКоманды: /stop /start /list (/auctions) /delauction НОМЕР_ЛОТА"
         "\nМожно отправить ссылку на eBay-аукцион — сохраню точное время и напомню заранее."
@@ -12620,7 +12835,7 @@ def start_leader_workers():
         name='telegram-ui-config',
     ).start()
     logging.info(
-        "🌐 Multi-provider v6.44: "
+        "🌐 Multi-provider v6.45: "
         f"ProxyScrape Premium={'ON' if PROXYSCRAPE_PREMIUM_API_KEY else 'OFF'}, "
         f"Webshare={'ON (' + str(len(WEBSHARE_API_KEYS)) + ' account(s))' if WEBSHARE_API_KEYS else 'OFF'}, "
         f"Webshare first-batch={'ON (1 unique-host slot; extra keys=bandwidth)' if WEBSHARE_FIRST_BATCH else 'OFF'}, "
@@ -12634,7 +12849,7 @@ def start_leader_workers():
     proxio_calls_day = int((86400 + PROXIO_FREE_REFRESH - 1) // PROXIO_FREE_REFRESH) if PROXIO_FREE_ENABLED else 0
     proxio_calls_per_key = (proxio_calls_day / len(PROXIO_API_KEYS)) if PROXIO_API_KEYS else 0.0
     logging.info(
-        f"🧭 External sources v6.44: HProxy={'ON' if HPROXY_FREE_ENABLED else 'OFF'} "
+        f"🧭 External sources v6.45: HProxy={'ON' if HPROXY_FREE_ENABLED else 'OFF'} "
         f"(HTTPS, elite+anonymous, cap={HPROXY_FREE_ELITE_LIMIT + HPROXY_FREE_ANON_LIMIT}), "
         f"Databay={'ON' if DATABAY_FREE_ENABLED else 'OFF'} "
         f"(HTTPS strict+fast, elite+anonymous, cap={DATABAY_FREE_ELITE_LIMIT + DATABAY_FREE_ANON_LIMIT}), "
@@ -12642,37 +12857,41 @@ def start_leader_workers():
         f"(Elite HTTPS, cap={PROXIO_SNAPSHOT_LIMIT}, refresh={PROXIO_FREE_REFRESH}s, "
         f"designed≈{proxio_calls_day} calls/day total≈{proxio_calls_per_key:.1f}/key); "
         f"eBay slots={EXTERNAL_FREE_EARLY_SLOTS} early/{EXTERNAL_FREE_ESCALATED_SLOTS} escalated, "
-        f"neutral_preflight={EXTERNAL_FREE_PREFLIGHT_SLOTS}, normal ceiling={PROBE_MAX_CONCURRENCY}, long-outage ceiling={PROBE_EXTREME_OUTAGE_CONCURRENCY}"
+        f"neutral_preflight={EXTERNAL_FREE_PREFLIGHT_SLOTS}, normal ceiling={PROBE_MAX_CONCURRENCY}, "
+        f"long/extreme/ultra ceilings={PROBE_LONG_OUTAGE_CONCURRENCY}/{PROBE_EXTREME_OUTAGE_CONCURRENCY}/{PROBE_ULTRA_OUTAGE_CONCURRENCY}"
     )
     logging.info(
-        f"⚡ Adaptive discovery v6.44: normal {PROBE_CONCURRENCY}→{PROBE_ESCALATED_CONCURRENCY}→"
+        f"⚡ Adaptive discovery v6.45: normal {PROBE_CONCURRENCY}→{PROBE_ESCALATED_CONCURRENCY}→"
         f"{PROBE_DEEP_CONCURRENCY}→{PROBE_BURST_CONCURRENCY}→{PROBE_MAX_CONCURRENCY} at "
         f"~0/{PROBE_ESCALATE_AFTER:.0f}/{PROBE_DEEP_ESCALATE_AFTER:.0f}/"
         f"{PROBE_BURST_ESCALATE_AFTER:.0f}/{PROBE_MAX_ESCALATE_AFTER:.0f}s; long-outage "
         f"{PROBE_LONG_OUTAGE_CONCURRENCY}@{PROBE_LONG_OUTAGE_AFTER:.0f}s→"
-        f"{PROBE_EXTREME_OUTAGE_CONCURRENCY}@{PROBE_EXTREME_OUTAGE_AFTER:.0f}s only while "
-        f"RSS<{PROBE_LONG_OUTAGE_MEMORY_CEILING_MB} MB"
+        f"{PROBE_EXTREME_OUTAGE_CONCURRENCY}@{PROBE_EXTREME_OUTAGE_AFTER:.0f}s→"
+        f"{PROBE_ULTRA_OUTAGE_CONCURRENCY}@{PROBE_ULTRA_OUTAGE_AFTER:.0f}s; "
+        f"9/10 while RSS<{PROBE_LONG_OUTAGE_MEMORY_CEILING_MB} MB, "
+        f"12 only while RSS<{PROBE_ULTRA_OUTAGE_MEMORY_CEILING_MB} MB"
     )
     rss = _memory_rss_mb()
     logging.info(
         f"🧠 MemorySafe: RSS≈{rss:.0f} MB, soft/clear/high/emergency={MEMORY_SOFT_MB}/{MEMORY_CLEAR_MB}/{MEMORY_HIGH_MB}/{MEMORY_EMERGENCY_MB} MB; "
         f"self-heal/recycle/hard={MEMORY_RECOVERY_TRIGGER_MB}/{MEMORY_RECYCLE_MB}/{MEMORY_HARD_RECYCLE_MB} MB "
         f"({'ON' if MEMORY_SELF_RECYCLE_ENABLED else 'OFF'}); "
-        f"burst/long-outage gates={PROBE_BURST_MEMORY_CEILING_MB}/{PROBE_LONG_OUTAGE_MEMORY_CEILING_MB} MB; "
+        f"burst/long/ultra gates={PROBE_BURST_MEMORY_CEILING_MB}/{PROBE_LONG_OUTAGE_MEMORY_CEILING_MB}/{PROBE_ULTRA_OUTAGE_MEMORY_CEILING_MB} MB; "
         f"background TLS workers={PROXY_PREFLIGHT_WARM_CONCURRENCY}, "
         f"HIGH-micro<{PROXY_PREFLIGHT_HIGH_MEMORY_CEILING_MB}MB="
         f"{PROXY_PREFLIGHT_HIGH_MEMORY_BATCH} probe/{PROXY_PREFLIGHT_HIGH_MEMORY_CONCURRENCY} worker" if rss is not None else
         f"🧠 MemorySafe enabled: soft/clear/high/emergency={MEMORY_SOFT_MB}/{MEMORY_CLEAR_MB}/{MEMORY_HIGH_MB}/{MEMORY_EMERGENCY_MB} MB; "
-        f"burst/long-outage gates={PROBE_BURST_MEMORY_CEILING_MB}/{PROBE_LONG_OUTAGE_MEMORY_CEILING_MB} MB"
+        f"burst/long/ultra gates={PROBE_BURST_MEMORY_CEILING_MB}/{PROBE_LONG_OUTAGE_MEMORY_CEILING_MB}/{PROBE_ULTRA_OUTAGE_MEMORY_CEILING_MB} MB"
     )
 
     threading.Thread(target=telegram_listener, daemon=True, name='telegram-listener').start()
     logging.info(
-        f"📨 Telegram intake v6.44: ItemID-dedupe ON; auction priority memory ceiling="
+        f"📨 Telegram intake v6.45: ItemID-dedupe ON; auction priority memory ceiling="
         f"{AUCTION_USER_MEMORY_LIMIT_MB}MB, high-memory fetch workers={AUCTION_HIGH_MEMORY_FETCH_PARALLEL}, "
-        f"status_grace={AUCTION_LINK_STATUS_GRACE}s"
+        f"status_grace={AUCTION_LINK_STATUS_GRACE}s; long-outage low-impact="
+        f"{AUCTION_DURING_DISCOVERY_AFTER:.0f}s/RSS<{AUCTION_DURING_DISCOVERY_MEMORY_CEILING_MB}MB"
     )
-    logging.info(f"🌉 Handoff-safe v6.44: recent-good transient scout failures are isolated for {WEBSHARE_HANDOFF_TRANSIENT_COOLDOWN:.0f}s; main cooldown untouched")
+    logging.info(f"🌉 Handoff-safe v6.45: recent-good transient scout failures are isolated for {WEBSHARE_HANDOFF_TRANSIENT_COOLDOWN:.0f}s; main cooldown untouched")
     threading.Thread(target=connection_watchdog, daemon=True, name='connection-watchdog').start()
     threading.Thread(target=memory_guard_worker, daemon=True, name='memory-guard-worker').start()
     threading.Thread(target=restart_sticky_persist_worker, daemon=True, name='restart-sticky-persist').start()
@@ -12719,7 +12938,7 @@ def leader_supervisor():
 @app.route('/')
 def index():
     role = "leader" if leader_active_event.is_set() else "standby"
-    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.44 MemorySelfHeal+TelegramUI+PremiumBackup+AuctionPriority, {role})"
+    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.45 BalancedOutage+MemorySelfHeal+AuctionDurable, {role})"
 
 
 @app.route('/health')
