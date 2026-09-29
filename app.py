@@ -3077,12 +3077,20 @@ class ExternalFreeSourceManager:
                 self._bounded_hash_add(st['unique_tested'], proxy)
                 if result == 'success':
                     st['discovery_success'] += 1
-                self.recent_results[source].append((request_kind, result))
+                # Adaptive history exists only for ranked external feeds
+                # (HProxy/ProxMint/Proxio). Generic ProxyScrape has its own large-pool
+                # selection path, so it is intentionally NOT present in recent_results.
+                # Never let telemetry raise KeyError and invalidate a real eBay result.
+                recent = self.recent_results.get(source)
+                if recent is not None:
+                    recent.append((request_kind, result))
             elif request_kind in ('fixed', 'recovery'):
                 st['fixed'] += 1
                 if result == 'success':
                     st['fixed_success'] += 1
-                self.recent_results[source].append((request_kind, result))
+                recent = self.recent_results.get(source)
+                if recent is not None:
+                    recent.append((request_kind, result))
             if result in st:
                 st[result] += 1
             if result == 'success':
@@ -5194,7 +5202,14 @@ def _restart_sticky_safe_record(proxy):
         if not host or port is None or scheme not in ('http', 'https', 'socks5'):
             return None
         source = provider_manager.source_fast(proxy) if 'provider_manager' in globals() else 'free'
-        if source not in ('free', 'proxyscrape_premium', 'webshare'):
+        if source == 'free' and 'external_free_manager' in globals():
+            external_source = external_free_manager.credit_source_fast(proxy)
+            if external_source in ('hproxy', 'proxmint', 'proxio'):
+                source = external_source
+        if source not in (
+            'free', 'hproxy', 'proxmint', 'proxio',
+            'proxyscrape_premium', 'webshare',
+        ):
             source = 'free'
         return {
             'v': 1,
@@ -5316,8 +5331,13 @@ def _resolve_restart_sticky_proxy(record):
         port = int(record.get('port') or 0)
         if not host or port <= 0:
             return None
-        if source == 'free':
-            return f"{scheme}://{host}:{port}"
+        if source in ('free', 'hproxy', 'proxmint', 'proxio'):
+            proxy = f"{scheme}://{host}:{port}"
+            # Preserve source attribution across a Render restart so a recovered external
+            # proxy continues feeding the correct fixed/recovery stats and adaptive ranking.
+            if source != 'free' and 'external_free_manager' in globals():
+                external_free_manager.claim_credit(proxy, source)
+            return proxy
 
         # Managed endpoints need fresh credentials. Never reconstruct or persist them ourselves.
         rows = provider_manager.candidates(include_webshare=True)
@@ -10636,15 +10656,32 @@ def _make_request(proxy, profile, session=None, timeout=None, request_kind="unkn
         timeout = (FIXED_CONNECT_TIMEOUT, FIXED_READ_TIMEOUT)
 
     def tracked_return(result, html_value, session_value, body_bytes=0):
-        # One central accounting point prevents the misleading v6.20 stats where only
-        # a fixed-session recovery was counted while discovery/fixed traffic was missing.
+        # Telemetry/accounting must NEVER be able to turn a valid network result into
+        # a failed probe. v6.48 fixes the adaptive-stats KeyError that could occur after
+        # a genuine ProxyScrape HTTP 200 and make discovery discard an otherwise good proxy.
         if result != 'profile_error':
-            provider_manager.record_result(
-                proxy, result, body_bytes=body_bytes, request_kind=request_kind
-            )
+            try:
+                provider_manager.record_result(
+                    proxy, result, body_bytes=body_bytes, request_kind=request_kind
+                )
+            except Exception as stats_error:
+                logging.error(
+                    f"⚠️ Provider accounting error for {_proxy_log_name(proxy)}: {stats_error}"
+                )
             if 'external_free_manager' in globals():
-                external_free_manager.record_result(proxy, result, request_kind=request_kind)
-            provider_manager.maybe_warn_webshare_usage()
+                try:
+                    external_free_manager.record_result(
+                        proxy, result, request_kind=request_kind
+                    )
+                except Exception as stats_error:
+                    logging.error(
+                        f"⚠️ External-source accounting error for {_proxy_log_name(proxy)}: "
+                        f"{stats_error}"
+                    )
+            try:
+                provider_manager.maybe_warn_webshare_usage()
+            except Exception as stats_error:
+                logging.debug(f"Provider usage accounting warning: {stats_error}")
         return result, html_value, session_value
 
     own_session = session is None
