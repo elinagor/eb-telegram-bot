@@ -618,14 +618,16 @@ PROXIO_FREE_ENABLED = bool(PROXIO_API_KEYS) and os.getenv("PROXIO_FREE_ENABLED",
 EXTERNAL_FREE_API_TIMEOUT = max(3.0, min(float(os.getenv("EXTERNAL_FREE_API_TIMEOUT", "8")), 15.0))
 HPROXY_FREE_REFRESH = max(60, int(os.getenv("HPROXY_FREE_REFRESH", "60")))
 
-# ProxMint re-validates the public dataset every 30 minutes. Polling faster only returns
-# the same rows, so keep one quality-sorted HTTP snapshot for the whole provider cycle.
+# V6.48: ProxMint re-validates the public dataset about every 30 minutes, but our process
+# does NOT know the provider's refresh phase. Polling exactly every 30 minutes can therefore
+# leave us on the previous snapshot for almost another full cycle. A cheap key-free 10-minute
+# poll caps normal pickup lag at ~10 minutes while remaining far below the provider API limit.
 # HTTP is intentional: for an HTTPS target such as eBay these endpoints are validated again
 # by our existing neutral CONNECT+TLS preflight before they become warm reserve.
 # Primary API: no key/sign-up, pageSize<=200, 60 requests/minute/IP. If the API edge is
 # temporarily unavailable, fall back to ProxMint's official GitHub mirror of the same data.
 # Proxy data from Proxmint's Free Proxy List (https://proxmint.com/free-proxies), CC BY 4.0.
-PROXMINT_FREE_REFRESH = max(1800, int(os.getenv("PROXMINT_FREE_REFRESH", "1800")))
+PROXMINT_FREE_REFRESH = max(300, int(os.getenv("PROXMINT_FREE_REFRESH", "600")))
 PROXMINT_FREE_API_URL = (
     os.getenv("PROXMINT_FREE_API_URL") or "https://proxmint.com/api/free-proxies"
 ).strip()
@@ -637,9 +639,21 @@ PROXMINT_API_PAGE_SIZE = max(50, min(int(os.getenv("PROXMINT_API_PAGE_SIZE", "20
 PROXMINT_SNAPSHOT_LIMIT = max(50, min(
     int(os.getenv("PROXMINT_SNAPSHOT_LIMIT", "200")), PROXMINT_API_PAGE_SIZE
 ))
+# Primary tier stays deliberately strict. V6.48 adds a SECOND fallback tier behind it:
+# weaker rows are retained for a long outage, never promoted ahead of the strong tier.
 PROXMINT_MIN_SCORE = max(0.0, min(float(os.getenv("PROXMINT_MIN_SCORE", "70")), 100.0))
 PROXMINT_MIN_UPTIME_PCT = max(0.0, min(float(os.getenv("PROXMINT_MIN_UPTIME_PCT", "70")), 100.0))
 PROXMINT_MAX_LATENCY_MS = max(500, min(int(os.getenv("PROXMINT_MAX_LATENCY_MS", "3000")), 10000))
+PROXMINT_FALLBACK_MIN_SCORE = max(0.0, min(
+    float(os.getenv("PROXMINT_FALLBACK_MIN_SCORE", "60")), PROXMINT_MIN_SCORE
+))
+PROXMINT_FALLBACK_MIN_UPTIME_PCT = max(0.0, min(
+    float(os.getenv("PROXMINT_FALLBACK_MIN_UPTIME_PCT", "60")), PROXMINT_MIN_UPTIME_PCT
+))
+PROXMINT_FALLBACK_MAX_LATENCY_MS = max(
+    PROXMINT_MAX_LATENCY_MS,
+    min(int(os.getenv("PROXMINT_FALLBACK_MAX_LATENCY_MS", "4500")), 10000),
+)
 PROXMINT_FREE_HTTP_HEADERS = {
     "Accept": "application/json,*/*;q=0.5",
     "User-Agent": "Mozilla/5.0 (compatible; eBayUKMonitor/6.47; +https://proxmint.com/free-proxies)",
@@ -678,6 +692,15 @@ EXTERNAL_FREE_ESCALATED_SLOTS = max(EXTERNAL_FREE_EARLY_SLOTS, min(int(os.getenv
 # background threads beyond the already bounded preflight executor.
 EXTERNAL_FREE_PREFLIGHT_SLOTS = max(0, min(int(os.getenv("EXTERNAL_FREE_PREFLIGHT_SLOTS", "5")), 6))
 EXTERNAL_FREE_STATS_INTERVAL = max(60, int(os.getenv("EXTERNAL_FREE_STATS_INTERVAL", "300")))
+# V6.48 source-level adaptive ordering. It changes ONLY which external feed gets the first
+# already-bounded slot; it never raises eBay concurrency. We learn from a short recent window
+# and force periodic exploration so yesterday's leader cannot monopolise tomorrow's outage.
+EXTERNAL_SOURCE_ADAPTIVE_RANKING = os.getenv(
+    "EXTERNAL_SOURCE_ADAPTIVE_RANKING", "true"
+).strip().lower() not in ("0", "false", "no", "off")
+EXTERNAL_SOURCE_RANK_WINDOW = max(30, min(int(os.getenv("EXTERNAL_SOURCE_RANK_WINDOW", "80")), 200))
+EXTERNAL_SOURCE_RANK_MIN_SAMPLES = max(4, min(int(os.getenv("EXTERNAL_SOURCE_RANK_MIN_SAMPLES", "12")), 50))
+EXTERNAL_SOURCE_EXPLORE_EVERY = max(3, min(int(os.getenv("EXTERNAL_SOURCE_EXPLORE_EVERY", "5")), 12))
 
 # Background SmartReserve may hold 12+ verified free proxies, but the real log showed that
 # draining 10-12 of them before managed providers delayed recovery. Keep a deeper reserve in
@@ -2316,7 +2339,11 @@ class ExternalFreeSourceManager:
         self.credit_source_at = {}
         self.turn = 0
         self.preflight_turn = 0
+        self.adaptive_pick_count = 0
         self.last_stats_log = 0.0
+        self.recent_results = {
+            name: deque(maxlen=EXTERNAL_SOURCE_RANK_WINDOW) for name in self.SOURCES
+        }
 
         # Proxio API quota state. Secrets themselves are never logged or persisted.
         utc_day = datetime.now(timezone.utc).date().isoformat()
@@ -2460,13 +2487,27 @@ class ExternalFreeSourceManager:
             latency_ms = self._proxmint_number(row.get('latencyMs', row.get('latency')), None)
             if score is None or uptime is None:
                 continue
-            if score < PROXMINT_MIN_SCORE or uptime < PROXMINT_MIN_UPTIME_PCT:
-                continue
-            if latency_ms is not None and latency_ms > PROXMINT_MAX_LATENCY_MS:
+
+            primary = (
+                score >= PROXMINT_MIN_SCORE
+                and uptime >= PROXMINT_MIN_UPTIME_PCT
+                and (latency_ms is None or latency_ms <= PROXMINT_MAX_LATENCY_MS)
+            )
+            fallback = (
+                score >= PROXMINT_FALLBACK_MIN_SCORE
+                and uptime >= PROXMINT_FALLBACK_MIN_UPTIME_PCT
+                and (latency_ms is None or latency_ms <= PROXMINT_FALLBACK_MAX_LATENCY_MS)
+            )
+            if not primary and not fallback:
                 continue
 
-            latency_sort = latency_ms if latency_ms is not None else float(PROXMINT_MAX_LATENCY_MS)
-            candidates.append((-score, -uptime, latency_sort, host, proxy))
+            # Strong tier is always exhausted before fallback rows. Provider score/uptime/
+            # latency still rank endpoints inside each tier.
+            tier = 0 if primary else 1
+            latency_sort = latency_ms if latency_ms is not None else float(
+                PROXMINT_MAX_LATENCY_MS if primary else PROXMINT_FALLBACK_MAX_LATENCY_MS
+            )
+            candidates.append((tier, -score, -uptime, latency_sort, host, proxy))
 
         candidates.sort()
         proxies = []
@@ -2912,8 +2953,63 @@ class ExternalFreeSourceManager:
                     self.turn += 1
             return enabled, {name: list(self.snapshots[name]) for name in enabled}
 
+    def _source_performance_score_locked(self, source):
+        """Recent time-to-success score for HProxy/ProxMint/Proxio ordering.
+
+        Discovery observations carry full weight; fixed/recovery observations carry only
+        0.35 so one long-lived endpoint helps its source without swamping discovery history.
+        A Bayesian prior prevents tiny samples from becoming a permanent winner. Timeout and
+        CONNECT/SSL failures get a small extra cost because they consume substantially more
+        failover wall-clock than a fast eBay 403.
+        """
+        rows = list(self.recent_results.get(source, ()))
+        if not rows:
+            return 0.0
+        attempts = successes = timeouts = hard_transport = 0.0
+        for request_kind, result in rows:
+            weight = 1.0 if request_kind == 'discovery' else 0.35
+            attempts += weight
+            if result == 'success':
+                successes += weight
+            elif result == 'proxy_timeout':
+                timeouts += weight
+            elif result in ('proxy_rejected', 'proxy_ssl', 'proxy_error'):
+                hard_transport += weight
+        if attempts <= 0:
+            return 0.0
+        # Prior ~=1.25% success over 40 virtual attempts: conservative but not sticky.
+        posterior = (successes + 0.5) / (attempts + 40.0)
+        timeout_rate = timeouts / attempts
+        hard_rate = hard_transport / attempts
+        winner_bonus = min(3, int(self.stats.get(source, {}).get('winners', 0))) * 0.25
+        return posterior * 1000.0 - timeout_rate * 2.5 - hard_rate * 1.5 + winner_bonus
+
+    def _adaptive_order_locked(self, enabled):
+        if len(enabled) <= 1 or not EXTERNAL_SOURCE_ADAPTIVE_RANKING:
+            return list(enabled), False
+        # Learn fairly first. Only switch to leader-first once every enabled source has
+        # enough real eBay observations in the recent window.
+        if min(len(self.recent_results.get(src, ())) for src in enabled) < EXTERNAL_SOURCE_RANK_MIN_SAMPLES:
+            shift = self.turn % len(enabled)
+            self.turn += 1
+            return enabled[shift:] + enabled[:shift], False
+
+        self.adaptive_pick_count += 1
+        # Mandatory exploration every N selections detects when a formerly weak feed improves.
+        if self.adaptive_pick_count % EXTERNAL_SOURCE_EXPLORE_EVERY == 0:
+            shift = self.turn % len(enabled)
+            self.turn += 1
+            return enabled[shift:] + enabled[:shift], False
+
+        ranked = sorted(
+            enabled,
+            key=lambda src: self._source_performance_score_locked(src),
+            reverse=True,
+        )
+        return ranked, True
+
     def selection_snapshot(self, include_proxio=True, prefer_proxio=False):
-        """Discovery snapshot with Proxio acting as a controlled reserve."""
+        """Discovery snapshot with adaptive source ordering + mandatory exploration."""
         with self.lock:
             enabled = []
             for source in self.SOURCES:
@@ -2923,10 +3019,7 @@ class ExternalFreeSourceManager:
                     enabled.append(source)
             if not enabled:
                 return [], {}
-            if len(enabled) > 1:
-                shift = self.turn % len(enabled)
-                enabled = enabled[shift:] + enabled[:shift]
-                self.turn += 1
+            enabled, _adaptive = self._adaptive_order_locked(enabled)
             if prefer_proxio and 'proxio' in enabled:
                 enabled = ['proxio'] + [name for name in enabled if name != 'proxio']
             return enabled, {name: list(self.snapshots[name]) for name in enabled}
@@ -2984,10 +3077,12 @@ class ExternalFreeSourceManager:
                 self._bounded_hash_add(st['unique_tested'], proxy)
                 if result == 'success':
                     st['discovery_success'] += 1
+                self.recent_results[source].append((request_kind, result))
             elif request_kind in ('fixed', 'recovery'):
                 st['fixed'] += 1
                 if result == 'success':
                     st['fixed_success'] += 1
+                self.recent_results[source].append((request_kind, result))
             if result in st:
                 st[result] += 1
             if result == 'success':
@@ -3028,7 +3123,29 @@ class ExternalFreeSourceManager:
                     f"fixed={st['fixed']}/{st['fixed_success']}, winners={st['winners']}, "
                     f"403={st['blocked']}, timeout={st['proxy_timeout']}, reject={st['proxy_rejected']}, ssl={st['proxy_ssl']}"
                 )
-        logging.info("📊 Free-source stats | " + " | ".join(parts))
+            enabled_rank = [
+                src for src in self.SOURCES
+                if self._source_enabled(src) and self.snapshots.get(src)
+            ]
+            rank_bits = []
+            for src in sorted(
+                enabled_rank,
+                key=lambda name: self._source_performance_score_locked(name),
+                reverse=True,
+            ):
+                rank_bits.append(
+                    f"{src}:{self._source_performance_score_locked(src):.1f}/n={len(self.recent_results.get(src, ())) }"
+                )
+            adaptive_ready = bool(
+                enabled_rank
+                and min(len(self.recent_results.get(src, ())) for src in enabled_rank) >= EXTERNAL_SOURCE_RANK_MIN_SAMPLES
+            )
+            rank_suffix = (
+                f" | adaptive_rank={'ON' if EXTERNAL_SOURCE_ADAPTIVE_RANKING and adaptive_ready else 'LEARNING'}"
+                f"[{'>'.join(rank_bits)}]"
+                if rank_bits else ""
+            )
+        logging.info("📊 Free-source stats | " + " | ".join(parts) + rank_suffix)
 
 
 provider_manager = ProviderManager()
@@ -12996,7 +13113,7 @@ def bot_worker():
     seen_line = f"\n📚 В базе: {seen_total} товаров." if seen_total is not None else ""
     startup_keyboard_ok = send_telegram_message(
         startup_line +
-        "\n🇬🇧 eBay UK monitor v6.47 AuctionConsensusSafe+BalancedOutage+MemorySelfHeal работает." +
+        "\n🇬🇧 eBay UK monitor v6.48 AuctionConsensusSafe+BalancedOutage+MemorySelfHeal работает." +
         seen_line +
         "\nКоманды: /stop /start /list (/auctions) /delauction НОМЕР_ЛОТА"
         "\nМожно отправить ссылку на eBay-аукцион — надёжно сохраню окончание и включу напоминания заранее."
@@ -13082,7 +13199,7 @@ def start_leader_workers():
         name='telegram-ui-config',
     ).start()
     logging.info(
-        "🌐 Multi-provider v6.47: "
+        "🌐 Multi-provider v6.48: "
         f"ProxyScrape Premium={'ON' if PROXYSCRAPE_PREMIUM_API_KEY else 'OFF'}, "
         f"Webshare={'ON (' + str(len(WEBSHARE_API_KEYS)) + ' account(s))' if WEBSHARE_API_KEYS else 'OFF'}, "
         f"Webshare first-batch={'ON (1 unique-host slot; extra keys=bandwidth)' if WEBSHARE_FIRST_BATCH else 'OFF'}, "
@@ -13096,20 +13213,25 @@ def start_leader_workers():
     proxio_calls_day = int((86400 + PROXIO_FREE_REFRESH - 1) // PROXIO_FREE_REFRESH) if PROXIO_FREE_ENABLED else 0
     proxio_calls_per_key = (proxio_calls_day / len(PROXIO_API_KEYS)) if PROXIO_API_KEYS else 0.0
     logging.info(
-        f"🧭 External sources v6.47: HProxy={'ON' if HPROXY_FREE_ENABLED else 'OFF'} "
+        f"🧭 External sources v6.48: HProxy={'ON' if HPROXY_FREE_ENABLED else 'OFF'} "
         f"(HTTPS, elite+anonymous, cap={HPROXY_FREE_ELITE_LIMIT + HPROXY_FREE_ANON_LIMIT}), "
         f"ProxMint={'ON' if PROXMINT_FREE_ENABLED else 'OFF'} "
-        f"(HTTP, score>={PROXMINT_MIN_SCORE:.0f}, uptime>={PROXMINT_MIN_UPTIME_PCT:.0f}%, "
-        f"latency<={PROXMINT_MAX_LATENCY_MS}ms, cap={PROXMINT_SNAPSHOT_LIMIT}, refresh={PROXMINT_FREE_REFRESH}s), "
+        f"(HTTP primary score>={PROXMINT_MIN_SCORE:.0f}/uptime>={PROXMINT_MIN_UPTIME_PCT:.0f}%/"
+        f"latency<={PROXMINT_MAX_LATENCY_MS}ms; fallback score>={PROXMINT_FALLBACK_MIN_SCORE:.0f}/"
+        f"uptime>={PROXMINT_FALLBACK_MIN_UPTIME_PCT:.0f}%/latency<={PROXMINT_FALLBACK_MAX_LATENCY_MS}ms; "
+        f"cap={PROXMINT_SNAPSHOT_LIMIT}, refresh={PROXMINT_FREE_REFRESH}s), "
         f"Proxio={'ON (' + str(len(PROXIO_API_KEYS)) + ' key(s))' if PROXIO_FREE_ENABLED else 'OFF'} "
         f"(Elite HTTPS, cap={PROXIO_SNAPSHOT_LIMIT}, refresh={PROXIO_FREE_REFRESH}s, "
         f"designed≈{proxio_calls_day} calls/day total≈{proxio_calls_per_key:.1f}/key); "
         f"eBay slots={EXTERNAL_FREE_EARLY_SLOTS} early/{EXTERNAL_FREE_ESCALATED_SLOTS} escalated, "
-        f"neutral_preflight={EXTERNAL_FREE_PREFLIGHT_SLOTS}, normal ceiling={PROBE_MAX_CONCURRENCY}, "
+        f"neutral_preflight={EXTERNAL_FREE_PREFLIGHT_SLOTS}, "
+        f"source-rank={'ON' if EXTERNAL_SOURCE_ADAPTIVE_RANKING else 'OFF'}/window={EXTERNAL_SOURCE_RANK_WINDOW}/"
+        f"min={EXTERNAL_SOURCE_RANK_MIN_SAMPLES}/explore=1:{EXTERNAL_SOURCE_EXPLORE_EVERY}, "
+        f"normal ceiling={PROBE_MAX_CONCURRENCY}, "
         f"long/extreme/ultra ceilings={PROBE_LONG_OUTAGE_CONCURRENCY}/{PROBE_EXTREME_OUTAGE_CONCURRENCY}/{PROBE_ULTRA_OUTAGE_CONCURRENCY}"
     )
     logging.info(
-        f"⚡ Adaptive discovery v6.47: normal {PROBE_CONCURRENCY}→{PROBE_ESCALATED_CONCURRENCY}→"
+        f"⚡ Adaptive discovery v6.48: normal {PROBE_CONCURRENCY}→{PROBE_ESCALATED_CONCURRENCY}→"
         f"{PROBE_DEEP_CONCURRENCY}→{PROBE_BURST_CONCURRENCY}→{PROBE_MAX_CONCURRENCY} at "
         f"~0/{PROBE_ESCALATE_AFTER:.0f}/{PROBE_DEEP_ESCALATE_AFTER:.0f}/"
         f"{PROBE_BURST_ESCALATE_AFTER:.0f}/{PROBE_MAX_ESCALATE_AFTER:.0f}s; long-outage "
@@ -13134,12 +13256,12 @@ def start_leader_workers():
 
     threading.Thread(target=telegram_listener, daemon=True, name='telegram-listener').start()
     logging.info(
-        f"📨 Telegram intake v6.47: ItemID-dedupe ON; auction priority memory ceiling="
+        f"📨 Telegram intake v6.48: ItemID-dedupe ON; auction priority memory ceiling="
         f"{AUCTION_USER_MEMORY_LIMIT_MB}MB, high-memory fetch workers={AUCTION_HIGH_MEMORY_FETCH_PARALLEL}, "
         f"status_grace={AUCTION_LINK_STATUS_GRACE}s; long-outage low-impact="
         f"{AUCTION_DURING_DISCOVERY_AFTER:.0f}s/RSS<{AUCTION_DURING_DISCOVERY_MEMORY_CEILING_MB}MB"
     )
-    logging.info(f"🌉 Handoff-safe v6.47: recent-good transient scout failures are isolated for {WEBSHARE_HANDOFF_TRANSIENT_COOLDOWN:.0f}s; main cooldown untouched")
+    logging.info(f"🌉 Handoff-safe v6.48: recent-good transient scout failures are isolated for {WEBSHARE_HANDOFF_TRANSIENT_COOLDOWN:.0f}s; main cooldown untouched")
     threading.Thread(target=connection_watchdog, daemon=True, name='connection-watchdog').start()
     threading.Thread(target=memory_guard_worker, daemon=True, name='memory-guard-worker').start()
     threading.Thread(target=restart_sticky_persist_worker, daemon=True, name='restart-sticky-persist').start()
@@ -13167,7 +13289,7 @@ def leader_supervisor():
         try:
             logging.info(
                 f"🔐 PostgreSQL leader-lock получен (pid={os.getpid()}); "
-                "инициализируем v6.47 leader workers"
+                "инициализируем v6.48 leader workers"
             )
             start_leader_workers()
             # Держим session-level advisory lock отдельным соединением.
@@ -13190,7 +13312,7 @@ def leader_supervisor():
 @app.route('/')
 def index():
     role = "leader" if leader_active_event.is_set() else "standby"
-    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.47 AuctionConsensusSafe+BalancedOutage+MemorySelfHeal, {role})"
+    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.48 AuctionConsensusSafe+BalancedOutage+MemorySelfHeal, {role})"
 
 
 @app.route('/health')
@@ -13202,7 +13324,7 @@ def health():
 
 if __name__ == "__main__":
     logging.info(
-        f"🚀 Render process v6.47 started (pid={os.getpid()}); "
+        f"🚀 Render process v6.48 started (pid={os.getpid()}); "
         "Flask запускается сразу, фоновые worker-ы ждут PostgreSQL leader-lock"
     )
     # Flask привязывается к PORT сразу, чтобы новый Render instance прошёл health/port check.
