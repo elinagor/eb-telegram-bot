@@ -11,6 +11,7 @@ import threading
 import logging
 import html as html_lib
 import hashlib
+import ipaddress
 import socket
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
@@ -471,6 +472,27 @@ MEMORY_SELF_RECYCLE_ENABLED = (
 PROXY_REPUTATION_TTL = max(1800, int(os.getenv("PROXY_REPUTATION_TTL", "21600")))
 PROXY_REPUTATION_MAX = max(1000, int(os.getenv("PROXY_REPUTATION_MAX", "7000")))
 PROVIDER_UNIQUE_STATS_CAP = max(500, int(os.getenv("PROVIDER_UNIQUE_STATS_CAP", "4096")))
+
+# V6.49: soft IPv4 /24 reputation. This NEVER blacklists a subnet and never removes a
+# candidate from the pool. It only lowers candidate ordering after failures from at least
+# two DIFFERENT IPs in the same /24. Direct evidence for the exact proxy always wins:
+# recently eBay-good endpoints are exempt from the subnet penalty. The short TTL matters
+# for public proxies because a subnet that is poor now may become useful again minutes later.
+SUBNET24_REPUTATION_ENABLED = os.getenv(
+    "SUBNET24_REPUTATION_ENABLED", "true"
+).strip().lower() not in ("0", "false", "no", "off")
+SUBNET24_REPUTATION_TTL = max(300, min(
+    int(os.getenv("SUBNET24_REPUTATION_TTL", "1200")), 3600
+))
+SUBNET24_REPUTATION_MIN_FAIL_HOSTS = max(2, min(
+    int(os.getenv("SUBNET24_REPUTATION_MIN_FAIL_HOSTS", "2")), 4
+))
+SUBNET24_REPUTATION_MAX_PENALTY = max(10.0, min(
+    float(os.getenv("SUBNET24_REPUTATION_MAX_PENALTY", "40")), 80.0
+))
+SUBNET24_REPUTATION_EVENTS_PER_SUBNET = max(8, min(
+    int(os.getenv("SUBNET24_REPUTATION_EVENTS_PER_SUBNET", "24")), 64
+))
 
 
 # ============ V6.22 MULTI-WEBSHARE / MAKE-BEFORE-BREAK BRIDGE ============
@@ -949,7 +971,7 @@ def _drop_rebuildable_memory_caches():
                     'preflight_ok_until', 'preflight_bad_until', 'preflight_last_result',
                     'preflight_latency_ms', 'quality_ok_until', 'quality_bad_until',
                     'quality_last_result', 'quality_latency_ms', 'outage_host_last_probe',
-                    'outage_proxy_last_probe', 'handoff_scout_bad_until',
+                    'outage_proxy_last_probe', 'handoff_scout_bad_until', 'subnet24_history',
                 )
                 total = 0
                 for name in cache_names:
@@ -1268,6 +1290,19 @@ def _proxy_host(proxy):
         return (urlsplit(proxy).hostname or proxy).lower()
     except Exception:
         return proxy.lower()
+
+
+def _proxy_subnet24(proxy_or_host):
+    """Return IPv4 /24 network string, or '' for IPv6/hostnames/invalid input."""
+    try:
+        raw = str(proxy_or_host or '')
+        host = _proxy_host(raw) if '://' in raw else raw.strip().lower()
+        ip = ipaddress.ip_address(host)
+        if ip.version != 4:
+            return ''
+        return str(ipaddress.ip_network(f"{ip}/24", strict=False))
+    except Exception:
+        return ''
 
 
 def _proxy_scheme(proxy):
@@ -3209,6 +3244,11 @@ class ProxyManager:
         # V6.35: separate cooldown used ONLY by background Webshare handoff scout.
         # It intentionally does not participate in main discovery/candidate scoring.
         self.handoff_scout_bad_until = {}
+
+        # V6.49: RAM-only SOFT /24 history. Values are tiny bounded deques of
+        # (timestamp, host, result). No subnet is ever hard-blocked.
+        self.subnet24_history = {}
+        self.subnet24_last_prune = 0.0
         self.last_reputation_prune = 0.0
 
     def _prune_reputation_locked(self, now):
@@ -3284,6 +3324,98 @@ class ProxyManager:
             self.quality_latency_ms.pop(proxy, None)
             self.outage_proxy_last_probe.pop(proxy, None)
 
+    def _prune_subnet24_history_locked(self, now):
+        if not SUBNET24_REPUTATION_ENABLED:
+            self.subnet24_history.clear()
+            return
+        if now - self.subnet24_last_prune < 60:
+            return
+        self.subnet24_last_prune = now
+        cutoff = now - SUBNET24_REPUTATION_TTL
+        for subnet, dq in list(self.subnet24_history.items()):
+            fresh = [row for row in dq if row[0] >= cutoff]
+            if not fresh:
+                self.subnet24_history.pop(subnet, None)
+                continue
+            if len(fresh) != len(dq):
+                self.subnet24_history[subnet] = deque(
+                    fresh, maxlen=SUBNET24_REPUTATION_EVENTS_PER_SUBNET
+                )
+
+    def _record_subnet24_result_locked(self, proxy, result, now):
+        if not SUBNET24_REPUTATION_ENABLED:
+            return
+        subnet = _proxy_subnet24(proxy)
+        host = _proxy_host(proxy)
+        if not subnet or not host:
+            return
+        dq = self.subnet24_history.get(subnet)
+        if dq is None:
+            dq = deque(maxlen=SUBNET24_REPUTATION_EVENTS_PER_SUBNET)
+            self.subnet24_history[subnet] = dq
+        dq.append((now, host, str(result or 'proxy_error')))
+
+    def _subnet24_penalty_locked(self, proxy, now):
+        """Soft score penalty from recent sibling-IP evidence; NEVER excludes a proxy.
+
+        Only the latest observation per IP counts, so one noisy endpoint cannot poison the
+        whole /24 by retrying repeatedly. At least two distinct failing IPs are required.
+        A recently successful exact endpoint is exempt because direct evidence is stronger
+        than a subnet-level heuristic.
+        """
+        if not SUBNET24_REPUTATION_ENABLED or self._is_recent_good_locked(proxy, now):
+            return 0.0
+        subnet = _proxy_subnet24(proxy)
+        if not subnet:
+            return 0.0
+        dq = self.subnet24_history.get(subnet)
+        if not dq:
+            return 0.0
+        cutoff = now - SUBNET24_REPUTATION_TTL
+        latest = {}
+        for ts, host, result in dq:
+            if ts >= cutoff:
+                prev = latest.get(host)
+                if prev is None or ts >= prev[0]:
+                    latest[host] = (ts, result)
+        if not latest:
+            return 0.0
+        failing = {
+            host: result for host, (_ts, result) in latest.items()
+            if result != 'success'
+        }
+        if len(failing) < SUBNET24_REPUTATION_MIN_FAIL_HOSTS:
+            return 0.0
+        weights = {
+            'blocked': 12.0, 'rate_limited': 14.0,
+            'proxy_rejected': 9.0, 'proxy_ssl': 10.0,
+            'proxy_timeout': 4.0, 'proxy_error': 5.0, 'http_error': 6.0,
+        }
+        raw = sum(weights.get(result, 4.0) for result in failing.values())
+        # Evidence that another IP in this /24 actually worked should soften the heuristic.
+        successes = sum(1 for _host, (_ts, result) in latest.items() if result == 'success')
+        raw -= successes * 10.0
+        return max(0.0, min(SUBNET24_REPUTATION_MAX_PENALTY, raw))
+
+    def subnet24_reputation_summary(self):
+        """Small diagnostic snapshot; no network work and no effect on selection."""
+        if not SUBNET24_REPUTATION_ENABLED:
+            return {'enabled': False, 'tracked': 0, 'penalized': 0}
+        now = time.time()
+        with self.lock:
+            self._prune_subnet24_history_locked(now)
+            penalized = 0
+            cutoff = now - SUBNET24_REPUTATION_TTL
+            for _subnet, dq in self.subnet24_history.items():
+                latest = {}
+                for ts, host, result in dq:
+                    if ts >= cutoff and (host not in latest or ts >= latest[host][0]):
+                        latest[host] = (ts, result)
+                failing_hosts = sum(1 for _h, (_ts, r) in latest.items() if r != 'success')
+                if failing_hosts >= SUBNET24_REPUTATION_MIN_FAIL_HOSTS:
+                    penalized += 1
+            return {'enabled': True, 'tracked': len(self.subnet24_history), 'penalized': penalized}
+
     def _cleanup_bad_locked(self):
         now = time.time()
         for p in [p for p, until in self.bad_until.items() if until <= now]:
@@ -3312,6 +3444,7 @@ class ProxyManager:
         for p in [p for p, ts in self.outage_proxy_last_probe.items() if ts < outage_cutoff]:
             self.outage_proxy_last_probe.pop(p, None)
 
+        self._prune_subnet24_history_locked(now)
         self._prune_reputation_locked(now)
 
         # Возвращаем proxy после cooldown, если он есть в свежем списке.
@@ -4094,11 +4227,16 @@ class ProxyManager:
         if self._host_recent_outage_locked(host, now) and not self._is_recent_good_locked(proxy, now):
             outage_penalty = 45.0
 
+        # V6.49: SOFT /24 heuristic. It cannot make a candidate ineligible; it only
+        # moves repeatedly-bad sibling networks later in the queue. Exact recent success
+        # is exempt inside _subnet24_penalty_locked().
+        subnet24_penalty = self._subnet24_penalty_locked(proxy, now)
+
         return (
             recent_bonus + success_bonus + standard_bonus + fresh_standard_bonus
             + scheme_bonus + idle_bonus + preflight_bonus + quality_bonus + provider_bonus
             - fail_penalty - unstable_penalty - reason_penalty
-            - quality_bad_penalty - soft_penalty - outage_penalty
+            - quality_bad_penalty - soft_penalty - outage_penalty - subnet24_penalty
             + random.uniform(0, 2.0)
         )
 
@@ -4304,6 +4442,7 @@ class ProxyManager:
                     rows.append(proxy)
                 rows.sort(
                     key=lambda p, src=source: (
+                        self._subnet24_penalty_locked(p, now),
                         external_free_manager.feed_rank_fast(p, src),
                         -self._candidate_score_locked(p, now),
                     )
@@ -4411,6 +4550,7 @@ class ProxyManager:
                     continue
                 rows.sort(
                     key=lambda p, src=source: (
+                        self._subnet24_penalty_locked(p, now),
                         external_free_manager.feed_rank_fast(p, src),
                         -self._candidate_score_locked(p, now),
                     )
@@ -4841,6 +4981,7 @@ class ProxyManager:
             self.last_failure_result.pop(proxy, None)
             self.last_failure_at.pop(proxy, None)
             self.bad_until.pop(proxy, None)
+            self._record_subnet24_result_locked(proxy, 'success', now)
             # Реальный eBay success сильнее любого preflight: endpoint точно проводит HTTPS.
             self.preflight_ok_until[proxy] = now + PROXY_PREFLIGHT_OK_TTL
             self.preflight_bad_until.pop(proxy, None)
@@ -4873,6 +5014,7 @@ class ProxyManager:
             self.fail_streak[proxy] = streak
             self.last_failure_result[proxy] = result
             self.last_failure_at[proxy] = now
+            self._record_subnet24_result_locked(proxy, result, now)
 
             # Единичный сбой недавно успешного proxy не уничтожает его репутацию.
             old_score = self.success_score.get(proxy, 0)
@@ -13150,7 +13292,7 @@ def bot_worker():
     seen_line = f"\n📚 В базе: {seen_total} товаров." if seen_total is not None else ""
     startup_keyboard_ok = send_telegram_message(
         startup_line +
-        "\n🇬🇧 eBay UK monitor v6.48 AuctionConsensusSafe+BalancedOutage+MemorySelfHeal работает." +
+        "\n🇬🇧 eBay UK monitor v6.49 AuctionConsensusSafe+Subnet24SoftRep+MemorySelfHeal работает." +
         seen_line +
         "\nКоманды: /stop /start /list (/auctions) /delauction НОМЕР_ЛОТА"
         "\nМожно отправить ссылку на eBay-аукцион — надёжно сохраню окончание и включу напоминания заранее."
@@ -13236,7 +13378,7 @@ def start_leader_workers():
         name='telegram-ui-config',
     ).start()
     logging.info(
-        "🌐 Multi-provider v6.48: "
+        "🌐 Multi-provider v6.49: "
         f"ProxyScrape Premium={'ON' if PROXYSCRAPE_PREMIUM_API_KEY else 'OFF'}, "
         f"Webshare={'ON (' + str(len(WEBSHARE_API_KEYS)) + ' account(s))' if WEBSHARE_API_KEYS else 'OFF'}, "
         f"Webshare first-batch={'ON (1 unique-host slot; extra keys=bandwidth)' if WEBSHARE_FIRST_BATCH else 'OFF'}, "
@@ -13250,7 +13392,7 @@ def start_leader_workers():
     proxio_calls_day = int((86400 + PROXIO_FREE_REFRESH - 1) // PROXIO_FREE_REFRESH) if PROXIO_FREE_ENABLED else 0
     proxio_calls_per_key = (proxio_calls_day / len(PROXIO_API_KEYS)) if PROXIO_API_KEYS else 0.0
     logging.info(
-        f"🧭 External sources v6.48: HProxy={'ON' if HPROXY_FREE_ENABLED else 'OFF'} "
+        f"🧭 External sources v6.49: HProxy={'ON' if HPROXY_FREE_ENABLED else 'OFF'} "
         f"(HTTPS, elite+anonymous, cap={HPROXY_FREE_ELITE_LIMIT + HPROXY_FREE_ANON_LIMIT}), "
         f"ProxMint={'ON' if PROXMINT_FREE_ENABLED else 'OFF'} "
         f"(HTTP primary score>={PROXMINT_MIN_SCORE:.0f}/uptime>={PROXMINT_MIN_UPTIME_PCT:.0f}%/"
@@ -13268,7 +13410,7 @@ def start_leader_workers():
         f"long/extreme/ultra ceilings={PROBE_LONG_OUTAGE_CONCURRENCY}/{PROBE_EXTREME_OUTAGE_CONCURRENCY}/{PROBE_ULTRA_OUTAGE_CONCURRENCY}"
     )
     logging.info(
-        f"⚡ Adaptive discovery v6.48: normal {PROBE_CONCURRENCY}→{PROBE_ESCALATED_CONCURRENCY}→"
+        f"⚡ Adaptive discovery v6.49: normal {PROBE_CONCURRENCY}→{PROBE_ESCALATED_CONCURRENCY}→"
         f"{PROBE_DEEP_CONCURRENCY}→{PROBE_BURST_CONCURRENCY}→{PROBE_MAX_CONCURRENCY} at "
         f"~0/{PROBE_ESCALATE_AFTER:.0f}/{PROBE_DEEP_ESCALATE_AFTER:.0f}/"
         f"{PROBE_BURST_ESCALATE_AFTER:.0f}/{PROBE_MAX_ESCALATE_AFTER:.0f}s; long-outage "
@@ -13293,12 +13435,17 @@ def start_leader_workers():
 
     threading.Thread(target=telegram_listener, daemon=True, name='telegram-listener').start()
     logging.info(
-        f"📨 Telegram intake v6.48: ItemID-dedupe ON; auction priority memory ceiling="
+        f"📨 Telegram intake v6.49: ItemID-dedupe ON; auction priority memory ceiling="
         f"{AUCTION_USER_MEMORY_LIMIT_MB}MB, high-memory fetch workers={AUCTION_HIGH_MEMORY_FETCH_PARALLEL}, "
         f"status_grace={AUCTION_LINK_STATUS_GRACE}s; long-outage low-impact="
         f"{AUCTION_DURING_DISCOVERY_AFTER:.0f}s/RSS<{AUCTION_DURING_DISCOVERY_MEMORY_CEILING_MB}MB"
     )
-    logging.info(f"🌉 Handoff-safe v6.48: recent-good transient scout failures are isolated for {WEBSHARE_HANDOFF_TRANSIENT_COOLDOWN:.0f}s; main cooldown untouched")
+    logging.info(f"🌉 Handoff-safe v6.49: recent-good transient scout failures are isolated for {WEBSHARE_HANDOFF_TRANSIENT_COOLDOWN:.0f}s; main cooldown untouched")
+    logging.info(
+        f"🧩 /24 soft reputation v6.49: {'ON' if SUBNET24_REPUTATION_ENABLED else 'OFF'}, "
+        f"TTL={SUBNET24_REPUTATION_TTL}s, min_fail_hosts={SUBNET24_REPUTATION_MIN_FAIL_HOSTS}, "
+        f"max_penalty={SUBNET24_REPUTATION_MAX_PENALTY:.0f}; ranking-only, never blacklist"
+    )
     threading.Thread(target=connection_watchdog, daemon=True, name='connection-watchdog').start()
     threading.Thread(target=memory_guard_worker, daemon=True, name='memory-guard-worker').start()
     threading.Thread(target=restart_sticky_persist_worker, daemon=True, name='restart-sticky-persist').start()
@@ -13326,7 +13473,7 @@ def leader_supervisor():
         try:
             logging.info(
                 f"🔐 PostgreSQL leader-lock получен (pid={os.getpid()}); "
-                "инициализируем v6.48 leader workers"
+                "инициализируем v6.49 leader workers"
             )
             start_leader_workers()
             # Держим session-level advisory lock отдельным соединением.
@@ -13349,7 +13496,7 @@ def leader_supervisor():
 @app.route('/')
 def index():
     role = "leader" if leader_active_event.is_set() else "standby"
-    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.48 AuctionConsensusSafe+BalancedOutage+MemorySelfHeal, {role})"
+    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.49 AuctionConsensusSafe+Subnet24SoftRep+MemorySelfHeal, {role})"
 
 
 @app.route('/health')
@@ -13361,7 +13508,7 @@ def health():
 
 if __name__ == "__main__":
     logging.info(
-        f"🚀 Render process v6.48 started (pid={os.getpid()}); "
+        f"🚀 Render process v6.49 started (pid={os.getpid()}); "
         "Flask запускается сразу, фоновые worker-ы ждут PostgreSQL leader-lock"
     )
     # Flask привязывается к PORT сразу, чтобы новый Render instance прошёл health/port check.
