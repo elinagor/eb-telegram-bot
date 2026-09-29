@@ -539,7 +539,7 @@ PREMIUM_UNLOCK_ATTEMPTS = max(8, int(os.getenv("PREMIUM_UNLOCK_ATTEMPTS", "20"))
 # V6.43: "allow Premium" in the generic batch is not a guarantee that a Premium
 # endpoint is ever selected when the free pool is large. After a genuinely difficult
 # discovery, reserve exactly ONE eligible Premium endpoint so the paid trial remains a
-# real late backup without displacing the stronger HProxy/Databay/Proxio early paths.
+# real late backup without displacing the stronger HProxy/ProxMint/Proxio early paths.
 PREMIUM_FORCE_BACKUP_AFTER = max(
     PREMIUM_UNLOCK_AFTER, float(os.getenv("PREMIUM_FORCE_BACKUP_AFTER", "20"))
 )
@@ -607,32 +607,42 @@ PREMIUM_CIRCUIT_HALF_OPEN_INTERVAL = max(
     30.0, float(os.getenv("PREMIUM_CIRCUIT_HALF_OPEN_INTERVAL", "60"))
 )
 
-# V6.32/V6.33: HProxy + Databay are UNMETERED public sources.
+# V6.32/V6.33: HProxy + ProxMint are UNMETERED public sources.
 # V6.36 adds Proxio as a quota-limited quality source. Proxio is deliberately handled
 # as a small snapshot/reserve, NOT merged into the large ProxyScrape pool and NOT allowed
-# to increase the global discovery ceiling. One API call fetches up to 200 Elite HTTPS
-# candidates; actual eBay probes are only made when normal failover needs them.
+# to increase the global discovery ceiling. External-source candidates still consume the
+# SAME bounded eBay probe slots; these feeds never increase global discovery concurrency.
 HPROXY_FREE_ENABLED = os.getenv("HPROXY_FREE_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
-DATABAY_FREE_ENABLED = os.getenv("DATABAY_FREE_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
+PROXMINT_FREE_ENABLED = os.getenv("PROXMINT_FREE_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
 PROXIO_FREE_ENABLED = bool(PROXIO_API_KEYS) and os.getenv("PROXIO_FREE_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
 EXTERNAL_FREE_API_TIMEOUT = max(3.0, min(float(os.getenv("EXTERNAL_FREE_API_TIMEOUT", "8")), 15.0))
 HPROXY_FREE_REFRESH = max(60, int(os.getenv("HPROXY_FREE_REFRESH", "60")))
-DATABAY_FREE_REFRESH = max(120, int(os.getenv("DATABAY_FREE_REFRESH", "300")))
-# Databay officially publishes both the filtered JSON API and stable protocol hotlinks.
-# The public API occasionally returns edge/CDN 401/429 even though Databay documents it
-# as no-key. Keep the filtered API as primary, but fall back to their official HTTPS
-# hotlink instead of dropping the whole source. If both paths fail, last_refresh is
-# advanced so we back off until the normal refresh interval instead of hammering the API.
-DATABAY_FREE_API_URL = (os.getenv("DATABAY_FREE_API_URL") or "https://databay.com/api/v1/proxy-list").strip()
-DATABAY_FREE_HOTLINK_URL = (
-    os.getenv("DATABAY_FREE_HOTLINK_URL") or "https://databay.com/free-proxy-list/https.txt"
+
+# ProxMint re-validates the public dataset every 30 minutes. Polling faster only returns
+# the same rows, so keep one quality-sorted HTTP snapshot for the whole provider cycle.
+# HTTP is intentional: for an HTTPS target such as eBay these endpoints are validated again
+# by our existing neutral CONNECT+TLS preflight before they become warm reserve.
+# Primary API: no key/sign-up, pageSize<=200, 60 requests/minute/IP. If the API edge is
+# temporarily unavailable, fall back to ProxMint's official GitHub mirror of the same data.
+# Proxy data from Proxmint's Free Proxy List (https://proxmint.com/free-proxies), CC BY 4.0.
+PROXMINT_FREE_REFRESH = max(1800, int(os.getenv("PROXMINT_FREE_REFRESH", "1800")))
+PROXMINT_FREE_API_URL = (
+    os.getenv("PROXMINT_FREE_API_URL") or "https://proxmint.com/api/free-proxies"
 ).strip()
-DATABAY_FREE_HOTLINK_LIMIT = max(
-    50, min(int(os.getenv("DATABAY_FREE_HOTLINK_LIMIT", "250")), 500)
-)
-DATABAY_FREE_HTTP_HEADERS = {
-    "Accept": "application/json,text/plain;q=0.9,*/*;q=0.5",
-    "User-Agent": "Mozilla/5.0 (compatible; eBayUKMonitor/6.47; +https://databay.com/free-proxy-list)",
+PROXMINT_FREE_GITHUB_URL = (
+    os.getenv("PROXMINT_FREE_GITHUB_URL")
+    or "https://raw.githubusercontent.com/proxmint/free-proxy-list/main/proxies/all.json"
+).strip()
+PROXMINT_API_PAGE_SIZE = max(50, min(int(os.getenv("PROXMINT_API_PAGE_SIZE", "200")), 200))
+PROXMINT_SNAPSHOT_LIMIT = max(50, min(
+    int(os.getenv("PROXMINT_SNAPSHOT_LIMIT", "200")), PROXMINT_API_PAGE_SIZE
+))
+PROXMINT_MIN_SCORE = max(0.0, min(float(os.getenv("PROXMINT_MIN_SCORE", "70")), 100.0))
+PROXMINT_MIN_UPTIME_PCT = max(0.0, min(float(os.getenv("PROXMINT_MIN_UPTIME_PCT", "70")), 100.0))
+PROXMINT_MAX_LATENCY_MS = max(500, min(int(os.getenv("PROXMINT_MAX_LATENCY_MS", "3000")), 10000))
+PROXMINT_FREE_HTTP_HEADERS = {
+    "Accept": "application/json,*/*;q=0.5",
+    "User-Agent": "Mozilla/5.0 (compatible; eBayUKMonitor/6.47; +https://proxmint.com/free-proxies)",
 }
 
 # Proxio says its live list is re-tested roughly every five minutes, so refreshing faster
@@ -661,11 +671,9 @@ HPROXY_FREE_ANON_LIMIT = max(25, min(int(os.getenv("HPROXY_FREE_ANON_LIMIT", "90
 HPROXY_FREE_MAX_LATENCY_MS = max(500, min(int(os.getenv("HPROXY_FREE_MAX_LATENCY_MS", "2000")), 5000))
 HPROXY_FREE_ELITE_MIN_UPTIME = max(50, min(int(os.getenv("HPROXY_FREE_ELITE_MIN_UPTIME", "85")), 100))
 HPROXY_FREE_ANON_MIN_UPTIME = max(50, min(int(os.getenv("HPROXY_FREE_ANON_MIN_UPTIME", "70")), 100))
-DATABAY_FREE_ELITE_LIMIT = max(50, min(int(os.getenv("DATABAY_FREE_ELITE_LIMIT", "160")), 400))
-DATABAY_FREE_ANON_LIMIT = max(25, min(int(os.getenv("DATABAY_FREE_ANON_LIMIT", "90")), 250))
 EXTERNAL_FREE_EARLY_SLOTS = max(0, min(int(os.getenv("EXTERNAL_FREE_EARLY_SLOTS", "1")), 1))
 EXTERNAL_FREE_ESCALATED_SLOTS = max(EXTERNAL_FREE_EARLY_SLOTS, min(int(os.getenv("EXTERNAL_FREE_ESCALATED_SLOTS", "2")), 2))
-# Small neutral TLS/CONNECT warm-check budget for HProxy+Databay+Proxio. It never calls eBay
+# Small neutral TLS/CONNECT warm-check budget for HProxy+ProxMint+Proxio. It never calls eBay
 # and shares the existing SmartReserve worker pool, so it does not add concurrent
 # background threads beyond the already bounded preflight executor.
 EXTERNAL_FREE_PREFLIGHT_SLOTS = max(0, min(int(os.getenv("EXTERNAL_FREE_PREFLIGHT_SLOTS", "5")), 6))
@@ -693,7 +701,7 @@ PROVIDER_STATS_INTERVAL = max(60, int(os.getenv("PROVIDER_STATS_INTERVAL", "300"
 OUTAGE_HOST_MEMORY = max(180, int(os.getenv("OUTAGE_HOST_MEMORY", "600")))
 # V6.45: the 10-minute outage host memory remains strict for eBay blocks, SSL/MITM and
 # CONNECT rejects. A *single* transient timeout/error from an independent external feed
-# may get exactly one second chance after a long outage. This prevents HProxy/Databay/
+# may get exactly one second chance after a long outage. This prevents HProxy/ProxMint/
 # Proxio from disappearing for the whole outage while generic FREE keeps recycling.
 EXTERNAL_TRANSIENT_RETRY_AFTER = max(
     120.0, float(os.getenv("EXTERNAL_TRANSIENT_RETRY_AFTER", "180"))
@@ -2290,14 +2298,14 @@ class ProviderManager:
 
 
 class ExternalFreeSourceManager:
-    """Small, quality-filtered HProxy + Databay + Proxio snapshots for discovery.
+    """Small, quality-filtered HProxy + ProxMint + Proxio snapshots for discovery.
 
-    HProxy/Databay are unmetered public feeds. Proxio is intentionally different: its API
+    HProxy/ProxMint are unmetered public feeds. Proxio is intentionally different: its API
     is quota-limited, so exactly ONE key is used per due refresh and the returned Elite
     HTTPS snapshot is reused for real probes until the next refresh. None of these feeds is
     merged into the large ProxyScrape list, and they never increase global eBay concurrency.
     """
-    SOURCES = ('hproxy', 'databay', 'proxio')
+    SOURCES = ('hproxy', 'proxmint', 'proxio')
 
     def __init__(self):
         self.lock = threading.Lock()
@@ -2318,6 +2326,7 @@ class ExternalFreeSourceManager:
         ]
         self.proxio_key_turn = 0
         self.proxio_next_retry_at = 0.0
+        self.proxmint_feed_rank = {}
         self.proxio_feed_rank = {}
         self.proxio_last_quota_log = 0.0
 
@@ -2328,7 +2337,7 @@ class ExternalFreeSourceManager:
                 'proxy_rejected': 0, 'proxy_ssl': 0, 'http_error': 0,
                 'winners': 0, 'unique_tested': set(), 'unique_success': set(),
             }
-            for name in ('proxyscrape', 'hproxy', 'databay', 'proxio')
+            for name in ('proxyscrape', 'hproxy', 'proxmint', 'proxio')
         }
 
     @staticmethod
@@ -2350,13 +2359,13 @@ class ExternalFreeSourceManager:
             return data
         if not isinstance(data, dict):
             return []
-        for key in ('data', 'results', 'proxies', 'items'):
+        for key in ('rows', 'data', 'results', 'proxies', 'items'):
             rows = data.get(key)
             if isinstance(rows, list):
                 return rows
             # Be tolerant of APIs that wrap rows as {data:{proxies:[...]}}.
             if isinstance(rows, dict):
-                for nested_key in ('results', 'proxies', 'items', 'data'):
+                for nested_key in ('rows', 'results', 'proxies', 'items', 'data'):
                     nested = rows.get(nested_key)
                     if isinstance(nested, list):
                         return nested
@@ -2365,8 +2374,8 @@ class ExternalFreeSourceManager:
     def _source_enabled(self, source):
         if source == 'hproxy':
             return HPROXY_FREE_ENABLED
-        if source == 'databay':
-            return DATABAY_FREE_ENABLED
+        if source == 'proxmint':
+            return PROXMINT_FREE_ENABLED
         if source == 'proxio':
             return PROXIO_FREE_ENABLED and bool(PROXIO_API_KEYS)
         return False
@@ -2375,8 +2384,8 @@ class ExternalFreeSourceManager:
     def _source_interval(source):
         if source == 'hproxy':
             return HPROXY_FREE_REFRESH
-        if source == 'databay':
-            return DATABAY_FREE_REFRESH
+        if source == 'proxmint':
+            return PROXMINT_FREE_REFRESH
         return PROXIO_FREE_REFRESH
 
     def _fetch_hproxy_group(self, anonymity, limit, min_uptime):
@@ -2408,128 +2417,138 @@ class ExternalFreeSourceManager:
             return None
         return list(dict.fromkeys((elite or []) + (anon or [])))
 
-    def _fetch_databay_group(self, anonymity, limit):
-        """Filtered Databay API path.
+    @staticmethod
+    def _proxmint_number(value, default=None):
+        try:
+            if value is None or value == '':
+                return default
+            return float(value)
+        except (TypeError, ValueError):
+            return default
 
-        Returns (rows, status_text). A non-200 response is not treated as an authentication
-        requirement because Databay documents this public endpoint as no-key; _fetch_databay
-        will immediately try Databay's official HTTPS hotlink instead.
+    def _filter_proxmint_rows(self, rows):
+        """Keep the strongest ProxMint HTTP endpoints for our HTTPS CONNECT workflow.
+
+        ProxMint can legitimately report anonymity=null for HTTP proxies tested through an
+        HTTPS CONNECT tunnel, because encrypted tunnel traffic gives the proxy no headers to
+        modify. Therefore null is accepted; only explicitly transparent endpoints are dropped.
+        Final eBay suitability is still decided by the existing neutral CONNECT+TLS preflight
+        and normal eBay probe, not by provider metadata alone.
         """
-        params = {
-            'protocol': 'https', 'ssl': 'strict', 'speed': 'fast',
-            'anonymity': anonymity, 'format': 'json', 'limit': int(limit), 'page': 1,
-        }
-        try:
-            resp = requests.get(
-                DATABAY_FREE_API_URL,
-                params=params,
-                headers=DATABAY_FREE_HTTP_HEADERS,
-                timeout=EXTERNAL_FREE_API_TIMEOUT,
-            )
-        except Exception as e:
-            return None, f"network:{type(e).__name__}"
-
-        if resp.status_code != 200:
-            return None, f"HTTP {int(resp.status_code)}"
-
-        try:
-            rows = self._rows_from_json(resp.json())
-        except Exception as e:
-            return None, f"json:{type(e).__name__}"
-
-        out = []
-        for row in rows:
+        candidates = []
+        for row in rows or ():
             if not isinstance(row, dict):
                 continue
+
+            protocol = str(row.get('protocol') or '').strip().lower()
+            if protocol != 'http':
+                continue
+
+            anonymity = str(row.get('anonymity') or '').strip().lower()
+            if anonymity == 'transparent':
+                continue
+            if anonymity not in ('', 'elite', 'anonymous'):
+                continue
+
             proxy = self._normalize_http_proxy(row.get('ip') or row.get('host'), row.get('port'))
-            if proxy:
-                out.append(proxy)
-        return out, "HTTP 200"
+            host = _proxy_host(proxy) if proxy else ''
+            if not proxy or not host:
+                continue
 
-    def _fetch_databay_hotlink(self):
-        """Fallback to Databay's documented, no-key HTTPS hotlink.
+            score = self._proxmint_number(row.get('score'), None)
+            uptime = self._proxmint_number(row.get('uptimePct', row.get('uptime')), None)
+            latency_ms = self._proxmint_number(row.get('latencyMs', row.get('latency')), None)
+            if score is None or uptime is None:
+                continue
+            if score < PROXMINT_MIN_SCORE or uptime < PROXMINT_MIN_UPTIME_PCT:
+                continue
+            if latency_ms is not None and latency_ms > PROXMINT_MAX_LATENCY_MS:
+                continue
 
-        The file contract is deliberately simple: two optional comment lines followed by
-        one IP:PORT per line. These are still passed through our existing neutral
-        TLS/CONNECT preflight before they receive an eBay slot.
-        """
+            latency_sort = latency_ms if latency_ms is not None else float(PROXMINT_MAX_LATENCY_MS)
+            candidates.append((-score, -uptime, latency_sort, host, proxy))
+
+        candidates.sort()
+        proxies = []
+        seen_hosts = set()
+        for row in candidates:
+            host, proxy = row[-2], row[-1]
+            if host in seen_hosts:
+                continue
+            seen_hosts.add(host)
+            proxies.append(proxy)
+            if len(proxies) >= PROXMINT_SNAPSHOT_LIMIT:
+                break
+        return proxies
+
+    def _fetch_proxmint(self):
+        """Fetch one key-free ProxMint snapshot, with the official mirror as fallback."""
+        if not PROXMINT_FREE_ENABLED:
+            return []
+
+        api_status = 'not attempted'
         try:
             resp = requests.get(
-                DATABAY_FREE_HOTLINK_URL,
-                headers={
-                    "Accept": "text/plain,*/*;q=0.5",
-                    "User-Agent": DATABAY_FREE_HTTP_HEADERS["User-Agent"],
+                PROXMINT_FREE_API_URL,
+                params={
+                    'protocol': 'http',
+                    'sort': 'score',
+                    'page': 1,
+                    'pageSize': int(PROXMINT_API_PAGE_SIZE),
+                    'format': 'json',
                 },
+                headers=PROXMINT_FREE_HTTP_HEADERS,
+                timeout=EXTERNAL_FREE_API_TIMEOUT,
+            )
+            api_status = f"HTTP {int(resp.status_code)}"
+            if resp.status_code == 200:
+                rows = self._rows_from_json(resp.json())
+                proxies = self._filter_proxmint_rows(rows)
+                if proxies:
+                    return proxies
+                api_status = 'HTTP 200 but no row passed local quality filter'
+        except Exception as e:
+            api_status = f"network/json:{type(e).__name__}"
+
+        logging.warning(
+            f"ProxMint API unavailable ({api_status}); switching to official GitHub mirror"
+        )
+        try:
+            mirror = requests.get(
+                PROXMINT_FREE_GITHUB_URL,
+                headers=PROXMINT_FREE_HTTP_HEADERS,
                 timeout=EXTERNAL_FREE_API_TIMEOUT,
             )
         except Exception as e:
             logging.warning(
-                f"Databay HTTPS hotlink unavailable ({type(e).__name__}); keep previous snapshot"
+                f"ProxMint GitHub mirror unavailable ({type(e).__name__}); keep previous snapshot"
             )
             return None
 
-        if resp.status_code != 200:
+        if mirror.status_code != 200:
             logging.warning(
-                f"Databay HTTPS hotlink HTTP {resp.status_code}; keep previous snapshot"
+                f"ProxMint GitHub mirror HTTP {mirror.status_code}; keep previous snapshot"
             )
             return None
 
-        out = []
-        seen = set()
-        for raw in (resp.text or '').splitlines():
-            row = raw.strip()
-            if not row or row.startswith('#'):
-                continue
-            # Databay's current public hotlink contract is IP:PORT. Ignore malformed rows
-            # rather than ever converting them into a questionable proxy URL.
-            if row.count(':') != 1:
-                continue
-            host, port = row.rsplit(':', 1)
-            proxy = self._normalize_http_proxy(host, port)
-            if not proxy or proxy in seen:
-                continue
-            seen.add(proxy)
-            out.append(proxy)
-            if len(out) >= DATABAY_FREE_HOTLINK_LIMIT:
-                break
-
-        if not out:
-            logging.warning("Databay HTTPS hotlink returned no valid IP:PORT rows; keep previous snapshot")
-            return None
-
-        logging.info(
-            f"🟦 Databay official HTTPS hotlink fallback loaded: {len(out)} endpoint(s)"
-        )
-        return out
-
-    def _fetch_databay(self):
-        if not DATABAY_FREE_ENABLED:
-            return []
-
-        elite, elite_status = self._fetch_databay_group('elite', DATABAY_FREE_ELITE_LIMIT)
-
-        # Auth/rate responses apply to the same public API edge, so do not waste a second
-        # request for the anonymous filter. Go straight to Databay's documented hotlink.
-        if elite_status in ('HTTP 401', 'HTTP 403', 'HTTP 429'):
+        try:
+            rows = self._rows_from_json(mirror.json())
+        except Exception as e:
             logging.warning(
-                f"Databay filtered API unavailable ({elite_status}); "
-                "switching to official HTTPS hotlink fallback"
+                f"ProxMint GitHub mirror JSON error ({type(e).__name__}); keep previous snapshot"
             )
-            return self._fetch_databay_hotlink()
+            return None
 
-        anon, anon_status = self._fetch_databay_group('anonymous', DATABAY_FREE_ANON_LIMIT)
+        proxies = self._filter_proxmint_rows(rows)
+        if not proxies:
+            logging.warning(
+                "ProxMint GitHub mirror returned no HTTP proxy passing local quality filter; "
+                "keep previous snapshot"
+            )
+            return None
 
-        if elite is not None or anon is not None:
-            merged = list(dict.fromkeys((elite or []) + (anon or [])))
-            if merged:
-                return merged
-
-        logging.warning(
-            "Databay filtered API unavailable "
-            f"(elite={elite_status}, anonymous={anon_status}); "
-            "switching to official HTTPS hotlink fallback"
-        )
-        return self._fetch_databay_hotlink()
+        logging.info(f"🟩 ProxMint official mirror fallback loaded: {len(proxies)} endpoint(s)")
+        return proxies
 
     @staticmethod
     def _proxio_number(value, default=None):
@@ -2793,7 +2812,7 @@ class ExternalFreeSourceManager:
 
             fetchers = {
                 'hproxy': self._fetch_hproxy,
-                'databay': self._fetch_databay,
+                'proxmint': self._fetch_proxmint,
                 'proxio': self._fetch_proxio,
             }
             results = {}
@@ -2827,14 +2846,14 @@ class ExternalFreeSourceManager:
 
                     rows = result
                     if rows is None:
-                        # Databay's public API can transiently fail at its edge. If both the
-                        # filtered API and the official hotlink are unavailable, count this
-                        # as the scheduled refresh attempt so repeated main cycles do not
-                        # hammer Databay and trigger an avoidable 429.
-                        if source == 'databay':
+                        # ProxMint refresh failures are backed off to the provider's normal
+                        # 30-minute cycle; the previous good snapshot stays available.
+                        if source == 'proxmint':
                             self.last_refresh[source] = stamp
                         continue
                     self.snapshots[source] = list(rows)
+                    if source == 'proxmint':
+                        self.proxmint_feed_rank = {proxy: rank for rank, proxy in enumerate(rows)}
                     self.last_refresh[source] = stamp
                     changed = True
 
@@ -2843,12 +2862,12 @@ class ExternalFreeSourceManager:
                     for source in self.SOURCES
                 }
                 h_count = len(self.snapshots['hproxy'])
-                d_count = len(self.snapshots['databay'])
+                m_count = len(self.snapshots['proxmint'])
                 p_count = len(self.snapshots['proxio'])
                 overlap_hosts = len(
-                    (host_sets['hproxy'] & host_sets['databay']) |
+                    (host_sets['hproxy'] & host_sets['proxmint']) |
                     (host_sets['hproxy'] & host_sets['proxio']) |
-                    (host_sets['databay'] & host_sets['proxio'])
+                    (host_sets['proxmint'] & host_sets['proxio'])
                 )
                 proxio_budget = self._proxio_daily_budget()
                 proxio_calls_today = sum(st.get('calls', 0) for st in self.proxio_key_state)
@@ -2856,8 +2875,9 @@ class ExternalFreeSourceManager:
                 proxio_safe_total = proxio_budget * len(self.proxio_key_state)
             if changed:
                 logging.info(
-                    f"🧭 External snapshots: HProxy={h_count}, Databay={d_count}, Proxio={p_count}, "
-                    f"overlap_hosts={overlap_hosts}; Proxio=Elite HTTPS quality-filtered, "
+                    f"🧭 External snapshots: HProxy={h_count}, ProxMint={m_count}, Proxio={p_count}, "
+                    f"overlap_hosts={overlap_hosts}; ProxMint=HTTP score-filtered + CONNECT/TLS preflight, "
+                    f"Proxio=Elite HTTPS quality-filtered, "
                     f"api_calls_today={proxio_calls_today}/{proxio_safe_total or 0} safe-budget "
                     f"(max_key={proxio_max_key_calls}/{proxio_budget})"
                 )
@@ -2916,6 +2936,8 @@ class ExternalFreeSourceManager:
         return self._selection_snapshot(preflight=True)
 
     def feed_rank_fast(self, proxy, source):
+        if source == 'proxmint':
+            return self.proxmint_feed_rank.get(proxy, 10**9)
         if source == 'proxio':
             return self.proxio_feed_rank.get(proxy, 10**9)
         return 10**9
@@ -2940,7 +2962,7 @@ class ExternalFreeSourceManager:
 
     def label_fast(self, proxy):
         source = self.credit_source_by_proxy.get(proxy)
-        if source in ('hproxy', 'databay', 'proxio'):
+        if source in ('hproxy', 'proxmint', 'proxio'):
             return source
         return None
 
@@ -2992,7 +3014,7 @@ class ExternalFreeSourceManager:
                 return
             self.last_stats_log = now
             parts = []
-            for source in ('proxyscrape', 'hproxy', 'databay', 'proxio'):
+            for source in ('proxyscrape', 'hproxy', 'proxmint', 'proxio'):
                 st = self.stats[source]
                 d = st['discovery']
                 ds = st['discovery_success']
@@ -4116,13 +4138,13 @@ class ProxyManager:
         return chosen
 
     def get_external_quality_preflight_candidates(self, limit=5, excluded_hosts=None):
-        """Neutral TLS/CONNECT candidates from HProxy/Databay/Proxio.
+        """Neutral TLS/CONNECT candidates from HProxy/ProxMint/Proxio.
 
         Uses up to the configured SmartReserve external slots (five by default in v6.38); this
         never increases eBay-request concurrency and still runs inside the bounded SmartReserve
         executor. Fairness is
         source-first (one unknown candidate from each enabled feed before any feed receives a
-        second slot), so Proxio is sampled without crowding out the proven HProxy/Databay paths.
+        second slot), so Proxio is sampled without crowding out the proven HProxy/ProxMint paths.
         Successful preflight keeps source credit when the proxy later moves through warm reserve.
         """
         limit = max(0, min(int(limit or 0), EXTERNAL_FREE_PREFLIGHT_SLOTS))
@@ -11567,7 +11589,7 @@ def fetch_ebay_html_with_fixed_pair():
                 # Multiple keys often expose the SAME 10 exit IPs. Treat extra accounts
                 # as bandwidth capacity, not artificial IP diversity. V6.43 production
                 # showed the new Webshare attempts in this hour adding only 403s while
-                # HProxy/Databay/Proxio kept producing winners. Reserve only ONE early
+                # HProxy/ProxMint/Proxio kept producing winners. Reserve only ONE early
                 # Webshare exit; a second worker is more valuable for the independent pools.
                 ws_first_limit = min(
                     active_ws_accounts,
@@ -11605,7 +11627,7 @@ def fetch_ebay_html_with_fixed_pair():
             ):
                 logging.info(
                     f"🔷 Premium backup unlocked: elapsed={elapsed_for_provider:.1f}s, "
-                    f"attempts={attempts}; primary free/Proxio/HProxy/Databay paths had first chance"
+                    f"attempts={attempts}; primary free/Proxio/HProxy/ProxMint paths had first chance"
                 )
                 premium_backup_unlock_logged = True
 
@@ -11736,7 +11758,7 @@ def fetch_ebay_html_with_fixed_pair():
             external_need = min(max(0, need - len(batch)), external_slot_cap)
             if external_need > 0:
                 # V6.40: Premium is now a backup tier, so its mere availability must not
-                # delay Proxio. HProxy/Databay/Proxio all compete for the early bounded
+                # delay Proxio. HProxy/ProxMint/Proxio all compete for the early bounded
                 # external slots from the first wave; round-robin keeps one source from
                 # monopolising those slots. Premium itself stays gated below.
                 external_rows = proxy_manager.get_external_free_candidates(
@@ -11756,7 +11778,7 @@ def fetch_ebay_html_with_fixed_pair():
                     external_free_manager.claim_credit(ext_proxy, ext_source)
                     batch_kinds[ext_proxy] = {
                         'hproxy': 'HProxy probe',
-                        'databay': 'Databay probe',
+                        'proxmint': 'ProxMint probe',
                         'proxio': 'Proxio reserve probe',
                     }.get(ext_source, 'External probe')
 
@@ -11847,13 +11869,13 @@ def fetch_ebay_html_with_fixed_pair():
             kind = batch_kinds.get(proxy, 'Probe')
             source = provider_manager.source_fast(proxy)
             if source == 'free':
-                # Preserve the original external-feed attribution when a HProxy/Databay/Proxio
+                # Preserve the original external-feed attribution when a HProxy/ProxMint/Proxio
                 # endpoint was neutral-preflighted earlier and is now consumed through the
                 # generic warm/re-probe path. v6.37 previously preserved only a *direct*
                 # "Proxio reserve probe", so successful warm Proxio candidates could still be
                 # misreported as ProxyScrape. Fresh generic/emergency ProxyScrape candidates
                 # are explicitly credited to proxyscrape.
-                direct_external_kinds = ('HProxy probe', 'Databay probe', 'Proxio reserve probe')
+                direct_external_kinds = ('HProxy probe', 'ProxMint probe', 'Proxio reserve probe')
                 preserve_external_kinds = (
                     'HTTPS reserve', 'Warm standby', 'Re-probe',
                     'Transient re-probe', 'Final known-good re-probe',
@@ -11863,7 +11885,7 @@ def fetch_ebay_html_with_fixed_pair():
                     pass  # get_external_free_candidates() already claimed the exact source.
                 elif (
                     kind in preserve_external_kinds
-                    and existing_external_source in ('hproxy', 'databay', 'proxio')
+                    and existing_external_source in ('hproxy', 'proxmint', 'proxio')
                 ):
                     # Refresh diagnostic credit so the following discovery/fixed result and
                     # winner are attributed to the source that actually supplied this reserve.
@@ -12796,7 +12818,7 @@ def proxy_preflight_warm_worker():
                     batch_limit = min(batch_limit, PROXY_PREFLIGHT_HIGH_MEMORY_BATCH)
                 elif reserve_elevated:
                     batch_limit = min(batch_limit, PROXY_PREFLIGHT_MAINTENANCE_BATCH)
-                # Reserve a small part of the existing preflight batch for HProxy/Databay/Proxio.
+                # Reserve a small part of the existing preflight batch for HProxy/ProxMint/Proxio.
                 # These checks are neutral CONNECT+TLS only (no eBay), so bad external
                 # endpoints are filtered before they can consume scarce discovery slots.
                 external_candidates = proxy_manager.get_external_quality_preflight_candidates(
@@ -13076,9 +13098,9 @@ def start_leader_workers():
     logging.info(
         f"🧭 External sources v6.47: HProxy={'ON' if HPROXY_FREE_ENABLED else 'OFF'} "
         f"(HTTPS, elite+anonymous, cap={HPROXY_FREE_ELITE_LIMIT + HPROXY_FREE_ANON_LIMIT}), "
-        f"Databay={'ON' if DATABAY_FREE_ENABLED else 'OFF'} "
-        f"(HTTPS strict+fast API + official HTTPS hotlink fallback, "
-        f"cap={DATABAY_FREE_ELITE_LIMIT + DATABAY_FREE_ANON_LIMIT}), "
+        f"ProxMint={'ON' if PROXMINT_FREE_ENABLED else 'OFF'} "
+        f"(HTTP, score>={PROXMINT_MIN_SCORE:.0f}, uptime>={PROXMINT_MIN_UPTIME_PCT:.0f}%, "
+        f"latency<={PROXMINT_MAX_LATENCY_MS}ms, cap={PROXMINT_SNAPSHOT_LIMIT}, refresh={PROXMINT_FREE_REFRESH}s), "
         f"Proxio={'ON (' + str(len(PROXIO_API_KEYS)) + ' key(s))' if PROXIO_FREE_ENABLED else 'OFF'} "
         f"(Elite HTTPS, cap={PROXIO_SNAPSHOT_LIMIT}, refresh={PROXIO_FREE_REFRESH}s, "
         f"designed≈{proxio_calls_day} calls/day total≈{proxio_calls_per_key:.1f}/key); "
