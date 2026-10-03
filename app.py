@@ -19,7 +19,9 @@ import requests
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode, quote
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup, Tag, SoupStrainer
+from coordinator_feed import CoordinatorFeed
+from proxy_runtime import PipelineMetrics, ProbeLimiter, finite_number
 from flask import Flask
 from dotenv import load_dotenv
 import psycopg2
@@ -48,6 +50,24 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 PROXY_LIST_URL = os.getenv("PROXY_LIST")
 # ProxyScrape обновляет бесплатный список примерно раз в минуту.
 PROXY_REFRESH_INTERVAL = 60
+
+# V6.51: optional UK-only coordinator. Existing sources stay independent.
+coordinator_feed = CoordinatorFeed(
+    base_url=os.getenv('COORDINATOR_BASE_URL', ''),
+    token=os.getenv('COORDINATOR_UK_TOKEN', ''),
+    limit=500, refresh_seconds=45, stale_seconds=180,
+)
+pipeline_metrics = PipelineMetrics()
+proxy_metadata_wakeup = threading.Event()
+proxy_metadata_ready = threading.Event()
+proxy_metadata_lock = threading.Lock()
+proxy_metadata_jobs = set()
+
+def request_proxy_metadata_refresh(tier='standard'):
+    with proxy_metadata_lock:
+        proxy_metadata_jobs.add(tier)
+    proxy_metadata_wakeup.set()
+    return False
 
 # PostgreSQL/Aiven: короткие сетевые/SQL timeout защищают worker-ы от долгого зависания
 # при временном сетевом сбое. Никаких ручных изменений в Aiven не требуется.
@@ -388,7 +408,7 @@ PROXY_PREFLIGHT_WARM_CONCURRENCY = max(
 )
 PROXY_PREFLIGHT_WARM_INTERVAL = max(10.0, float(os.getenv("PROXY_PREFLIGHT_WARM_INTERVAL", "20")))
 PROXY_PREFLIGHT_RESERVE_TARGET = max(
-    4, min(int(os.getenv("PROXY_PREFLIGHT_RESERVE_TARGET", "10")), 30)
+    4, min(int(os.getenv("PROXY_PREFLIGHT_RESERVE_TARGET", "16")), 30)
 )
 PROXY_PREFLIGHT_MAINTENANCE_BATCH = max(
     2, min(int(os.getenv("PROXY_PREFLIGHT_MAINTENANCE_BATCH", "5")), 10)
@@ -397,6 +417,12 @@ PROXY_PREFLIGHT_RETAIN_MAX = max(
     PROXY_PREFLIGHT_RESERVE_TARGET,
     min(int(os.getenv("PROXY_PREFLIGHT_RETAIN_MAX", "60")), 120),
 )
+
+# Refresh a bounded part of the TLS reserve before its readiness expires.
+PROXY_PREFLIGHT_RECHECK_AHEAD = 30
+
+# If a previous discovery still has running probes, they count toward this ceiling.
+probe_limiter = ProbeLimiter(maximum=PROBE_ULTRA_OUTAGE_CONCURRENCY)
 
 # Если первый fixed request уже висел очень долго, второй recovery только откладывает failover.
 # Быстрый reset/короткий connect-timeout по-прежнему получает один шанс с новой Session.
@@ -1272,6 +1298,7 @@ def record_ebay_success():
         recovery_gap = (now - previous_success_at) if previous_success_at is not None else None
         last_ebay_success_at = now
         connection_alert_sent = False
+    pipeline_metrics.success(outage=recovery_gap if recovery_gap and recovery_gap >= CONNECTION_RECOVERY_LOG_AFTER else None)
     if recovery_gap is not None and recovery_gap >= CONNECTION_RECOVERY_LOG_AFTER:
         logging.info(
             f"🔄 eBay связь восстановлена: между валидными HTTP 200 прошло "
@@ -1380,6 +1407,8 @@ def _proxy_log_name(proxy):
         port = f":{parts.port}" if parts.port else ''
         scheme = parts.scheme or 'http'
         source = provider_manager.source_label_fast(proxy) if 'provider_manager' in globals() else None
+        if source == 'free' and 'proxy_manager' in globals() and proxy_manager.is_coordinator_proxy_fast(proxy):
+            source = 'coordinator'
         if source == 'free' and 'external_free_manager' in globals():
             external_label = external_free_manager.label_fast(proxy)
             if external_label:
@@ -1955,6 +1984,8 @@ class ProviderManager:
             return None
 
     def refresh_all(self, force=False, include_stats=True):
+        if threading.current_thread().name != 'proxy-metadata-worker':
+            return request_proxy_metadata_refresh('managed')
         now = time.time()
         with self.lock:
             ps_due = force or (now - self.last_refresh['proxyscrape_premium']) >= PROXYSCRAPE_PREMIUM_REFRESH
@@ -2931,6 +2962,8 @@ class ExternalFreeSourceManager:
         return (now - self.last_refresh.get(source, 0.0)) >= self._source_interval(source)
 
     def refresh_all(self, force=False):
+        if threading.current_thread().name != 'proxy-metadata-worker':
+            return request_proxy_metadata_refresh('external')
         if not self.refresh_gate.acquire(blocking=False):
             return False
         try:
@@ -3019,13 +3052,7 @@ class ExternalFreeSourceManager:
             self.refresh_gate.release()
 
     def refresh_all_async(self, force=False):
-        if self.refresh_gate.locked():
-            return
-        threading.Thread(
-            target=self.refresh_all,
-            kwargs={'force': force},
-            name='external-free-refresh', daemon=True,
-        ).start()
+        return request_proxy_metadata_refresh('external')
 
     def _selection_snapshot(self, preflight=False):
         with self.lock:
@@ -3254,6 +3281,10 @@ external_free_manager = ExternalFreeSourceManager()
 class ProxyManager:
     def __init__(self, proxy_list_url=None):
         self.proxy_list_url = proxy_list_url
+        self.coordinator_current = frozenset()
+        self.coordinator_metadata = {}
+        self.coordinator_valid_until = 0.0
+        self.legacy_current = frozenset()
         self.proxies = []
         self.all_proxies = []
         self.lock = threading.Lock()
@@ -3307,6 +3338,54 @@ class ProxyManager:
         self.subnet24_history = {}
         self.subnet24_last_prune = 0.0
         self.last_reputation_prune = 0.0
+
+
+    def is_coordinator_proxy_fast(self, proxy, now=None):
+        now = time.time() if now is None else now
+        return now < self.coordinator_valid_until and proxy in self.coordinator_current
+
+    def refresh_coordinator(self):
+        rows, valid_until = coordinator_feed.refresh()
+        current = frozenset(rows)
+        metadata = coordinator_feed.metadata_snapshot()
+        with self.lock:
+            now = time.time()
+            obsolete = self.coordinator_current - current - self.legacy_current
+            def retain(p):
+                return (p not in obsolete or self._quality_state_locked(p, now) == 'ok'
+                        or self._is_recent_good_locked(p, now))
+            self.all_proxies = [p for p in self.all_proxies if retain(p)]
+            self.proxies = [p for p in self.proxies if retain(p)]
+            self.coordinator_current = current
+            self.coordinator_valid_until = valid_until
+            self.coordinator_metadata = metadata
+            if rows:
+                self.all_proxies = list(dict.fromkeys(list(rows) + self.all_proxies))
+                self.proxies = [p for p in dict.fromkeys(list(rows) + self.proxies)
+                                if self.bad_until.get(p, 0) <= now
+                                and self.host_bad_until.get(_proxy_host(p), 0) <= now]
+        # Remote checks never set local success/TLS caches or remove local cooldowns.
+        if rows:
+            proxy_metadata_ready.set()
+        return len(rows)
+
+    def reserve_diagnostics(self):
+        now = time.time()
+        with self.lock:
+            ready, primary = set(), set()
+            for p in self.proxies:
+                host = _proxy_host(p)
+                if (not host or self.bad_until.get(p, 0) > now
+                        or self.host_bad_until.get(host, 0) > now
+                        or self.soft_host_penalty_until.get(host, 0) > now):
+                    continue
+                if self._quality_state_locked(p, now) == 'ok':
+                    ready.add(host)
+                    if self.is_coordinator_proxy_fast(p, now):
+                        primary.add(host)
+            return {'feed': len(self.coordinator_current) if now < self.coordinator_valid_until else 0,
+                    'tls_ips': len(ready), 'coordinator_tls_ips': len(primary),
+                    'legacy_candidates': len(self.legacy_current)}
 
     def _prune_reputation_locked(self, now):
         """Bound stale reputation from rotating public proxy feeds.
@@ -3521,6 +3600,7 @@ class ProxyManager:
         if not target_url:
             return []
 
+        resp = None
         try:
             if label == 'emergency':
                 prefix = "🆘 Emergency ProxyScrape"
@@ -3528,8 +3608,9 @@ class ProxyManager:
                 prefix = "🆘🆘 Deep-emergency ProxyScrape"
             else:
                 prefix = "Загрузка прокси"
-            logging.info(f"{prefix} из {target_url}")
-            resp = requests.get(target_url, timeout=15)
+            # No full URLs: even a future authenticated legacy source must stay private.
+            logging.info(f"{prefix} из резервного источника ({label})")
+            resp = requests.get(target_url, timeout=(3, 5), stream=True)
             if resp.status_code != 200:
                 logging.error(f"Ошибка загрузки прокси ({label}): HTTP {resp.status_code}")
                 return []
@@ -3538,7 +3619,16 @@ class ProxyManager:
             seen = set()
             scheme_counts = {'http': 0, 'https': 0, 'socks5': 0, 'skipped': 0}
 
-            for raw_line in resp.text.splitlines():
+            deadline = time.monotonic() + 10
+            body = bytearray()
+            for chunk in resp.iter_content(chunk_size=8192):
+                if time.monotonic() > deadline:
+                    raise TimeoutError('legacy feed deadline')
+                if chunk:
+                    body.extend(chunk)
+                    if len(body) > 2 * 1024 * 1024:
+                        raise ValueError('legacy feed too large')
+            for raw_line in body.decode('utf-8-sig').splitlines():
                 line = raw_line.strip()
                 if not line:
                     continue
@@ -3547,6 +3637,10 @@ class ProxyManager:
 
                 scheme = _proxy_scheme(line)
                 if scheme not in ('http', 'https', 'socks5'):
+                    scheme_counts['skipped'] += 1
+                    continue
+                line = CoordinatorFeed.public_uri(line)
+                if line is None:
                     scheme_counts['skipped'] += 1
                     continue
                 if line in seen:
@@ -3566,10 +3660,15 @@ class ProxyManager:
             )
             return proxies
         except Exception as e:
-            logging.error(f"Ошибка при получении прокси ({label}): {e}")
+            logging.error(f"Ошибка при получении прокси ({label}): {type(e).__name__}")
             return []
+        finally:
+            if resp is not None:
+                resp.close()
 
     def refresh_proxies(self, force=False, emergency=False):
+        if threading.current_thread().name != 'proxy-metadata-worker':
+            return request_proxy_metadata_refresh('emergency' if emergency else 'standard')
         """Обновляет основной пул или аккуратно ДОБАВЛЯЕТ emergency-кандидатов.
 
         Emergency timeout=3000 не заменяет основной список 1500 и не снимает cooldown.
@@ -3591,9 +3690,20 @@ class ProxyManager:
             label='emergency' if emergency else 'standard',
         )
 
+        legacy_new = list(new_proxies)
+        if not emergency:
+            primary, _until = coordinator_feed.snapshot()
+            if not legacy_new:
+                # A failed legacy download must not discard the independent fallback.
+                with self.lock:
+                    new_proxies = list(self.legacy_current)
+            new_proxies = list(dict.fromkeys(list(primary) + new_proxies))
         with self.lock:
             now = time.time()
             self._cleanup_bad_locked()
+            if legacy_new and not emergency:
+                self.legacy_current = frozenset(legacy_new)
+                proxy_metadata_ready.set()
             if new_proxies:
                 if emergency:
                     old_all = list(self.all_proxies)
@@ -3670,7 +3780,7 @@ class ProxyManager:
 
                     logging.info(
                         f"Пул proxy обновлён: {len(self.proxies)} доступно "
-                        f"(standard={len(new_proxies)}, warm retained={len(retained)}, "
+                        f"(standard={len(new_proxies)}, coordinator={len(self.coordinator_current)}, legacy={len(self.legacy_current)}, warm retained={len(retained)}, "
                         f"proxy cooldown: {len(self.bad_until)}, host cooldown: {len(self.host_bad_until)})"
                     )
                 return True
@@ -3687,6 +3797,8 @@ class ProxyManager:
             return False
 
     def refresh_deep_emergency(self, force=False):
+        if threading.current_thread().name != 'proxy-metadata-worker':
+            return request_proxy_metadata_refresh('deep')
         """Последний резервный tier ProxyScrape timeout=4000 мс.
 
         Не заменяет standard/emergency pool и никогда не снимает cooldown. Используется
@@ -3733,6 +3845,8 @@ class ProxyManager:
             return True
 
     def refresh_standard_merge(self, force=True):
+        if threading.current_thread().name != 'proxy-metadata-worker':
+            return request_proxy_metadata_refresh('merge')
         """Мягко подмешивает свежий standard(1500 ms) snapshot в текущий pool.
 
         В отличие от обычного standard refresh НЕ удаляет уже добавленные emergency
@@ -3966,25 +4080,40 @@ class ProxyManager:
                     continue
                 if self.bad_until.get(p, 0) > now or self.host_bad_until.get(host, 0) > now:
                     continue
-                if self._quality_state_locked(p, now) != 'unknown':
+                quality_state = self._quality_state_locked(p, now)
+                if quality_state == 'bad':
+                    continue
+                if quality_state == 'ok' and self.quality_ok_until.get(p, 0) - now > PROXY_PREFLIGHT_RECHECK_AHEAD:
                     continue
                 if self._preflight_state_locked(p, now) == 'bad':
                     continue
                 rows.append(p)
 
-            # TCP-open идёт первым, затем ещё неизвестные; внутри — обычный score.
+            # Real eBay success remains strongest. Fresh coordinator candidates already
+            # passed remote neutral checks, so warm them before legacy TCP-only rows.
+            # Still perform our OWN TLS check; never clear local bad/host cooldowns.
             rows.sort(
                 key=lambda p: (
+                    1 if self._quality_state_locked(p, now) == 'ok' else 0,
+                    1 if (self._is_recent_good_locked(p, now)
+                          and self.fail_streak.get(p, 0) <= 2
+                          and self.last_failure_result.get(p) in (None, 'proxy_timeout', 'proxy_error')) else 0,
+                    1 if self.is_coordinator_proxy_fast(p, now) else 0,
                     1 if self._preflight_state_locked(p, now) == 'ok' else 0,
                     self._candidate_score_locked(p, now),
                 ),
                 reverse=True,
             )
             result = []
+            rechecks = 0
             for p in rows:
                 host = _proxy_host(p)
                 if host in used_hosts:
                     continue
+                due = self._quality_state_locked(p, now) == 'ok'
+                if due and rechecks >= min(4, limit):
+                    continue
+                rechecks += int(due)
                 result.append(p)
                 used_hosts.add(host)
                 if len(result) >= limit:
@@ -4043,6 +4172,10 @@ class ProxyManager:
 
             known.sort(key=_standby_key, reverse=True)
             quality.sort(key=_standby_key, reverse=True)
+            primary = [p for p in quality if self.is_coordinator_proxy_fast(p, now)]
+            independent = [p for p in quality if not self.is_coordinator_proxy_fast(p, now)]
+            cap = max(1, round(WARM_STANDBY_FREE_QUALITY_LIMIT * pipeline_metrics.coordinator_fraction()))
+            quality = primary[:cap] + independent[:1] + primary[cap:] + independent[1:]
             tcp.sort(key=_standby_key, reverse=True)
 
             result = []
@@ -4289,8 +4422,20 @@ class ProxyManager:
         # is exempt inside _subnet24_penalty_locked().
         subnet24_penalty = self._subnet24_penalty_locked(proxy, now)
 
+        remote_bonus = 0.0
+        if self.is_coordinator_proxy_fast(proxy, now):
+            meta = self.coordinator_metadata.get(proxy, {})
+            # A modest discovery hint: local eBay evidence and quarantine stay stronger.
+            remote_bonus = 18.0 + (4.0 if meta.get('strong') else 0.0)
+            remote_bonus += max(0.0, 6.0 - float(meta.get('rank', 500)) / 30.0)
+            remote_bonus += 8.0 * finite_number(meta.get('market_quality'), 0, 1, 0)
+            latency = finite_number(meta.get('latency_ms'), 0, 60000)
+            if latency is not None:
+                remote_bonus += max(0.0, 4.0 - latency / 800.0)
+            remote_bonus -= min(6.0, 2.0 * finite_number(meta.get('failure_streak'), 0, 100, 0))
+
         return (
-            recent_bonus + success_bonus + standard_bonus + fresh_standard_bonus
+            remote_bonus + recent_bonus + success_bonus + standard_bonus + fresh_standard_bonus
             + scheme_bonus + idle_bonus + preflight_bonus + quality_bonus + provider_bonus
             - fail_penalty - unstable_penalty - reason_penalty
             - quality_bad_penalty - soft_penalty - outage_penalty - subnet24_penalty
@@ -4679,6 +4824,8 @@ class ProxyManager:
             fresh_usable = []
             recycled_usable = []
             for p in candidates:
+                if (not allow_webshare) and provider_manager.source_fast(p) == 'webshare':
+                    continue
                 if (not allow_premium) and provider_manager.source_fast(p) == 'proxyscrape_premium':
                     continue
                 if self.bad_until.get(p, 0) > now:
@@ -4755,6 +4902,26 @@ class ProxyManager:
                     if len(batch) >= batch_size:
                         return batch
 
+            # Prefer the UK coordinator in the public share, leaving an independent slot.
+            # Existing proven eBay successes above keep absolute priority.
+            primary_limit = max(1, min(max(1, batch_size - 1), round(batch_size * pipeline_metrics.coordinator_fraction())))
+            managed_sources = {provider_manager.source_fast(p) for p in usable if provider_manager.source_fast(p) != 'free'}
+            if 'webshare' in managed_sources and 'proxyscrape_premium' in managed_sources:
+                primary_limit = min(primary_limit, max(1, batch_size - 2))
+            primary_added = sum(self.is_coordinator_proxy_fast(p, now) for p in batch)
+            recycled_set = set(recycled_usable)
+            for p in usable:
+                if primary_added >= primary_limit or len(batch) >= batch_size:
+                    break
+                if (provider_manager.source_fast(p) == 'free'
+                        and self.is_coordinator_proxy_fast(p, now)
+                        and p not in recycled_set and add_candidate(p)):
+                    primary_added += 1
+            if not managed_sources and len(batch) < batch_size and batch and all(self.is_coordinator_proxy_fast(p, now) for p in batch):
+                for p in usable:
+                    if not self.is_coordinator_proxy_fast(p, now) and provider_manager.source_fast(p) == 'free' and add_candidate(p):
+                        break
+
             # 2) Managed providers + verified free reserve. Не даём одному источнику
             # монополизировать весь batch: это одновременно ускоряет поиск и даёт честную
             # сравнительную статистику. До rescue-unlock Webshare вообще отсутствует.
@@ -4764,6 +4931,8 @@ class ProxyManager:
                 # slots in ordinary rolling batches, still leaving room for Premium/FREE.
                 active_ws_accounts = provider_manager.usable_webshare_account_count()
                 ws_limit = min(active_ws_accounts, max(1, batch_size // 2), 2)
+                if 'proxyscrape_premium' in managed_sources and not any(provider_manager.source_fast(p) == 'proxyscrape_premium' for p in batch):
+                    ws_limit = min(ws_limit, max(0, batch_size - len(batch) - 1))
                 ws_accounts_added = {
                     provider_manager.webshare_account_index_fast(p)
                     for p in batch if provider_manager.source_fast(p) == 'webshare'
@@ -10854,11 +11023,21 @@ def _make_request(proxy, profile, session=None, timeout=None, request_kind="unkn
     if timeout is None:
         timeout = (FIXED_CONNECT_TIMEOUT, FIXED_READ_TIMEOUT)
 
+    request_started = time.monotonic()
+
     def tracked_return(result, html_value, session_value, body_bytes=0):
         # Telemetry/accounting must NEVER be able to turn a valid network result into
         # a failed probe. v6.48 fixes the adaptive-stats KeyError that could occur after
         # a genuine ProxyScrape HTTP 200 and make discovery discard an otherwise good proxy.
         if result != 'profile_error':
+            try:
+                elapsed = time.monotonic() - request_started
+                origin = 'coordinator' if proxy_manager.is_coordinator_proxy_fast(proxy) else (
+                    'legacy' if provider_manager.source_fast(proxy) == 'free' else provider_manager.source_fast(proxy))
+                pipeline_metrics.record_request(_proxy_host(proxy), origin, result, elapsed, request_kind)
+                coordinator_feed.record_result(proxy, result, latency_ms=elapsed * 1000)
+            except Exception as telemetry_error:
+                logging.debug('Coordinator accounting skipped (%s)', type(telemetry_error).__name__)
             try:
                 provider_manager.record_result(
                     proxy, result, body_bytes=body_bytes, request_kind=request_kind
@@ -10867,7 +11046,7 @@ def _make_request(proxy, profile, session=None, timeout=None, request_kind="unkn
                 logging.error(
                     f"⚠️ Provider accounting error for {_proxy_log_name(proxy)}: {stats_error}"
                 )
-            if 'external_free_manager' in globals():
+            if 'external_free_manager' in globals() and not proxy_manager.is_coordinator_proxy_fast(proxy):
                 try:
                     external_free_manager.record_result(
                         proxy, result, request_kind=request_kind
@@ -11096,7 +11275,10 @@ def _quality_https_preflight_proxy(proxy):
 
     state = proxy_manager.quality_state(proxy)
     if state == 'ok':
-        return True, None
+        with proxy_manager.lock:
+            fresh = proxy_manager.quality_ok_until.get(proxy, 0) - time.time() > PROXY_PREFLIGHT_RECHECK_AHEAD
+        if fresh:
+            return True, None
     if state == 'bad':
         return False, proxy_manager.quality_failure_result(proxy)
 
@@ -11428,12 +11610,13 @@ def webshare_handoff_worker():
                 thread_name_prefix='webshare-handoff',
             )
             future_to_proxy = {
-                executor.submit(
-                    _probe_proxy, candidate, profile,
-                    (PROBE_CONNECT_TIMEOUT, PROBE_READ_TIMEOUT),
+                probe_limiter.submit(
+                    executor, _probe_proxy, candidate, profile,
+                    (PROBE_CONNECT_TIMEOUT, PROBE_READ_TIMEOUT), identity=_proxy_host(candidate),
                 ): candidate
                 for candidate in candidates
             }
+            future_to_proxy.pop(None, None)
             winner = None
             try:
                 while future_to_proxy and winner is None:
@@ -11660,6 +11843,8 @@ def fetch_ebay_html_with_fixed_pair():
     # (timeout=1500). Emergency 3000 не имеет права включаться на пустом 0/0 pool.
     if not proxy_manager.standard_pool_loaded():
         proxy_manager.refresh_proxies(force=True, emergency=False)
+        # Cold boot only. Source APIs never block a running failover.
+        proxy_metadata_ready.wait(timeout=2.5)
 
     # V6.30: on a fresh leader process, try the exact last eBay-proven endpoint ONCE
     # before broad discovery. Render deploys discard RAM state, but the old process may
@@ -11902,7 +12087,7 @@ def fetch_ebay_html_with_fixed_pair():
             return False
 
         desired = desired_concurrency()
-        free_slots = max(0, desired - len(future_to_proxy))
+        free_slots = max(0, min(desired - len(future_to_proxy), desired - probe_limiter.count()))
         if free_slots <= 0:
             return True
 
@@ -12211,17 +12396,27 @@ def fetch_ebay_html_with_fixed_pair():
         if not batch:
             return False
 
+        submitted = 0
         for proxy in batch:
             is_final_extra = batch_kinds.get(proxy) == 'Final known-good re-probe'
             if not is_final_extra and attempts >= MAX_SEARCH_ATTEMPTS:
                 break
+            future = probe_limiter.submit(
+                executor, _probe_proxy, proxy, profile,
+                (PROBE_CONNECT_TIMEOUT, PROBE_READ_TIMEOUT),
+                identity=_proxy_host(proxy),
+            )
+            if future is None:
+                continue
+            submitted += 1
+            future_to_proxy[future] = proxy
             tried_hosts.add(_proxy_host(proxy))
             tried_proxies.add(proxy)
             proxy_manager.remember_outage_attempt(proxy)
             attempts += 1
             kind = batch_kinds.get(proxy, 'Probe')
             source = provider_manager.source_fast(proxy)
-            if source == 'free':
+            if source == 'free' and not proxy_manager.is_coordinator_proxy_fast(proxy):
                 # Preserve the original external-feed attribution when a HProxy/ProxMint/Proxio
                 # endpoint was neutral-preflighted earlier and is now consumed through the
                 # generic warm/re-probe path. v6.37 previously preserved only a *direct*
@@ -12251,14 +12446,7 @@ def fetch_ebay_html_with_fixed_pair():
             logging.info(
                 f"🔍 {kind} {attempts}/{limit_label}: proxy {_proxy_log_name(proxy)}, профиль {profile['name']}"
             )
-            future = executor.submit(
-                _probe_proxy,
-                proxy,
-                profile,
-                (PROBE_CONNECT_TIMEOUT, PROBE_READ_TIMEOUT),
-            )
-            future_to_proxy[future] = proxy
-        return bool(batch)
+        return submitted > 0
 
     try:
         submit_more()
@@ -12278,6 +12466,10 @@ def fetch_ebay_html_with_fixed_pair():
             if not future_to_proxy:
                 # Нет in-flight. Даём шанс final known-good re-probe; если и его нет — выход.
                 if submit_more():
+                    continue
+                if probe_limiter.count() > 0:
+                    # Previous-wave probes/handoff retain slots until they really finish.
+                    time.sleep(min(.1, max(.01, SEARCH_TIME_BUDGET - elapsed)))
                     continue
                 break
 
@@ -12349,8 +12541,11 @@ def fetch_ebay_html_with_fixed_pair():
                     webshare_handoff_wakeup_event.set()
                 discovery_elapsed = time.monotonic() - started
                 provider_manager.record_winner(winner_proxy, discovery_elapsed, attempts)
-                external_free_manager.record_winner(winner_proxy)
+                if not proxy_manager.is_coordinator_proxy_fast(winner_proxy):
+                    external_free_manager.record_winner(winner_proxy)
                 winner_source = provider_manager.source_fast(winner_proxy)
+                if winner_source == 'free' and proxy_manager.is_coordinator_proxy_fast(winner_proxy):
+                    winner_source = 'coordinator'
                 if winner_source == 'free':
                     winner_source = external_free_manager.credit_source_fast(winner_proxy) or 'proxyscrape'
                 logging.info(
@@ -12858,12 +13053,38 @@ def _listing_link(card):
     return None
 
 
+def _main_search_soup_bounded(html):
+    """Keep the complete SRP subtree and structured prices; discard unrelated DOM."""
+    soup = None
+    if re.search(r'id\s*=\s*[\"\']srp-river-results[\"\']', html, re.I):
+        soup = BeautifulSoup(html, 'html.parser', parse_only=SoupStrainer(id='srp-river-results'))
+    elif re.search(r'class\s*=\s*[\"\'][^\"\']*(?:srp-river-results|srp-results)', html, re.I):
+        root_re = re.compile(r'(?:^|\s)(?:srp-river-results|srp-results)(?:\s|$)', re.I)
+        soup = BeautifulSoup(html, 'html.parser', parse_only=SoupStrainer(class_=root_re))
+    if soup is not None:
+        root = soup.select_one('#srp-river-results, .srp-river-results, ul.srp-results')
+        if root is not None and root.find('a', href=re.compile(r'/itm/')) is not None:
+            structured = BeautifulSoup(html, 'html.parser', parse_only=SoupStrainer('script', type='application/ld+json'))
+            try:
+                for script in list(structured.find_all('script', type='application/ld+json')):
+                    # In-card copies already live in the complete subtree.
+                    if script.string and not any(existing.string == script.string for existing in soup.find_all('script', type='application/ld+json')):
+                        soup.append(script.extract())
+            finally:
+                structured.decompose()
+            logging.info('🧠 Main parser: SRP subtree + structured prices; unrelated DOM omitted')
+            return soup
+        soup.decompose()
+    # Preserve the old compatibility path and its strict main-root selection.
+    return BeautifulSoup(html, 'html.parser')
+
+
 def parse_ebay_listings(html, max_items=MAX_ITEMS):
     if not html:
         return None
     soup = None
     try:
-        soup = BeautifulSoup(html, 'html.parser')
+        soup = _main_search_soup_bounded(html)
         cards = _main_search_result_cards(soup)
         if cards is None:
             return None
@@ -13057,6 +13278,51 @@ def check_and_send_new_items():
     return 'ok'
 
 
+def proxy_metadata_worker():
+    """One source-refresh owner; scanner threads consume cached snapshots only."""
+    db_ready_event.wait()
+    next_poll = 0.0
+    logging.info('⚡ UK proxy metadata worker: coordinator first, independent fallback, no API wait in failover')
+    while True:
+        try:
+            with proxy_metadata_lock:
+                jobs = set(proxy_metadata_jobs)
+                proxy_metadata_jobs.clear()
+            now = time.monotonic()
+            poll = now >= next_poll
+            if not is_paused:
+                proxy_manager.refresh_coordinator()
+                coordinator_feed.flush_feedback()
+                if poll or jobs:
+                    with proxy_manager.lock:
+                        emergency_recent = (proxy_manager.last_emergency_refresh > proxy_manager.last_refresh
+                            and time.time() - proxy_manager.last_emergency_refresh < max(PROXY_REFRESH_INTERVAL, SEARCH_TIME_BUDGET + 15))
+                    if 'merge' in jobs:
+                        proxy_manager.refresh_standard_merge(force=True)
+                    elif poll and not emergency_recent:
+                        proxy_manager.refresh_proxies(force=False, emergency=False)
+                    if proxy_manager.standard_pool_loaded():
+                        if 'emergency' in jobs:
+                            proxy_manager.refresh_proxies(force=False, emergency=True)
+                        if 'deep' in jobs:
+                            proxy_manager.refresh_deep_emergency(force=False)
+                    if poll:
+                        external_free_manager.refresh_all(force=False)
+                        provider_manager.refresh_all(force=False, include_stats=True)
+                        next_poll = time.monotonic() + 15.0
+            summary = pipeline_metrics.snapshot_if_due()
+            if summary:
+                logging.info('📊 UK proxy pipeline: %s; reserve=%s; active_probes=%d/%d; coordinator_share=%.0f%%',
+                    json.dumps(summary, sort_keys=True), proxy_manager.reserve_diagnostics(),
+                    probe_limiter.count(), PROBE_ULTRA_OUTAGE_CONCURRENCY, pipeline_metrics.coordinator_fraction()*100)
+            proxy_metadata_wakeup.wait(timeout=5.0)
+            proxy_metadata_wakeup.clear()
+        except Exception as error:
+            logging.warning('UK proxy metadata recovered (%s)', type(error).__name__)
+            proxy_metadata_wakeup.wait(timeout=5.0)
+            proxy_metadata_wakeup.clear()
+
+
 def proxy_preflight_warm_worker():
     """
     Пока fixed proxy исправен, поддерживает свежий резерв БЕЗ eBay HTTP-запросов.
@@ -13174,17 +13440,17 @@ def proxy_preflight_warm_worker():
                 # Reserve a small part of the existing preflight batch for HProxy/ProxMint/Proxio.
                 # These checks are neutral CONNECT+TLS only (no eBay), so bad external
                 # endpoints are filtered before they can consume scarce discovery slots.
+                primary_limit = max(1, round(batch_limit * .75))
+                candidates = proxy_manager.get_quality_preflight_candidates(primary_limit, excluded_hosts=excluded)
+                selected_hosts = {_proxy_host(p) for p in candidates}
                 external_candidates = proxy_manager.get_external_quality_preflight_candidates(
-                    min(EXTERNAL_FREE_PREFLIGHT_SLOTS, batch_limit),
-                    excluded_hosts=excluded,
-                )
-                external_hosts = {_proxy_host(p) for p in external_candidates if _proxy_host(p)}
-                base_limit = max(0, batch_limit - len(external_candidates))
-                candidates = proxy_manager.get_quality_preflight_candidates(
-                    base_limit,
-                    excluded_hosts=excluded | external_hosts,
-                )
+                    min(EXTERNAL_FREE_PREFLIGHT_SLOTS, max(0, batch_limit-len(candidates))),
+                    excluded_hosts=excluded | selected_hosts)
                 candidates.extend(external_candidates)
+                selected_hosts.update(_proxy_host(p) for p in external_candidates)
+                if len(candidates) < batch_limit:
+                    candidates.extend(proxy_manager.get_quality_preflight_candidates(
+                        batch_limit-len(candidates), excluded_hosts=excluded | selected_hosts))
                 external_candidate_set = set(external_candidates)
 
                 checked = 0
@@ -13349,7 +13615,7 @@ def bot_worker():
     seen_line = f"\n📚 В базе: {seen_total} товаров." if seen_total is not None else ""
     startup_keyboard_ok = send_telegram_message(
         startup_line +
-        "\n🇬🇧 eBay UK monitor v6.50 AuctionConsensusSafe+Subnet24SoftRep+MemorySelfHeal+FastSelfRestart работает." +
+        "\n🇬🇧 eBay UK monitor v6.51 AuctionConsensusSafe+Subnet24SoftRep+MemorySelfHeal+FastSelfRestart работает." +
         seen_line +
         "\nКоманды: /stop /start /list (/auctions) /delauction НОМЕР_ЛОТА"
         "\nМожно отправить ссылку на eBay-аукцион — надёжно сохраню окончание и включу напоминания заранее."
@@ -13435,7 +13701,7 @@ def start_leader_workers():
         name='telegram-ui-config',
     ).start()
     logging.info(
-        "🌐 Multi-provider v6.50: "
+        "🌐 Multi-provider v6.51: "
         f"ProxyScrape Premium={'ON' if PROXYSCRAPE_PREMIUM_API_KEY else 'OFF'}, "
         f"Webshare={'ON (' + str(len(WEBSHARE_API_KEYS)) + ' account(s))' if WEBSHARE_API_KEYS else 'OFF'}, "
         f"Webshare first-batch={'ON (1 unique-host slot; extra keys=bandwidth)' if WEBSHARE_FIRST_BATCH else 'OFF'}, "
@@ -13449,7 +13715,7 @@ def start_leader_workers():
     proxio_calls_day = int((86400 + PROXIO_FREE_REFRESH - 1) // PROXIO_FREE_REFRESH) if PROXIO_FREE_ENABLED else 0
     proxio_calls_per_key = (proxio_calls_day / len(PROXIO_API_KEYS)) if PROXIO_API_KEYS else 0.0
     logging.info(
-        f"🧭 External sources v6.50: HProxy={'ON' if HPROXY_FREE_ENABLED else 'OFF'} "
+        f"🧭 External sources v6.51: HProxy={'ON' if HPROXY_FREE_ENABLED else 'OFF'} "
         f"(HTTPS, elite+anonymous, cap={HPROXY_FREE_ELITE_LIMIT + HPROXY_FREE_ANON_LIMIT}), "
         f"ProxMint={'ON' if PROXMINT_FREE_ENABLED else 'OFF'} "
         f"(HTTP primary score>={PROXMINT_MIN_SCORE:.0f}/uptime>={PROXMINT_MIN_UPTIME_PCT:.0f}%/"
@@ -13467,7 +13733,7 @@ def start_leader_workers():
         f"long/extreme/ultra ceilings={PROBE_LONG_OUTAGE_CONCURRENCY}/{PROBE_EXTREME_OUTAGE_CONCURRENCY}/{PROBE_ULTRA_OUTAGE_CONCURRENCY}"
     )
     logging.info(
-        f"⚡ Adaptive discovery v6.50: normal {PROBE_CONCURRENCY}→{PROBE_ESCALATED_CONCURRENCY}→"
+        f"⚡ Adaptive discovery v6.51: normal {PROBE_CONCURRENCY}→{PROBE_ESCALATED_CONCURRENCY}→"
         f"{PROBE_DEEP_CONCURRENCY}→{PROBE_BURST_CONCURRENCY}→{PROBE_MAX_CONCURRENCY} at "
         f"~0/{PROBE_ESCALATE_AFTER:.0f}/{PROBE_DEEP_ESCALATE_AFTER:.0f}/"
         f"{PROBE_BURST_ESCALATE_AFTER:.0f}/{PROBE_MAX_ESCALATE_AFTER:.0f}s; long-outage "
@@ -13492,20 +13758,23 @@ def start_leader_workers():
 
     threading.Thread(target=telegram_listener, daemon=True, name='telegram-listener').start()
     logging.info(
-        f"📨 Telegram intake v6.50: ItemID-dedupe ON; auction priority memory ceiling="
+        f"📨 Telegram intake v6.51: ItemID-dedupe ON; auction priority memory ceiling="
         f"{AUCTION_USER_MEMORY_LIMIT_MB}MB, high-memory fetch workers={AUCTION_HIGH_MEMORY_FETCH_PARALLEL}, "
         f"status_grace={AUCTION_LINK_STATUS_GRACE}s; long-outage low-impact="
         f"{AUCTION_DURING_DISCOVERY_AFTER:.0f}s/RSS<{AUCTION_DURING_DISCOVERY_MEMORY_CEILING_MB}MB"
     )
-    logging.info(f"🌉 Handoff-safe v6.50: recent-good transient scout failures are isolated for {WEBSHARE_HANDOFF_TRANSIENT_COOLDOWN:.0f}s; main cooldown untouched")
+    logging.info(f"🌉 Handoff-safe v6.51: recent-good transient scout failures are isolated for {WEBSHARE_HANDOFF_TRANSIENT_COOLDOWN:.0f}s; main cooldown untouched")
     logging.info(
-        f"🧩 /24 soft reputation v6.50: {'ON' if SUBNET24_REPUTATION_ENABLED else 'OFF'}, "
+        f"🧩 /24 soft reputation v6.51: {'ON' if SUBNET24_REPUTATION_ENABLED else 'OFF'}, "
         f"TTL={SUBNET24_REPUTATION_TTL}s, min_fail_hosts={SUBNET24_REPUTATION_MIN_FAIL_HOSTS}, "
         f"max_penalty={SUBNET24_REPUTATION_MAX_PENALTY:.0f}; ranking-only, never blacklist"
     )
     threading.Thread(target=connection_watchdog, daemon=True, name='connection-watchdog').start()
     threading.Thread(target=memory_guard_worker, daemon=True, name='memory-guard-worker').start()
     threading.Thread(target=restart_sticky_persist_worker, daemon=True, name='restart-sticky-persist').start()
+    logging.info('Coordinator UK integration: %s; feed_limit=500; refresh=45s; TLS reserve target=%d; legacy fallback retained',
+                 'ON' if coordinator_feed.enabled else 'OFF', PROXY_PREFLIGHT_RESERVE_TARGET)
+    threading.Thread(target=proxy_metadata_worker, daemon=True, name='proxy-metadata-worker').start()
     threading.Thread(target=proxy_preflight_warm_worker, daemon=True, name='proxy-preflight-worker').start()
     threading.Thread(target=webshare_handoff_worker, daemon=True, name='webshare-handoff-worker').start()
     threading.Thread(target=auction_link_worker, daemon=True, name='auction-link-worker').start()
@@ -13530,7 +13799,7 @@ def leader_supervisor():
         try:
             logging.info(
                 f"🔐 PostgreSQL leader-lock получен (pid={os.getpid()}); "
-                "инициализируем v6.50 leader workers"
+                "инициализируем v6.51 leader workers"
             )
             start_leader_workers()
             # Держим session-level advisory lock отдельным соединением.
@@ -13553,7 +13822,7 @@ def leader_supervisor():
 @app.route('/')
 def index():
     role = "leader" if leader_active_event.is_set() else "standby"
-    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.50 AuctionConsensusSafe+Subnet24SoftRep+MemorySelfHeal+FastSelfRestart, {role})"
+    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.51 AuctionConsensusSafe+Subnet24SoftRep+MemorySelfHeal+FastSelfRestart, {role})"
 
 
 @app.route('/health')
@@ -13565,7 +13834,7 @@ def health():
 
 if __name__ == "__main__":
     logging.info(
-        f"🚀 Render process v6.50 started (pid={os.getpid()}); "
+        f"🚀 Render process v6.51 started (pid={os.getpid()}); "
         "Flask запускается сразу, фоновые worker-ы ждут PostgreSQL leader-lock"
     )
     # Flask привязывается к PORT сразу, чтобы новый Render instance прошёл health/port check.
