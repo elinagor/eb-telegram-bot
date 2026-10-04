@@ -68,6 +68,7 @@ def test_due_tls_recheck_renews_before_expiry(scanner, monkeypatch):
     context = Mock()
     context.wrap_socket.return_value = tls
     monkeypatch.setattr(scanner.ssl, 'create_default_context', lambda: context)
+    monkeypatch.setattr(scanner, '_quality_tls_context', None)
     assert scanner._quality_https_preflight_proxy(proxy) == (True, None)
     connect.assert_called_once()
     tls.do_handshake.assert_called_once()
@@ -131,7 +132,7 @@ def test_ready_reserve_counts_local_tls_and_independent_hosts(scanner):
 def test_existing_durable_uk_features_are_preserved():
     base = Path(__file__).resolve().parent
     before = json.loads((base / 'uk_feature_baseline.json').read_text(encoding='utf-8'))
-    current = ast.parse((base / 'app.py').read_text(encoding='utf-8').replace('v6.51', 'v6.50'))
+    current = ast.parse((base / 'app.py').read_text(encoding='utf-8').replace('v6.52', 'v6.50').replace('v6.51', 'v6.50'))
     after = {n.name: hashlib.sha256(ast.dump(n, include_attributes=False).encode()).hexdigest()
              for n in current.body if isinstance(n, ast.FunctionDef)}
     # Hashes from UK v6.50: persisted jobs, duplicate prevention and Telegram content.
