@@ -103,6 +103,10 @@ class PipelineMetrics:
         self.clock = clock
         self.lock = threading.Lock()
         self.requests = deque(maxlen=512)
+        # A busy fallback must not evict a quieter source's recent failures and
+        # accidentally restore its default high priority during the same outage.
+        self.discovery_by_source = {name: deque(maxlen=128)
+                                    for name in ('coordinator', 'legacy')}
         self.latencies = OrderedDict()
         self.stages = {}
         self.last_success = None
@@ -113,7 +117,10 @@ class PipelineMetrics:
     def record_request(self, identity, origin, result, seconds, kind):
         seconds = finite_number(seconds, 0, 120, 0)
         with self.lock:
-            self.requests.append((self.clock(), origin, result, seconds, kind))
+            row = (self.clock(), origin, result, seconds, kind)
+            self.requests.append(row)
+            if kind == 'discovery' and origin in self.discovery_by_source:
+                self.discovery_by_source[origin].append(row)
             if result == 'success':
                 samples = self.latencies.setdefault(identity, deque(maxlen=12))
                 samples.append(seconds)
@@ -151,9 +158,9 @@ class PipelineMetrics:
     def coordinator_fraction(self):
         """Mostly coordinator by default; retain exploration and independent fallback."""
         with self.lock:
-            rows = [r for r in self.requests if self.clock() - r[0] < 900
-                    and r[1] in ('coordinator', 'legacy') and r[4] == 'discovery']
-        groups = {name: [r for r in rows if r[1] == name] for name in ('coordinator', 'legacy')}
+            now = self.clock()
+            groups = {name: [r for r in rows if now - r[0] < 900]
+                      for name, rows in self.discovery_by_source.items()}
         if min(map(len, groups.values())) < 12:
             return .75
         # Fast 403s are not useful throughput. A pseudocount must never promote a
@@ -169,7 +176,8 @@ class PipelineMetrics:
 
     def public_acceptance(self):
         with self.lock:
-            rows = [r for r in self.requests if self.clock() - r[0] < 900
+            now = self.clock()
+            rows = [r for r in self.requests if now - r[0] < 900
                     and r[1] in ('coordinator', 'legacy') and r[4] == 'discovery']
         if len(rows) < 12:
             return None
