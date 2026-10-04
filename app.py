@@ -11,6 +11,7 @@ import threading
 import logging
 import html as html_lib
 import hashlib
+import hmac
 import ipaddress
 import socket
 from collections import deque
@@ -5938,7 +5939,7 @@ def get_exact_auction_by_id(item_id):
             return cur.fetchone()
 
 
-def list_active_auctions(limit=20):
+def list_active_auctions(limit=None):
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -6214,7 +6215,7 @@ def get_next_auction_link_job_state():
     return row[:6], 0.0
 
 
-def list_queued_auction_links(limit=20):
+def list_queued_auction_links(limit=None):
     with get_db_connection('ebay_uk_auction_link_list') as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -6225,7 +6226,7 @@ def list_queued_auction_links(limit=20):
                 ORDER BY created_at ASC
                 LIMIT %s
                 """,
-                (max(1, int(limit)),),
+                (None if limit is None else max(1, int(limit)),),
             )
             return cur.fetchall()
 
@@ -6540,7 +6541,7 @@ def _pending_window_single_minute(earliest, latest):
     return first_minute if first_minute == last_minute else None
 
 
-def list_pending_auctions(limit=20):
+def list_pending_auctions(limit=None):
     with get_db_connection('ebay_uk_auction_pending_list') as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -6713,7 +6714,7 @@ def update_verified_auction(item_id, title, new_end_time_utc):
     return True, changed, old_end, new_end_time_utc
 
 
-def get_auctions_for_status_check(limit=100):
+def get_auctions_for_status_check(limit=None):
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -7115,6 +7116,27 @@ def bot_main_reply_keyboard():
 
 def auction_queue_keyboard(url):
     return {'inline_keyboard': [[{'text': '🔗 Открыть eBay', 'url': url}]]}
+
+
+def _auction_add_callback_data(item_id):
+    # A compact signed ItemID survives restarts. Only auction notifications issue it;
+    # altered callback data cannot turn a fixed-price notification into an auction job.
+    item_id = str(item_id)
+    signature = hmac.new(
+        str(TELEGRAM_BOT_TOKEN).encode('utf-8'),
+        f'uk-auction-add:{item_id}'.encode('ascii'),
+        hashlib.sha256,
+    ).hexdigest()[:16]
+    return f'aucadd:{item_id}:{signature}'
+
+
+def new_item_auction_keyboard(item):
+    item_id = str(item.get('id') or '')
+    if not item.get('auction') or not re.fullmatch(r'\d{9,19}', item_id):
+        return None
+    return {'inline_keyboard': [[{
+        'text': '➕ Добавить', 'callback_data': _auction_add_callback_data(item_id),
+    }]]}
 
 
 def auction_open_list_keyboard(url):
@@ -10003,17 +10025,40 @@ def auction_link_worker():
             auction_link_wakeup_event.wait(timeout=AUCTION_LINK_DB_ERROR_WAIT)
 
 
+def _auction_list_message_pages(blocks, delete_buttons):
+    """Keep whole escaped HTML entries and their buttons together below Telegram's limit."""
+    pages = []
+    parts, buttons = [], []
+
+    def header():
+        return ("⏰ <b>Мои аукционы UK</b> 🇬🇧\n"
+                f"Всего: {len(blocks)} · Часть {len(pages) + 1}\n")
+
+    for block, button in zip(blocks, delete_buttons):
+        # Counting raw HTML UTF-16 units is conservative even after entity parsing.
+        candidate = header() + ''.join(parts) + block
+        if parts and len(candidate.encode('utf-16-le')) // 2 > 3500:
+            pages.append((header() + ''.join(parts), buttons))
+            parts, buttons = [], []
+        parts.append(block)
+        buttons.append(button)
+    if parts:
+        pages.append((header() + ''.join(parts), buttons))
+    return pages
+
+
 def send_auction_list():
     try:
-        exact_rows = list_active_auctions(limit=20)
-        pending_rows = list_pending_auctions(limit=20)
-        queued_rows = list_queued_auction_links(limit=20)
+        exact_rows = list_active_auctions()
+        pending_rows = list_pending_auctions()
+        queued_rows = list_queued_auction_links()
     except Exception as e:
         logging.error(f"Не удалось получить список аукционов: {e}")
         send_telegram_message("❌ Не удалось сейчас прочитать список аукционов из базы.")
         return
 
     exact_ids = {str(row[0]) for row in exact_rows}
+    pending_rows = [row for row in pending_rows if str(row[0]) not in exact_ids]
     pending_ids = {str(row[0]) for row in pending_rows}
     # На границе успешной обработки queue-row может существовать ещё долю секунды;
     # не показываем один ItemID дважды.
@@ -10033,13 +10078,12 @@ def send_auction_list():
     for row in queued_rows:
         entries.append(('queued', datetime.max.replace(tzinfo=timezone.utc), row))
     entries.sort(key=lambda x: x[1])
-    entries = entries[:20]
-
-    parts = ["⏰ <b>Мои аукционы UK</b> 🇬🇧\n"]
+    parts = []
     delete_buttons = []
     for idx, (kind, _sort_time, row) in enumerate(entries, 1):
         if kind == 'exact':
             item_id, url, title, end_time, timing_confidence, end_window_latest = row
+            url = f'https://www.ebay.co.uk/itm/{item_id}'
             end_time = _ensure_aware_utc(end_time)
             end_window_latest = (
                 _ensure_aware_utc(end_window_latest)
@@ -10065,9 +10109,10 @@ def send_auction_list():
             )
         elif kind == 'pending':
             item_id, url, title, earliest, latest, remaining_text, clock_text, next_check = row
+            url = f'https://www.ebay.co.uk/itm/{item_id}'
             title = _clean_auction_title(title, item_id)
             short_title = title if len(title) <= 100 else title[:97] + '…'
-            shown = _format_pending_remaining_ru(remaining_text)
+            shown = _format_pending_remaining_ru(remaining_text)[:200]
             parts.append(
                 f"\n{idx}) <b>{html_lib.escape(short_title)}</b>\n\n"
                 f"⏳ Осталось: {html_lib.escape(shown)}\n"
@@ -10077,6 +10122,7 @@ def send_auction_list():
             )
         else:
             item_id, url, created_at, next_attempt = row
+            url = f'https://www.ebay.co.uk/itm/{item_id}'
             parts.append(
                 f"\n{idx}) <b>Название уточняется</b>\n\n"
                 f"⏳ Осталось: проверяется\n"
@@ -10088,16 +10134,23 @@ def send_auction_list():
             {'text': f'❌ Удалить #{idx}', 'callback_data': f'aucdel:{item_id}'}
         )
 
-    keyboard = []
-    for i in range(0, len(delete_buttons), 2):
-        keyboard.append(delete_buttons[i:i + 2])
-    keyboard.append([{'text': '🗑 Удалить все', 'callback_data': 'aucdelall:ask'}])
-
-    send_telegram_message(
-        ''.join(parts),
-        reply_markup={'inline_keyboard': keyboard},
-        disable_preview=True,
-    )
+    pages = _auction_list_message_pages(parts, delete_buttons)
+    for page_index, (text, buttons) in enumerate(pages):
+        keyboard = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+        if page_index == len(pages) - 1:
+            keyboard.append([{'text': '🗑 Удалить все', 'callback_data': 'aucdelall:ask'}])
+        if not send_telegram_message(
+            text, reply_markup={'inline_keyboard': keyboard}, disable_preview=True,
+        ):
+            logging.warning('Auction list delivery failed: part=%s/%s; durable rows unchanged',
+                            page_index + 1, len(pages))
+            send_telegram_message('⚠️ Не удалось отправить весь список. Аукционы сохранены; '
+                                  'повторите команду «Аукционы».')
+            return False
+        if page_index < len(pages) - 1:
+            time.sleep(1)
+    logging.info('📋 Auction list sent: entries=%s parts=%s', len(entries), len(pages))
+    return True
 
 
 def _notify_auction_closed_early(item_id, url, title, expected_end, detected_end=None):
@@ -10360,7 +10413,7 @@ def auction_status_worker():
                     )
                     time.sleep(random.uniform(0.6, 1.0))
 
-                rows = get_auctions_for_status_check(limit=100)
+                rows = get_auctions_for_status_check()
                 now = datetime.now(timezone.utc)
                 due = []
                 for item_id, url, title, end_time, last_check in rows:
@@ -10528,6 +10581,54 @@ def _mark_deleted_button(message, item_id):
         edit_message_reply_markup(message.get('message_id'), {'inline_keyboard': new_rows})
 
 
+def submit_auction_link(url, callback_id=None):
+    """The same durable intake for pasted links and auction notification buttons."""
+    key, item_id, canonical_url, existing_message_id, is_new, duplicate_state = enqueue_auction_link(url)
+    # enqueue_auction_link has already committed. A DB failure propagates to the listener,
+    # which replays the update instead of acknowledging an unsaved user request.
+    if callback_id:
+        answer_callback_query(callback_id, 'Уже добавлен ✅' if duplicate_state else
+                              'Ссылка сохранена ✅ Проверяю окончание…')
+    if duplicate_state is not None:
+        send_duplicate_auction_notice(item_id, canonical_url, duplicate_state)
+        auction_link_wakeup_event.set()
+        return item_id
+    if is_new and not existing_message_id:
+        msg_id = send_telegram_message(
+            "🟡 <b>Аукцион добавлен</b> 🇬🇧\n\n"
+            "💾 Ссылка уже надёжно сохранена и не пропадёт после перезапуска Render.\n"
+            "⏳ Точное время окончания ещё <b>не подтверждено</b>; проверяю автоматически.\n"
+            "🔔 Напоминания 60 / 30 / 10 / 5 мин. включатся сразу после подтверждения точного времени.",
+            reply_markup=auction_queue_keyboard(canonical_url),
+            preview_url=canonical_url, return_message_id=True,
+        )
+        if msg_id:
+            set_auction_link_status_message(key, msg_id)
+        else:
+            logging.warning('⚠️ Auction %s durably queued without confirmed Telegram status message',
+                            item_id or key)
+        # Keep the original status-message grace and release only after attaching its ID.
+        activate_auction_link_job(key)
+    return item_id
+
+
+def _mark_auction_added_button(message, callback_data):
+    rows = (message.get('reply_markup') or {}).get('inline_keyboard') or []
+    changed = False
+    new_rows = []
+    for row in rows:
+        new_row = []
+        for original in row:
+            button = dict(original)
+            if button.get('callback_data') == callback_data:
+                button['text'] = '✅ Добавлен'
+                changed = True
+            new_row.append(button)
+        new_rows.append(new_row)
+    if changed:
+        edit_message_reply_markup(message.get('message_id'), {'inline_keyboard': new_rows})
+
+
 def handle_telegram_callback(callback):
     callback_id = callback.get('id')
     data = str(callback.get('data') or '')
@@ -10535,6 +10636,18 @@ def handle_telegram_callback(callback):
     chat_id = str((message.get('chat') or {}).get('id') or '')
     if chat_id != str(TELEGRAM_CHAT_ID):
         answer_callback_query(callback_id, "Недоступно", show_alert=False)
+        return
+
+    if data.startswith('aucadd:'):
+        match = re.fullmatch(r'aucadd:(\d{9,19}):([a-f0-9]{16})', data)
+        if not match or not hmac.compare_digest(data, _auction_add_callback_data(match.group(1))):
+            answer_callback_query(callback_id, 'Эта кнопка недействительна. Отправьте ссылку на лот.',
+                                  show_alert=True)
+            return
+        item_id = match.group(1)
+        submit_auction_link(f'https://www.ebay.co.uk/itm/{item_id}', callback_id=callback_id)
+        _mark_auction_added_button(message, data)
+        logging.info('➕ Auction added from UK notification button: item=%s', item_id)
         return
 
     if data == 'auclist':
@@ -10619,7 +10732,6 @@ def auction_reminder_worker():
                     FROM auction_reminders
                     WHERE end_time_utc > %s
                     ORDER BY end_time_utc ASC
-                    LIMIT 200
                     """,
                     (now,),
                 )
@@ -10847,17 +10959,9 @@ def telegram_listener():
                                         f"text_len={len(str(message.get('text') or ''))}, "
                                         f"caption_len={len(str(message.get('caption') or ''))}"
                                     )
-                                    if len(ebay_urls) > 20:
-                                        logging.warning(
-                                            f"Telegram update {update_id}: получено {len(ebay_urls)} eBay URL; "
-                                            "обрабатываем первые 20"
-                                        )
                                     handled_auction_keys = set()
-                                    for ebay_url in ebay_urls[:20]:
-                                        (
-                                            key, item_id, canonical_url, existing_message_id,
-                                            is_new, duplicate_state
-                                        ) = enqueue_auction_link(ebay_url)
+                                    for ebay_url in ebay_urls:
+                                        key = _auction_queue_key(ebay_url, extract_ebay_item_id_any(ebay_url))
                                         if key in handled_auction_keys:
                                             logging.info(
                                                 f"♻️ Same-update auction duplicate suppressed: "
@@ -10865,38 +10969,7 @@ def telegram_listener():
                                             )
                                             continue
                                         handled_auction_keys.add(key)
-                                        if duplicate_state is not None:
-                                            send_duplicate_auction_notice(item_id, canonical_url, duplicate_state)
-                                            auction_link_wakeup_event.set()
-                                            continue
-                                        # Одно компактное жёлтое status-сообщение. Оно не накапливается:
-                                        # после получения результата бот отредактирует ЭТО ЖЕ сообщение в pending/exact.
-                                        if is_new and not existing_message_id:
-                                            msg_id = send_telegram_message(
-                                                "🟡 <b>Аукцион добавлен</b> 🇬🇧\n\n"
-                                                "💾 Ссылка уже надёжно сохранена и не пропадёт после перезапуска Render.\n"
-                                                "⏳ Точное время окончания ещё <b>не подтверждено</b>; проверяю автоматически.\n"
-                                                "🔔 Напоминания 60 / 30 / 10 / 5 мин. включатся сразу после подтверждения точного времени.",
-                                                reply_markup=auction_queue_keyboard(canonical_url),
-                                                preview_url=canonical_url,
-                                                return_message_id=True,
-                                            )
-                                            if msg_id:
-                                                set_auction_link_status_message(key, msg_id)
-                                            else:
-                                                # Queue insert is already COMMITted, so a Telegram
-                                                # send failure cannot lose the auction.  The worker's
-                                                # final pending/exact publication will create a new
-                                                # message if there is no status_message_id.
-                                                logging.warning(
-                                                    f"⚠️ Auction {item_id or key} сохранён в очереди, "
-                                                    "но Telegram не подтвердил жёлтый status-message; "
-                                                    "финальный результат всё равно будет опубликован worker-ом"
-                                                )
-                                            # Only now release the new row to the worker. If this handler
-                                            # crashes before activation, DB next_attempt safety grace will
-                                            # release it automatically, so the auction still cannot be lost.
-                                            activate_auction_link_job(key)
+                                        submit_auction_link(ebay_url)
                                 elif telegram_message_has_ebay_signal(message):
                                     # Critical anti-silence guard: never ACK an eBay-looking update
                                     # without telling the user that its URL could not be parsed.
@@ -13250,20 +13323,20 @@ def check_and_send_new_items():
 
     if new:
         for item in new:
-            msg = f"🇬🇧 <b>НОВЫЙ ТОВАР Англия</b> 🇬🇧\n\n<b>{item['title']}</b>\n\n"
+            msg = f"🇬🇧 <b>НОВЫЙ ТОВАР Англия</b> 🇬🇧\n\n<b>{html_lib.escape(item['title'])}</b>\n\n"
             if item['price']:
-                msg += f"💰 Цена: {item['price']}\n"
+                msg += f"💰 Цена: {html_lib.escape(item['price'])}\n"
             else:
                 msg += "💰 Цена не указана (не GBP)\n"
             if item['shipping']:
-                msg += f"🚚 Доставка: {item['shipping']}\n"
+                msg += f"🚚 Доставка: {html_lib.escape(item['shipping'])}\n"
             else:
                 msg += "🚚 Доставка: не указана\n"
             if item.get('best_offer', False):
                 msg += "✅ Сделать предложение (Best Offer)\n"
             if item.get('auction', False):
                 if item.get('has_buy_it_now', False) and item.get('buy_it_now_price'):
-                    msg += f"⏰ Аукцион / Buy It Now цена: {item['buy_it_now_price']}\n"
+                    msg += f"⏰ Аукцион / Buy It Now цена: {html_lib.escape(item['buy_it_now_price'])}\n"
                 elif item.get('has_buy_it_now', False):
                     msg += "⏰ Аукцион / Buy It Now\n"
                 else:
@@ -13279,11 +13352,11 @@ def check_and_send_new_items():
                 )
                 if total is not None:
                     msg += f"\nЗа все (с доставкой в Украину): <b>{total}грн</b>"
-            msg += f"\n\n🔗 <a href='{item['url']}'>Ссылка на товар</a>"
+            msg += f"\n\n🔗 <a href='{html_lib.escape(item['url'], quote=True)}'>Ссылка на товар</a>"
 
             # item_id уже записан в seen_items ДО Telegram. Даже если Render внезапно
             # перезапустится после отправки, этот товар не пойдёт по второму кругу.
-            if not send_telegram_message(msg):
+            if not send_telegram_message(msg, reply_markup=new_item_auction_keyboard(item)):
                 logging.error(
                     f"Telegram не подтвердил отправку нового item {item['id']}. "
                     "ID оставлен в seen_items специально, чтобы не создать повторную отправку."
@@ -13631,7 +13704,7 @@ def bot_worker():
     seen_line = f"\n📚 В базе: {seen_total} товаров." if seen_total is not None else ""
     startup_keyboard_ok = send_telegram_message(
         startup_line +
-        "\n🇬🇧 eBay UK monitor v6.52 AuctionConsensusSafe+Subnet24SoftRep+MemorySelfHeal+FastSelfRestart работает." +
+        "\n🇬🇧 eBay UK monitor v6.53 AuctionConsensusSafe+Subnet24SoftRep+MemorySelfHeal+FastSelfRestart работает." +
         seen_line +
         "\nКоманды: /stop /start /list (/auctions) /delauction НОМЕР_ЛОТА"
         "\nМожно отправить ссылку на eBay-аукцион — надёжно сохраню окончание и включу напоминания заранее."
@@ -13717,7 +13790,7 @@ def start_leader_workers():
         name='telegram-ui-config',
     ).start()
     logging.info(
-        "🌐 Multi-provider v6.52: "
+        "🌐 Multi-provider v6.53: "
         f"ProxyScrape Premium={'ON' if PROXYSCRAPE_PREMIUM_API_KEY else 'OFF'}, "
         f"Webshare={'ON (' + str(len(WEBSHARE_API_KEYS)) + ' account(s))' if WEBSHARE_API_KEYS else 'OFF'}, "
         f"Webshare first-batch={'ON (1 unique-host slot; extra keys=bandwidth)' if WEBSHARE_FIRST_BATCH else 'OFF'}, "
@@ -13731,7 +13804,7 @@ def start_leader_workers():
     proxio_calls_day = int((86400 + PROXIO_FREE_REFRESH - 1) // PROXIO_FREE_REFRESH) if PROXIO_FREE_ENABLED else 0
     proxio_calls_per_key = (proxio_calls_day / len(PROXIO_API_KEYS)) if PROXIO_API_KEYS else 0.0
     logging.info(
-        f"🧭 External sources v6.52: HProxy={'ON' if HPROXY_FREE_ENABLED else 'OFF'} "
+        f"🧭 External sources v6.53: HProxy={'ON' if HPROXY_FREE_ENABLED else 'OFF'} "
         f"(HTTPS, elite+anonymous, cap={HPROXY_FREE_ELITE_LIMIT + HPROXY_FREE_ANON_LIMIT}), "
         f"ProxMint={'ON' if PROXMINT_FREE_ENABLED else 'OFF'} "
         f"(HTTP primary score>={PROXMINT_MIN_SCORE:.0f}/uptime>={PROXMINT_MIN_UPTIME_PCT:.0f}%/"
@@ -13749,7 +13822,7 @@ def start_leader_workers():
         f"long/extreme/ultra ceilings={PROBE_LONG_OUTAGE_CONCURRENCY}/{PROBE_EXTREME_OUTAGE_CONCURRENCY}/{PROBE_ULTRA_OUTAGE_CONCURRENCY}"
     )
     logging.info(
-        f"⚡ Adaptive discovery v6.52: normal {PROBE_CONCURRENCY}→{PROBE_ESCALATED_CONCURRENCY}→"
+        f"⚡ Adaptive discovery v6.53: normal {PROBE_CONCURRENCY}→{PROBE_ESCALATED_CONCURRENCY}→"
         f"{PROBE_DEEP_CONCURRENCY}→{PROBE_BURST_CONCURRENCY}→{PROBE_MAX_CONCURRENCY} at "
         f"~0/{PROBE_ESCALATE_AFTER:.0f}/{PROBE_DEEP_ESCALATE_AFTER:.0f}/"
         f"{PROBE_BURST_ESCALATE_AFTER:.0f}/{PROBE_MAX_ESCALATE_AFTER:.0f}s; long-outage "
@@ -13774,14 +13847,14 @@ def start_leader_workers():
 
     threading.Thread(target=telegram_listener, daemon=True, name='telegram-listener').start()
     logging.info(
-        f"📨 Telegram intake v6.52: ItemID-dedupe ON; auction priority memory ceiling="
+        f"📨 Telegram intake v6.53: ItemID-dedupe ON; auction priority memory ceiling="
         f"{AUCTION_USER_MEMORY_LIMIT_MB}MB, high-memory fetch workers={AUCTION_HIGH_MEMORY_FETCH_PARALLEL}, "
         f"status_grace={AUCTION_LINK_STATUS_GRACE}s; long-outage low-impact="
         f"{AUCTION_DURING_DISCOVERY_AFTER:.0f}s/RSS<{AUCTION_DURING_DISCOVERY_MEMORY_CEILING_MB}MB"
     )
-    logging.info(f"🌉 Handoff-safe v6.52: recent-good transient scout failures are isolated for {WEBSHARE_HANDOFF_TRANSIENT_COOLDOWN:.0f}s; main cooldown untouched")
+    logging.info(f"🌉 Handoff-safe v6.53: recent-good transient scout failures are isolated for {WEBSHARE_HANDOFF_TRANSIENT_COOLDOWN:.0f}s; main cooldown untouched")
     logging.info(
-        f"🧩 /24 soft reputation v6.52: {'ON' if SUBNET24_REPUTATION_ENABLED else 'OFF'}, "
+        f"🧩 /24 soft reputation v6.53: {'ON' if SUBNET24_REPUTATION_ENABLED else 'OFF'}, "
         f"TTL={SUBNET24_REPUTATION_TTL}s, min_fail_hosts={SUBNET24_REPUTATION_MIN_FAIL_HOSTS}, "
         f"max_penalty={SUBNET24_REPUTATION_MAX_PENALTY:.0f}; ranking-only, never blacklist"
     )
@@ -13815,7 +13888,7 @@ def leader_supervisor():
         try:
             logging.info(
                 f"🔐 PostgreSQL leader-lock получен (pid={os.getpid()}); "
-                "инициализируем v6.52 leader workers"
+                "инициализируем v6.53 leader workers"
             )
             start_leader_workers()
             # Держим session-level advisory lock отдельным соединением.
@@ -13838,7 +13911,7 @@ def leader_supervisor():
 @app.route('/')
 def index():
     role = "leader" if leader_active_event.is_set() else "standby"
-    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.52 AuctionConsensusSafe+Subnet24SoftRep+MemorySelfHeal+FastSelfRestart, {role})"
+    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.53 AuctionConsensusSafe+Subnet24SoftRep+MemorySelfHeal+FastSelfRestart, {role})"
 
 
 @app.route('/health')
@@ -13850,7 +13923,7 @@ def health():
 
 if __name__ == "__main__":
     logging.info(
-        f"🚀 Render process v6.52 started (pid={os.getpid()}); "
+        f"🚀 Render process v6.53 started (pid={os.getpid()}); "
         "Flask запускается сразу, фоновые worker-ы ждут PostgreSQL leader-lock"
     )
     # Flask привязывается к PORT сразу, чтобы новый Render instance прошёл health/port check.
