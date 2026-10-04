@@ -132,12 +132,26 @@ def test_ready_reserve_counts_local_tls_and_independent_hosts(scanner):
 def test_existing_durable_uk_features_are_preserved():
     base = Path(__file__).resolve().parent
     before = json.loads((base / 'uk_feature_baseline.json').read_text(encoding='utf-8'))
-    current = ast.parse((base / 'app.py').read_text(encoding='utf-8').replace('v6.52', 'v6.50').replace('v6.51', 'v6.50'))
+    current = ast.parse((base / 'app.py').read_text(encoding='utf-8').replace('v6.53', 'v6.50').replace('v6.52', 'v6.50').replace('v6.51', 'v6.50'))
     after = {n.name: hashlib.sha256(ast.dump(n, include_attributes=False).encode()).hexdigest()
              for n in current.body if isinstance(n, ast.FunctionDef)}
-    # Hashes from UK v6.50: persisted jobs, duplicate prevention and Telegram content.
+    # Reviewed v6.53 changes: complete lists/status selection, multipart delivery,
+    # shared durable intake and signed auction notification buttons. Behavioral coverage
+    # lives in test_uk_auctions.py. Every other v6.50 durable function stays identical.
+    approved_auction_updates = {
+        'list_active_auctions': 'a0ce73cc6299832318d5183103bff6d89bafda83c6142efc04fefaca2be4c260',
+        'list_queued_auction_links': '86a602c5841ae2a60303305ee7900dd2122bc669d0b3b0ec49ff72dd5a68f2a6',
+        'list_pending_auctions': '8859445298d3340dba4a49e75892f15e8a79d9ba8bf0dacd873542aec261861f',
+        'get_auctions_for_status_check': '206c665ce5b049b84ebcaac7c24623c82bc2e63c396dd9f149805541e22e4dcd',
+        'send_auction_list': 'aeab1f3022f439bff142240b91c227e96dfdf86ea8cc9e53009c46a3158e8a58',
+        'auction_status_worker': '1ffb9a56be75561e4d52b3a14ebc881e6583c998ed0542a7d1535fb5e3af4245',
+        'handle_telegram_callback': '28b386e0572f55c47bd2aaa73913ed153921c42a77f6612255691624a8aeba4c',
+        'auction_reminder_worker': '506b6e575e77aae1c41b8d9dad81d4c45d73732e86c368d5e40b10e0130581e3',
+        'telegram_listener': '8205361dff0eabf22c05222edda63b507239c2af5c88943c6b62628c2be412b1',
+        'check_and_send_new_items': 'c05a0b474c74af7d48060a21009b16b69abb3cc21ce62016a5679cbe90846a70',
+    }
     for name in before:
-        assert before[name] == after[name], name
+        assert approved_auction_updates.get(name, before[name]) == after[name], name
 
 
 def test_hot_failover_finds_ready_replacement_without_api_wait(scanner, monkeypatch):
