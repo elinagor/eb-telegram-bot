@@ -7132,7 +7132,7 @@ def _auction_add_callback_data(item_id):
 
 def new_item_auction_keyboard(item):
     item_id = str(item.get('id') or '')
-    if not item.get('auction') or not re.fullmatch(r'\d{9,19}', item_id):
+    if not item.get('auction') or not re.fullmatch(r'[0-9]{9,19}', item_id):
         return None
     return {'inline_keyboard': [[{
         'text': '➕ Добавить', 'callback_data': _auction_add_callback_data(item_id),
@@ -10639,7 +10639,7 @@ def handle_telegram_callback(callback):
         return
 
     if data.startswith('aucadd:'):
-        match = re.fullmatch(r'aucadd:(\d{9,19}):([a-f0-9]{16})', data)
+        match = re.fullmatch(r'aucadd:([0-9]{9,19}):([a-f0-9]{16})', data)
         if not match or not hmac.compare_digest(data, _auction_add_callback_data(match.group(1))):
             answer_callback_query(callback_id, 'Эта кнопка недействительна. Отправьте ссылку на лот.',
                                   show_alert=True)
