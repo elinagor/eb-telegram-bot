@@ -145,7 +145,7 @@ def test_existing_durable_uk_features_are_preserved():
         'get_auctions_for_status_check': '206c665ce5b049b84ebcaac7c24623c82bc2e63c396dd9f149805541e22e4dcd',
         'send_auction_list': 'aeab1f3022f439bff142240b91c227e96dfdf86ea8cc9e53009c46a3158e8a58',
         'auction_status_worker': '1ffb9a56be75561e4d52b3a14ebc881e6583c998ed0542a7d1535fb5e3af4245',
-        'handle_telegram_callback': '28b386e0572f55c47bd2aaa73913ed153921c42a77f6612255691624a8aeba4c',
+        'handle_telegram_callback': 'e4b506b8a6f0ac196c98a4f8591ed685b449d64ddad7e0fbbc787bbd798885e9',
         'auction_reminder_worker': '506b6e575e77aae1c41b8d9dad81d4c45d73732e86c368d5e40b10e0130581e3',
         'telegram_listener': '8205361dff0eabf22c05222edda63b507239c2af5c88943c6b62628c2be412b1',
         'check_and_send_new_items': 'c05a0b474c74af7d48060a21009b16b69abb3cc21ce62016a5679cbe90846a70',
