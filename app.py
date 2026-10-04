@@ -11261,6 +11261,21 @@ def _quality_recv_headers(sock, deadline, max_bytes=8192):
     return bytes(data)
 
 
+_quality_tls_context_lock = threading.Lock()
+_quality_tls_context = None
+
+
+def _get_quality_tls_context():
+    """Share an immutable verified context; sockets retain independent ownership."""
+    global _quality_tls_context
+    with _quality_tls_context_lock:
+        if _quality_tls_context is None:
+            # SSLContext is thread-safe when not reconfigured after first use.
+            # Keep default CA and hostname verification; never modify this context.
+            _quality_tls_context = ssl.create_default_context()
+        return _quality_tls_context
+
+
 def _quality_https_preflight_proxy(proxy):
     """
     Строгий ФОНОВЫЙ health-check без HTTP-запроса к eBay:
@@ -11369,7 +11384,7 @@ def _quality_https_preflight_proxy(proxy):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise socket.timeout("quality preflight deadline before TLS")
-        context = ssl.create_default_context()
+        context = _get_quality_tls_context()
         tls_sock = context.wrap_socket(
             sock,
             server_hostname=PROXY_QUALITY_HOST,
@@ -11396,6 +11411,7 @@ def _quality_https_preflight_proxy(proxy):
         proxy_manager.mark_quality_result(proxy, False, 'proxy_error')
         return False, 'proxy_error'
     finally:
+        pipeline_metrics.stage('neutral_tls', time.monotonic() - started)
         if tls_sock is not None:
             try:
                 tls_sock.close()
@@ -13615,7 +13631,7 @@ def bot_worker():
     seen_line = f"\n📚 В базе: {seen_total} товаров." if seen_total is not None else ""
     startup_keyboard_ok = send_telegram_message(
         startup_line +
-        "\n🇬🇧 eBay UK monitor v6.51 AuctionConsensusSafe+Subnet24SoftRep+MemorySelfHeal+FastSelfRestart работает." +
+        "\n🇬🇧 eBay UK monitor v6.52 AuctionConsensusSafe+Subnet24SoftRep+MemorySelfHeal+FastSelfRestart работает." +
         seen_line +
         "\nКоманды: /stop /start /list (/auctions) /delauction НОМЕР_ЛОТА"
         "\nМожно отправить ссылку на eBay-аукцион — надёжно сохраню окончание и включу напоминания заранее."
@@ -13701,7 +13717,7 @@ def start_leader_workers():
         name='telegram-ui-config',
     ).start()
     logging.info(
-        "🌐 Multi-provider v6.51: "
+        "🌐 Multi-provider v6.52: "
         f"ProxyScrape Premium={'ON' if PROXYSCRAPE_PREMIUM_API_KEY else 'OFF'}, "
         f"Webshare={'ON (' + str(len(WEBSHARE_API_KEYS)) + ' account(s))' if WEBSHARE_API_KEYS else 'OFF'}, "
         f"Webshare first-batch={'ON (1 unique-host slot; extra keys=bandwidth)' if WEBSHARE_FIRST_BATCH else 'OFF'}, "
@@ -13715,7 +13731,7 @@ def start_leader_workers():
     proxio_calls_day = int((86400 + PROXIO_FREE_REFRESH - 1) // PROXIO_FREE_REFRESH) if PROXIO_FREE_ENABLED else 0
     proxio_calls_per_key = (proxio_calls_day / len(PROXIO_API_KEYS)) if PROXIO_API_KEYS else 0.0
     logging.info(
-        f"🧭 External sources v6.51: HProxy={'ON' if HPROXY_FREE_ENABLED else 'OFF'} "
+        f"🧭 External sources v6.52: HProxy={'ON' if HPROXY_FREE_ENABLED else 'OFF'} "
         f"(HTTPS, elite+anonymous, cap={HPROXY_FREE_ELITE_LIMIT + HPROXY_FREE_ANON_LIMIT}), "
         f"ProxMint={'ON' if PROXMINT_FREE_ENABLED else 'OFF'} "
         f"(HTTP primary score>={PROXMINT_MIN_SCORE:.0f}/uptime>={PROXMINT_MIN_UPTIME_PCT:.0f}%/"
@@ -13733,7 +13749,7 @@ def start_leader_workers():
         f"long/extreme/ultra ceilings={PROBE_LONG_OUTAGE_CONCURRENCY}/{PROBE_EXTREME_OUTAGE_CONCURRENCY}/{PROBE_ULTRA_OUTAGE_CONCURRENCY}"
     )
     logging.info(
-        f"⚡ Adaptive discovery v6.51: normal {PROBE_CONCURRENCY}→{PROBE_ESCALATED_CONCURRENCY}→"
+        f"⚡ Adaptive discovery v6.52: normal {PROBE_CONCURRENCY}→{PROBE_ESCALATED_CONCURRENCY}→"
         f"{PROBE_DEEP_CONCURRENCY}→{PROBE_BURST_CONCURRENCY}→{PROBE_MAX_CONCURRENCY} at "
         f"~0/{PROBE_ESCALATE_AFTER:.0f}/{PROBE_DEEP_ESCALATE_AFTER:.0f}/"
         f"{PROBE_BURST_ESCALATE_AFTER:.0f}/{PROBE_MAX_ESCALATE_AFTER:.0f}s; long-outage "
@@ -13758,14 +13774,14 @@ def start_leader_workers():
 
     threading.Thread(target=telegram_listener, daemon=True, name='telegram-listener').start()
     logging.info(
-        f"📨 Telegram intake v6.51: ItemID-dedupe ON; auction priority memory ceiling="
+        f"📨 Telegram intake v6.52: ItemID-dedupe ON; auction priority memory ceiling="
         f"{AUCTION_USER_MEMORY_LIMIT_MB}MB, high-memory fetch workers={AUCTION_HIGH_MEMORY_FETCH_PARALLEL}, "
         f"status_grace={AUCTION_LINK_STATUS_GRACE}s; long-outage low-impact="
         f"{AUCTION_DURING_DISCOVERY_AFTER:.0f}s/RSS<{AUCTION_DURING_DISCOVERY_MEMORY_CEILING_MB}MB"
     )
-    logging.info(f"🌉 Handoff-safe v6.51: recent-good transient scout failures are isolated for {WEBSHARE_HANDOFF_TRANSIENT_COOLDOWN:.0f}s; main cooldown untouched")
+    logging.info(f"🌉 Handoff-safe v6.52: recent-good transient scout failures are isolated for {WEBSHARE_HANDOFF_TRANSIENT_COOLDOWN:.0f}s; main cooldown untouched")
     logging.info(
-        f"🧩 /24 soft reputation v6.51: {'ON' if SUBNET24_REPUTATION_ENABLED else 'OFF'}, "
+        f"🧩 /24 soft reputation v6.52: {'ON' if SUBNET24_REPUTATION_ENABLED else 'OFF'}, "
         f"TTL={SUBNET24_REPUTATION_TTL}s, min_fail_hosts={SUBNET24_REPUTATION_MIN_FAIL_HOSTS}, "
         f"max_penalty={SUBNET24_REPUTATION_MAX_PENALTY:.0f}; ranking-only, never blacklist"
     )
@@ -13799,7 +13815,7 @@ def leader_supervisor():
         try:
             logging.info(
                 f"🔐 PostgreSQL leader-lock получен (pid={os.getpid()}); "
-                "инициализируем v6.51 leader workers"
+                "инициализируем v6.52 leader workers"
             )
             start_leader_workers()
             # Держим session-level advisory lock отдельным соединением.
@@ -13822,7 +13838,7 @@ def leader_supervisor():
 @app.route('/')
 def index():
     role = "leader" if leader_active_event.is_set() else "standby"
-    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.51 AuctionConsensusSafe+Subnet24SoftRep+MemorySelfHeal+FastSelfRestart, {role})"
+    return f"eBay бот работает (Великобритания, adaptive parallel UK v6.52 AuctionConsensusSafe+Subnet24SoftRep+MemorySelfHeal+FastSelfRestart, {role})"
 
 
 @app.route('/health')
@@ -13834,7 +13850,7 @@ def health():
 
 if __name__ == "__main__":
     logging.info(
-        f"🚀 Render process v6.51 started (pid={os.getpid()}); "
+        f"🚀 Render process v6.52 started (pid={os.getpid()}); "
         "Flask запускается сразу, фоновые worker-ы ждут PostgreSQL leader-lock"
     )
     # Flask привязывается к PORT сразу, чтобы новый Render instance прошёл health/port check.
