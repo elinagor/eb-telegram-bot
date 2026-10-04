@@ -1,4 +1,4 @@
-# England eBay scanner — v6.52
+# England eBay scanner — v6.53
 
 UK scanner with a primary proxy coordinator and independent fallback sources.
 Existing UK product parsing, auction jobs, PostgreSQL deduplication, Telegram commands,
@@ -38,7 +38,7 @@ path; there is no global recommendation-card fallback.
 With the normal dependencies and pytest installed:
 
 ```text
-python -m pytest test_coordinator_uk.py test_uk_regressions.py test_uk_source_history.py test_uk_tls_context.py -q
+python -m pytest test_coordinator_uk.py test_uk_regressions.py test_uk_source_history.py test_uk_tls_context.py test_uk_auctions.py -q
 ```
 
 Tests forbid unmocked network and database calls. They cover feed expiry, response
@@ -56,3 +56,26 @@ local TLS reserve and actual eBay successes.
 Discovery evidence is bounded separately for coordinator and legacy sources (128 samples each, 15 minutes). Heavy fallback traffic or fixed-session requests cannot erase recent coordinator failures and incorrectly restore its default priority. The original 75%/50% policy, provider quotas, worker escalation and reserve target remain unchanged.
 
 Neutral TLS preflight shares one immutable default SSL context across independent sockets. CA verification, hostname verification, SNI and socket cleanup remain active; the trust store is no longer recreated on every handshake. Runtime metrics include the neutral TLS stage. Tests cover concurrent initialization, certificate rejection, resource closure and busy-source eviction.
+
+## Auction controls — v6.53
+
+Auction storage has no 16/20 item cap. `/auctions`, `/list` and the persistent
+`📋 Аукционы` button display all exact, pending and queued item records, deduplicated
+and sorted by ending time. Whole escaped HTML entries are split into conservative
+3500 UTF-16-unit messages; delete buttons stay with their entries and numbering is
+continuous. One delete-all control on the final part retains the existing confirmation.
+
+New auction product notifications have `➕ Добавить`, including auction listings with
+Buy It Now or Best Offer. Ordinary fixed-price and offer-only listings have no add
+button. The signed ItemID is validated within the configured UK chat and uses the
+same PostgreSQL-backed intake as pasted links. Repeat taps reuse the saved state;
+the button changes to `✅ Добавлен`. Buttons survive process restarts while the bot
+token is unchanged. Existing notifications sent before this version are not edited.
+
+Pasted batches are no longer cut off after 20 URLs. Exact auction reminder selection
+has no 200-row cutoff, and status selection has no 100-row cutoff. Status network
+checks retain their existing small per-pass budget and proxy/memory guards. Time
+confirmation, 60/30/10/5-minute reminders and final-five-minute cleanup stay intact.
+Neutral proxy health still cannot guarantee eBay availability or immediate auction
+time confirmation. Tests exercise 30/60/240 saved auctions, mixed states, reminder
+delivery, notification parsing, duplicate taps and DB/Telegram failure handling.
