@@ -232,7 +232,7 @@ def make_callback(scanner, item_id='123456789001'):
                 message=dict(message_id=99, chat=dict(id=scanner.TELEGRAM_CHAT_ID), reply_markup=keyboard))
 
 
-@pytest.mark.parametrize('invalid', ['other_chat', 'changed_id', 'changed_signature', 'unsigned'])
+@pytest.mark.parametrize('invalid', ['other_chat', 'changed_id', 'changed_signature', 'unsigned', 'non_ascii'])
 def test_forged_or_wrong_chat_button_cannot_enqueue(scanner, monkeypatch, invalid):
     callback = make_callback(scanner)
     if invalid == 'other_chat':
@@ -241,6 +241,8 @@ def test_forged_or_wrong_chat_button_cannot_enqueue(scanner, monkeypatch, invali
         callback['data'] = callback['data'].replace('123456789001', '123456789002')
     elif invalid == 'changed_signature':
         callback['data'] = callback['data'][:-16] + '0' * 16
+    elif invalid == 'non_ascii':
+        callback['data'] = callback['data'].replace('123456789001', '١٢٣٤٥٦٧٨٩٠٠١')
     else:
         callback['data'] = 'aucadd:123456789001'
     intake = Mock()
@@ -248,6 +250,11 @@ def test_forged_or_wrong_chat_button_cannot_enqueue(scanner, monkeypatch, invali
     monkeypatch.setattr(scanner, 'answer_callback_query', Mock())
     scanner.handle_telegram_callback(callback)
     intake.assert_not_called()
+
+
+@pytest.mark.parametrize('item_id', ['', '123', '١٢٣٤٥٦٧٨٩٠٠١'])
+def test_invalid_item_ids_have_no_add_button(scanner, item_id):
+    assert scanner.new_item_auction_keyboard(dict(id=item_id, auction=True)) is None
 
 
 def test_button_intake_uses_durable_queue_and_duplicate_guard(scanner, monkeypatch):
