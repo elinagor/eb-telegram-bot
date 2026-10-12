@@ -132,7 +132,7 @@ def test_ready_reserve_counts_local_tls_and_independent_hosts(scanner):
 def test_existing_durable_uk_features_are_preserved():
     base = Path(__file__).resolve().parent
     before = json.loads((base / 'uk_feature_baseline.json').read_text(encoding='utf-8'))
-    current = ast.parse((base / 'app.py').read_text(encoding='utf-8').replace('v6.53', 'v6.50').replace('v6.52', 'v6.50').replace('v6.51', 'v6.50'))
+    current = ast.parse((base / 'app.py').read_text(encoding='utf-8').replace('v6.54', 'v6.50').replace('v6.53', 'v6.50').replace('v6.52', 'v6.50').replace('v6.51', 'v6.50'))
     after = {n.name: hashlib.sha256(ast.dump(n, include_attributes=False).encode()).hexdigest()
              for n in current.body if isinstance(n, ast.FunctionDef)}
     # Reviewed v6.53 changes: complete lists/status selection, multipart delivery,
