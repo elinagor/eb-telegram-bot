@@ -1,4 +1,4 @@
-# England eBay scanner — v6.53
+# England eBay scanner — v6.54
 
 UK scanner with a primary proxy coordinator and independent fallback sources.
 Existing UK product parsing, auction jobs, PostgreSQL deduplication, Telegram commands,
@@ -19,6 +19,24 @@ quarantine remain stronger than the coordinator's neutral health checks.
 Normally 75% of the available public discovery share prefers the coordinator,
 with independent fallback capacity and existing managed-provider controls.
 If sufficiently sampled local results are worse, its share falls to 50%.
+The same share is respected across consecutive single-slot replacements, rather
+than rounding every replacement in favor of the coordinator. When either source
+is exhausted, the other fills the slot immediately.
+External-source allowances count already running probes during rolling refill.
+They can borrow idle capacity when ordinary sources are exhausted, while the
+shared probe and RAM limits remain unchanged.
+
+Proxio uses its authenticated API first and the official
+[keyless download](https://proxio.io/api/) if API access is unavailable or its daily
+quota is exhausted. Public download refreshes are bounded to once per five minutes
+and use the same quality filters, IP deduplication and snapshot cap. API quota
+accounting also observes the provider's reported usage; daily limits reset at
+midnight UTC. A failed or invalid download retains the previous snapshot.
+Provider requests remain in the metadata worker, outside critical failover.
+Each response is limited to 1 MiB: fetch up to 1000 rows, rank eligible addresses,
+and retain at most 500 distinct IPs. With the coordinator enabled, authenticated
+API refresh defaults to 20 minutes to leave quota for the shared coordinator;
+public JSON still refreshes every five minutes.
 
 The local neutral CONNECT + certificate-verified TLS reserve target is 16 distinct
 eligible IPs. Remote health is not counted as a locally ready replacement. Checks
