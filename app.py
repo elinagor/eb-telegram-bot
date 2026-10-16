@@ -1338,6 +1338,19 @@ def _connection_outage_snapshot():
         return elapsed, connection_alert_sent, (last_ebay_success_at is not None)
 
 
+def _claim_connection_outage_alert():
+    """Atomically check the current outage and reserve its single notification."""
+    global connection_alert_sent
+    with connection_state_lock:
+        reference = last_ebay_success_at if last_ebay_success_at is not None else connection_watch_started_at
+        elapsed = max(0.0, time.monotonic() - reference)
+        if is_paused or connection_alert_sent or elapsed < CONNECTION_ALERT_AFTER:
+            return None
+        connection_alert_sent = True
+        state = (connection_watch_started_at, last_ebay_success_at)
+        return elapsed, last_ebay_success_at is not None, state
+
+
 # ============ ПРОФИЛИ БРАУЗЕРОВ ============
 # По свежему UK-логу именно Chrome150 дал HTTP 200 на IP, где Firefox147
 # перед этим получил 403. Поэтому Chrome150 используем как основной профиль.
@@ -7304,42 +7317,37 @@ def connection_watchdog():
     )
     while True:
         try:
-            if not is_paused:
-                elapsed, already_sent, had_success = _connection_outage_snapshot()
-                if elapsed >= CONNECTION_ALERT_AFTER and not already_sent:
-                    # Ставим флаг ДО Telegram-запроса, чтобы два прохода watchdog
-                    # никогда не отправили дубль. Если Telegram не принял сообщение,
-                    # флаг вернём назад и попробуем снова на следующем проходе.
-                    should_send = False
-                    with connection_state_lock:
-                        if not connection_alert_sent:
-                            connection_alert_sent = True
-                            should_send = True
-                    if not should_send:
-                        time.sleep(CONNECTION_WATCHDOG_INTERVAL)
-                        continue
+            claim = _claim_connection_outage_alert()
+            if claim is not None:
+                elapsed, had_success, claimed_state = claim
+                minutes = max(10, int(elapsed // 60))
+                if had_success:
+                    status_line = f"⏱ Уже <b>{minutes} мин.</b> нет успешного подключения к eBay UK."
+                else:
+                    status_line = f"⏱ Уже <b>{minutes} мин.</b> после запуска нет успешного подключения к eBay UK."
 
-                    minutes = max(10, int(elapsed // 60))
-                    if had_success:
-                        status_line = f"⏱ Уже <b>{minutes} мин.</b> нет успешного подключения к eBay UK."
-                    else:
-                        status_line = f"⏱ Уже <b>{minutes} мин.</b> после запуска нет успешного подключения к eBay UK."
-
-                    message = (
-                        "⚠️ <b>eBay UK — проверьте подключение</b> 🇬🇧\n\n"
-                        f"{status_line}\n"
-                        "🤖 Бот продолжает работать и автоматически искать рабочий proxy.\n\n"
-                        "👉 <b>Пожалуйста, проверьте сайт/подключение вручную.</b>\n\n"
-                        "Следующее такое предупреждение будет отправлено только если связь "
-                        "сначала восстановится, а затем снова пропадёт более чем на 10 минут."
-                    )
-                    if send_telegram_message(message):
+                message = (
+                    "⚠️ <b>eBay UK — проверьте подключение</b> 🇬🇧\n\n"
+                    f"{status_line}\n"
+                    "🤖 Бот продолжает работать и автоматически искать рабочий proxy.\n\n"
+                    "👉 <b>Пожалуйста, проверьте сайт/подключение вручную.</b>\n\n"
+                    f'🔗 <a href="{html_lib.escape(EBAY_SEARCH_URL, quote=True)}">Открыть проверяемый поиск eBay UK</a>\n\n'
+                    "Следующее такое предупреждение будет отправлено только если связь "
+                    "сначала восстановится, а затем снова пропадёт более чем на 10 минут."
+                )
+                sent = False
+                try:
+                    sent = send_telegram_message(message, disable_preview=True)
+                    if sent:
                         logging.warning(
                             f"📨 Отправлено Telegram-предупреждение: eBay недоступен {elapsed:.0f} сек."
                         )
-                    else:
+                finally:
+                    if not sent:
                         with connection_state_lock:
-                            connection_alert_sent = False
+                            current_state = (connection_watch_started_at, last_ebay_success_at)
+                            if current_state == claimed_state:
+                                connection_alert_sent = False
             time.sleep(CONNECTION_WATCHDOG_INTERVAL)
         except Exception as e:
             logging.error(f"Ошибка connection watchdog: {e}", exc_info=True)
