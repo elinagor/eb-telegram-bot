@@ -14,6 +14,11 @@ import requests
 
 
 class CoordinatorFeed:
+    # Background metadata only: leave room for a slow hosted worker/DB response.
+    # Discovery consumes snapshots and never waits for these bounded requests.
+    REQUEST_TIMEOUT = (2.0, 5.0)
+    REQUEST_DEADLINE = 7.0
+
     RESULT_MAP = {
         'success': 'success', 'blocked': 'blocked', 'rate_limited': 'blocked',
         'proxy_timeout': 'timeout', 'proxy_rejected': 'rejected',
@@ -109,12 +114,12 @@ class CoordinatorFeed:
             return self.snapshot()
         response = None
         try:
-            deadline = time.monotonic() + 4.0
+            deadline = time.monotonic() + self.REQUEST_DEADLINE
             response = self.transport.get(
                 self.base_url + '/api/v1/proxies',
                 params={'market': 'uk', 'limit': self.limit},
                 headers={'Authorization': 'Bearer ' + self.token},
-                timeout=(1.5, 2.5), stream=True, allow_redirects=False,
+                timeout=self.REQUEST_TIMEOUT, stream=True, allow_redirects=False,
             )
             if response.status_code != 200:
                 raise RuntimeError('HTTP %d' % response.status_code)
@@ -171,9 +176,11 @@ class CoordinatorFeed:
                     self.ids.move_to_end(uri)
                 while len(self.ids) > 1000:
                     self.ids.popitem(last=False)
-            logging.info('Coordinator UK snapshot: public=%d strong=%d; legacy fallback stays active',
-                         len(rows), sum(row[2] for row in rows))
-            self.flush_feedback()
+            logging.info('Coordinator UK snapshot: public=%d strong=%d received=%d unique_ips=%d; legacy fallback stays active',
+                         len(rows), sum(row[2] for row in rows), len(source_rows),
+                         len({urlsplit(row[0]).hostname for row in rows}))
+            # The metadata worker flushes feedback AFTER applying this snapshot to
+            # ProxyManager. A slow report acknowledgement must not delay new candidates.
         except Exception as error:
             now = self.clock()
             with self.state_lock:
@@ -235,12 +242,12 @@ class CoordinatorFeed:
                 reports.extend(events)
         response = None
         try:
-            deadline = time.monotonic() + 3.0
+            deadline = time.monotonic() + self.REQUEST_DEADLINE
             response = self.transport.post(
                 self.base_url + '/api/v1/report',
                 headers={'Authorization': 'Bearer ' + self.token},
                 json={'market': 'uk', 'reports': reports},
-                timeout=(1.0, 2.0), stream=True, allow_redirects=False,
+                timeout=self.REQUEST_TIMEOUT, stream=True, allow_redirects=False,
             )
             if response.status_code != 200:
                 raise RuntimeError('feedback HTTP')
