@@ -1,5 +1,6 @@
 """Offline private-reserve regressions; no production credentials or network."""
 import os
+import runpy
 import stat
 from concurrent.futures import Future, ThreadPoolExecutor
 from unittest.mock import Mock
@@ -41,6 +42,25 @@ def reserve_factory(monkeypatch):
                                         ('invalid', (30, 45)), (None, (30, 45))])
 def test_requested_normal_cadence(raw, expected):
     assert normal_check_delay_bounds(raw) == expected
+
+
+@pytest.mark.parametrize('raw_url', [
+    'https://www.ebay.co.uk/sch/34017/i.html?_nkw=test+kit&_sop=10&LH_PrefLoc=1',
+    'https://www.ebay.co.uk/sch/i.html?_nkw=test&_ipg=240&_sop=1&LH_PrefLoc=2&LH_PrefLoc=3',
+    'https://www.ebay.co.uk/sch/i.html?_nkw=test&LH_PrefLoc=1&_ipg=60&_sop=10',
+])
+def test_scanner_reserve_uses_normalized_search_url(scanner, monkeypatch, raw_url):
+    # Exercise real scanner initialization with a captured transport constructor;
+    # malformed/missing pagination must not give the reserve a different search.
+    constructor = Mock()
+    monkeypatch.setattr('private_reserve.PrivateReserve', constructor)
+    monkeypatch.setenv('EBAY_SEARCH_URL', raw_url)
+    initialized = runpy.run_path(
+        scanner.__file__, run_name='uk_reserve_normalization_test',
+    )
+    expected = scanner.normalize_ebay_search_url(raw_url)
+    constructor.assert_called_once_with(search_url=expected)
+    assert initialized['EBAY_SEARCH_URL'] == expected
 
 
 def test_normal_healthy_sleep_does_not_unlock_reserve(reserve_factory):
