@@ -45,8 +45,6 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 # Успешные и parse-only проверки: пауза всегда в безопасном диапазоне 30–45 сек.
 CHECK_INTERVAL, CHECK_INTERVAL_MAX = normal_check_delay_bounds(os.getenv("CHECK_INTERVAL", "30"))
-# Isolated UK-only emergency transport. No endpoint or credentials enter shared pools.
-private_reserve = PrivateReserve(search_url=EBAY_SEARCH_URL or '')
 DATABASE_URL = os.getenv("DATABASE_URL")
 PROXY_LIST_URL = os.getenv("PROXY_LIST")
 # ProxyScrape обновляет бесплатный список примерно раз в минуту.
@@ -890,6 +888,8 @@ def normalize_ebay_search_url(raw_url):
 
 
 EBAY_SEARCH_URL = normalize_ebay_search_url(EBAY_SEARCH_URL)
+# Isolated UK-only emergency transport. No endpoint or credentials enter shared pools.
+private_reserve = PrivateReserve(search_url=EBAY_SEARCH_URL or '')
 
 if not all([EBAY_SEARCH_URL, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DATABASE_URL]):
     logging.error("Не хватает переменных окружения.")
