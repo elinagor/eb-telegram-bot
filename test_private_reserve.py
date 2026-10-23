@@ -3,6 +3,7 @@ import os
 import runpy
 import stat
 from concurrent.futures import Future, ThreadPoolExecutor
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -181,7 +182,7 @@ def test_failure_cooldowns(reserve_factory, monkeypatch, result, seconds):
 
 def test_verified_mtls_options_exact_target_no_redirects_and_close(reserve_factory):
     import certifi
-    from curl_cffi.const import CurlOpt
+    from curl_cffi.const import CurlInfo, CurlOpt
     response = Mock(status_code=200, text='valid', url=SEARCH)
     session = Mock()
     session.get.return_value = response
@@ -192,6 +193,7 @@ def test_verified_mtls_options_exact_target_no_redirects_and_close(reserve_facto
     assert kwargs['verify'] is True and kwargs['trust_env'] is False
     assert kwargs['allow_redirects'] is False
     assert kwargs['proxy'] == ENDPOINT
+    assert kwargs['curl_infos'] == [CurlInfo.HTTP_CONNECTCODE]
     options = kwargs['curl_options']
     assert options[CurlOpt.CAINFO] == certifi.where()
     assert options[CurlOpt.CAINFO] != options[CurlOpt.PROXY_CAINFO]
@@ -256,6 +258,118 @@ def test_transport_failures_return_only_safe_classifications(reserve_factory, ca
     reserve = reserve_factory(session_factory=Mock(return_value=session))
     assert reserve._request_once({'impersonate': 'chrome'}, lambda *args: 'success') == (result, None)
     assert ENDPOINT not in caplog.text and 'secret URL' not in caplog.text
+    session.close.assert_called_once()
+
+
+@pytest.mark.parametrize('peer,expected', [
+    ('192.0.2.19', 'true'), ('192.0.2.20', 'false'), ('private-invalid-peer', 'unknown'),
+])
+def test_vps_route_diagnostic_is_sanitized(reserve_factory, caplog, peer, expected):
+    from curl_cffi.const import CurlInfo
+    endpoint = ENDPOINT.replace('reserve.example', '192.0.2.19')
+    private_marker = 'DO-NOT-LOG-private-value'
+    body = '<title>Access Denied ' + private_marker + '</title><p>' + endpoint + '</p>'
+
+    class Response:
+        status_code = 403
+        url = SEARCH
+        text = body
+        content = body.encode()
+        primary_ip = peer
+        infos = {CurlInfo.HTTP_CONNECTCODE: 200}
+        close = Mock()
+
+        @property
+        def headers(self):
+            raise AssertionError('Diagnostic must not inspect private headers ' + private_marker)
+
+        @property
+        def cookies(self):
+            raise AssertionError('Diagnostic must not inspect private cookies ' + private_marker)
+
+    response = Response()
+    session = Mock()
+    session.get.return_value = response
+    reserve = reserve_factory(environ={'UK_RESERVE_URL': endpoint},
+                              session_factory=Mock(return_value=session))
+    with caplog.at_level('INFO'):
+        assert reserve._request_once({'impersonate': 'chrome'}, lambda *args: 'blocked') == ('blocked', None)
+    message = caplog.records[-1].getMessage()
+    assert 'source=VPS connect_http=200 origin_http=403' in message
+    assert 'peer_matches_config=' + expected in message
+    assert 'bytes=' + str(len(body.encode())) in message
+    assert 'title_class=access_denied body_class=challenge result=blocked duration_ms=' in message
+    assert all(secret not in caplog.text for secret in (endpoint, peer, private_marker, body, '192.0.2.19'))
+    response.close.assert_called_once()
+    session.close.assert_called_once()
+
+
+@pytest.mark.parametrize('body,result,title_class,body_class', [
+    ('<title>Items | eBay</title><div class="s-card">/itm/123</div>', 'success', 'ebay', 'search'),
+    ('<title>Pardon Our Interruption</title>', 'blocked', 'challenge', 'challenge'),
+    ('<title>private arbitrary title</title>', 'http_error', 'other', 'other'),
+    ('', 'http_error', 'empty', 'empty'),
+])
+def test_diagnostic_page_classes_are_fixed_enums(reserve_factory, caplog, body, result, title_class, body_class):
+    reserve = reserve_factory()
+    response = SimpleNamespace(status_code=200, infos={}, content=body.encode(), primary_ip='')
+    with caplog.at_level('INFO'):
+        reserve._log_diagnostic(response, body, result, 0)
+    assert 'title_class=' + title_class in caplog.text
+    assert 'body_class=' + body_class in caplog.text
+    assert 'private arbitrary title' not in caplog.text
+    duration_ms = int(caplog.records[-1].getMessage().rsplit('duration_ms=', 1)[1])
+    assert 0 <= duration_ms <= 3_600_000
+
+
+def test_diagnostic_reads_connect_code_from_exception_without_logging_exception(reserve_factory, caplog):
+    from curl_cffi.const import CurlInfo
+    error = RuntimeError('CONNECT failed private error ' + ENDPOINT)
+    error.response = SimpleNamespace(status_code=0, infos={CurlInfo.HTTP_CONNECTCODE: 407},
+                                     content=b'', primary_ip='private-invalid-peer')
+    session = Mock()
+    session.get.side_effect = error
+    reserve = reserve_factory(session_factory=Mock(return_value=session))
+    with caplog.at_level('INFO'):
+        assert reserve._request_once({'impersonate': 'chrome'}, lambda *args: 'success') == ('proxy_error', None)
+    assert 'connect_http=407 origin_http=0' in caplog.text
+    assert 'title_class=empty body_class=empty' in caplog.text
+    assert 'private error' not in caplog.text and ENDPOINT not in caplog.text
+    session.close.assert_called_once()
+
+
+def test_hostile_diagnostic_values_cannot_be_stringified_or_logged(reserve_factory, caplog):
+    from curl_cffi.const import CurlInfo
+
+    class Hostile:
+        def __str__(self):
+            raise AssertionError('private stringification')
+
+        def __eq__(self, other):
+            raise AssertionError('private comparison')
+
+    reserve = reserve_factory()
+    response = SimpleNamespace(status_code=Hostile(), infos={CurlInfo.HTTP_CONNECTCODE: Hostile()},
+                               content=Hostile(), primary_ip=Hostile())
+    with caplog.at_level('INFO'):
+        reserve._log_diagnostic(response, Hostile(), Hostile(), 0)
+    assert 'connect_http=0 origin_http=0 peer_matches_config=unknown bytes=0' in caplog.text
+    assert 'title_class=empty body_class=empty result=proxy_error' in caplog.text
+    assert 'private' not in caplog.records[-1].getMessage()
+
+
+@pytest.mark.parametrize('failure', ['getter', 'logger'])
+def test_diagnostic_failure_never_changes_success_or_cleanup(reserve_factory, monkeypatch, failure):
+    response = Mock(status_code=200, text='valid', url=SEARCH)
+    if failure == 'getter':
+        type(response).infos = property(lambda self: (_ for _ in ()).throw(RuntimeError('private getter')))
+    else:
+        monkeypatch.setattr('private_reserve.logging.info', Mock(side_effect=RuntimeError('private logger')))
+    session = Mock()
+    session.get.return_value = response
+    reserve = reserve_factory(session_factory=Mock(return_value=session))
+    assert reserve._request_once({'impersonate': 'chrome'}, lambda *args: 'success') == ('success', 'valid')
+    response.close.assert_called_once()
     session.close.assert_called_once()
 
 
