@@ -160,6 +160,7 @@ def test_failure_cooldowns(reserve_factory, monkeypatch, result, seconds):
 
 
 def test_verified_mtls_options_exact_target_no_redirects_and_close(reserve_factory):
+    import certifi
     from curl_cffi.const import CurlOpt
     response = Mock(status_code=200, text='valid', url=SEARCH)
     session = Mock()
@@ -172,6 +173,8 @@ def test_verified_mtls_options_exact_target_no_redirects_and_close(reserve_facto
     assert kwargs['allow_redirects'] is False
     assert kwargs['proxy'] == ENDPOINT
     options = kwargs['curl_options']
+    assert options[CurlOpt.CAINFO] == certifi.where()
+    assert options[CurlOpt.CAINFO] != options[CurlOpt.PROXY_CAINFO]
     assert options[CurlOpt.PROXY_SSL_VERIFYPEER] == 1
     assert options[CurlOpt.PROXY_SSL_VERIFYHOST] == 2
     assert set((CurlOpt.PROXY_CAINFO, CurlOpt.PROXY_SSLCERT, CurlOpt.PROXY_SSLKEY)) <= options.keys()
@@ -188,6 +191,39 @@ def test_verified_mtls_options_exact_target_no_redirects_and_close(reserve_facto
     directory = reserve._directory.name
     reserve.close()
     assert not os.path.exists(directory)
+
+
+def test_curl_default_ca_initialization_preserves_separate_proxy_trust(reserve_factory, monkeypatch):
+    import certifi
+    from curl_cffi import Curl, CurlOpt
+
+    reserve = reserve_factory()
+    # Exercise the real curl_cffi pre-perform CA initialization without making
+    # any connection. It must keep system origin trust and private proxy trust
+    # separate, including when curl initializes its own default CA bundle.
+    curl = Curl()
+    try:
+        actual_setopt = curl.setopt
+        configured = {}
+        calls = []
+
+        def observed_setopt(option, value):
+            configured[option] = value
+            calls.append(option)
+            return actual_setopt(option, value)
+
+        monkeypatch.setattr(curl, 'setopt', observed_setopt)
+        for option, value in reserve._curl_options.items():
+            curl.setopt(option, value)
+        curl._ensure_cacert()
+        assert configured[CurlOpt.PROXY_CAINFO] == reserve._curl_options[CurlOpt.PROXY_CAINFO]
+        assert configured[CurlOpt.CAINFO] == certifi.where()
+        assert configured[CurlOpt.CAINFO] != configured[CurlOpt.PROXY_CAINFO]
+        assert calls.count(CurlOpt.PROXY_CAINFO) == 1
+        assert configured[CurlOpt.PROXY_SSL_VERIFYPEER] == 1
+        assert configured[CurlOpt.PROXY_SSL_VERIFYHOST] == 2
+    finally:
+        curl.close()
 
 
 @pytest.mark.parametrize('message,result', [('certificate rejected secret URL', 'proxy_ssl'),
