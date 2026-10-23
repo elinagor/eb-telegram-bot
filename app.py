@@ -23,6 +23,7 @@ from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode, quote
 from bs4 import BeautifulSoup, Tag, SoupStrainer
 from coordinator_feed import CoordinatorFeed
 from proxy_runtime import PipelineMetrics, ProbeLimiter, finite_number
+from private_reserve import PrivateReserve, RESERVE_ID, normal_check_delay_bounds
 from flask import Flask
 from dotenv import load_dotenv
 import psycopg2
@@ -42,11 +43,10 @@ load_dotenv()
 EBAY_SEARCH_URL = os.getenv("EBAY_SEARCH_URL")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-# Успешные проверки: нижняя граница берётся из Render.
-# При CHECK_INTERVAL=15 фактическая пауза будет 15-27 сек.
-# Ниже 15 сек. код не позволяет опускаться: это новый безопасный нижний предел,
-# а случайный jitter +12 сек. сохраняет непостоянный ритм запросов к eBay.
-CHECK_INTERVAL = max(15, int(os.getenv("CHECK_INTERVAL", "40")))
+# Успешные и parse-only проверки: пауза всегда в безопасном диапазоне 30–45 сек.
+CHECK_INTERVAL, CHECK_INTERVAL_MAX = normal_check_delay_bounds(os.getenv("CHECK_INTERVAL", "30"))
+# Isolated UK-only emergency transport. No endpoint or credentials enter shared pools.
+private_reserve = PrivateReserve(search_url=EBAY_SEARCH_URL or '')
 DATABASE_URL = os.getenv("DATABASE_URL")
 PROXY_LIST_URL = os.getenv("PROXY_LIST")
 # ProxyScrape обновляет бесплатный список примерно раз в минуту.
@@ -1299,6 +1299,7 @@ def record_ebay_success():
     """Фиксирует успешный HTTP 200 с валидной выдачей и сбрасывает outage alert."""
     global last_ebay_success_at, connection_alert_sent
     now = time.monotonic()
+    private_reserve.note_success()
     with connection_state_lock:
         previous_success_at = last_ebay_success_at
         first_success = previous_success_at is None
@@ -1324,6 +1325,7 @@ def record_ebay_success():
 def reset_connection_watch_after_manual_resume():
     """После /start даём новые 10 минут, чтобы ручная пауза не считалась аварией."""
     global connection_watch_started_at, last_ebay_success_at, connection_alert_sent
+    private_reserve.note_success()
     with connection_state_lock:
         connection_watch_started_at = time.monotonic()
         last_ebay_success_at = None
@@ -11657,6 +11659,22 @@ def _quality_https_preflight_proxy(proxy):
                 pass
 
 
+def _classify_private_reserve_response(response, body):
+    """Reuse normal eBay validation without sharing endpoint/provider accounting."""
+    if response.status_code == 403:
+        return 'blocked'
+    if response.status_code == 429:
+        return 'rate_limited'
+    if response.status_code == 407:
+        return 'proxy_auth'
+    if response.status_code != 200:
+        return 'http_error'
+    blocked, _reason = _is_ebay_block_page(response, body)
+    if blocked:
+        return 'blocked'
+    return 'success' if _looks_like_search_results(body) else 'http_error'
+
+
 def _probe_proxy(proxy, profile, timeout):
     """Одна discovery-проверка: быстрый TCP preflight -> только затем eBay."""
     ok, preflight_result = _tcp_preflight_proxy(proxy, force=False)
@@ -11673,6 +11691,15 @@ def _probe_proxy(proxy, profile, timeout):
 
 def _cleanup_late_probe_future(future, proxy):
     """Закрывает/учитывает probe, который уже был в полёте, когда другой proxy победил."""
+    if proxy == RESERVE_ID:
+        # The isolated request closes its own response/session and accounts only its
+        # private duty budget. A late result must never enter public reputation.
+        if not future.cancelled():
+            try:
+                future.result()
+            except Exception:
+                pass
+        return
     if future.cancelled():
         return
     try:
@@ -11986,6 +12013,9 @@ def fetch_ebay_html_with_fixed_pair():
             _queue_restart_sticky_persist(old_proxy, force=False)
             return html
 
+        # Count active failures, never the normal 30–45-second successful-check sleep.
+        private_reserve.note_failure(fixed_attempt_started)
+
         # Частая реальная ситуация: умерло только старое TCP/TLS соединение Session,
         # а сам proxy всё ещё жив. Быстрый reset получает ОДИН шанс с новой Session.
         # Но если первая попытка уже висела >= FIXED_RECOVERY_SKIP_AFTER, второй 12-секундный
@@ -12073,6 +12103,8 @@ def fetch_ebay_html_with_fixed_pair():
             )
 
         logging.info("Ищем новую рабочую пару...")
+
+    private_reserve.note_failure()
 
     # 2) Rolling discovery V6.19: warm reserve -> обычные 4 worker -> 5 после 10 сек.;
     # максимум 6 при нормальном RSS; emergency/deep tiers по-прежнему расширяют сам пул.
@@ -12182,6 +12214,7 @@ def fetch_ebay_html_with_fixed_pair():
     last_concurrency_logged = None
     premium_backup_unlock_logged = False
     premium_forced_backup_used = False
+    private_reserve_used = False
 
     def desired_concurrency():
         nonlocal last_concurrency_logged
@@ -12329,7 +12362,7 @@ def fetch_ebay_html_with_fixed_pair():
 
     def submit_more():
         """Поддерживает rolling in-flight probe и один безопасный последний re-probe."""
-        nonlocal attempts, refreshed_after_exhaustion, final_reprobe_used, premium_backup_unlock_logged, premium_forced_backup_used
+        nonlocal attempts, refreshed_after_exhaustion, final_reprobe_used, premium_backup_unlock_logged, premium_forced_backup_used, private_reserve_used
 
         elapsed_now = time.monotonic() - started
         if elapsed_now >= SEARCH_TIME_BUDGET:
@@ -12339,6 +12372,20 @@ def fetch_ebay_html_with_fixed_pair():
         free_slots = max(0, min(desired - len(future_to_proxy), desired - probe_limiter.count()))
         if free_slots <= 0:
             return True
+
+        reserve_submitted = False
+        if not private_reserve_used:
+            reserve_future = private_reserve.submit(
+                executor, probe_limiter, profile, _classify_private_reserve_response,
+            )
+            if reserve_future is not None:
+                private_reserve_used = True
+                reserve_submitted = True
+                future_to_proxy[reserve_future] = RESERVE_ID
+                free_slots -= 1
+                logging.info('UK reserve: one emergency request admitted; other sources stay active')
+                if free_slots <= 0:
+                    return True
 
         # В длинном цикле сначала подмешиваем свежий быстрый 1500-ms snapshot: новый
         # рабочий endpoint может появиться уже после старта discovery. Emergency pool
@@ -12679,9 +12726,9 @@ def fetch_ebay_html_with_fixed_pair():
                 logging.info(f"♻️ Финальный known-good re-probe поверх обычного лимита: {_proxy_log_name(final_proxy)}")
 
         if not batch:
-            return False
+            return reserve_submitted
 
-        submitted = 0
+        submitted = 1 if reserve_submitted else 0
         for proxy in batch:
             is_final_extra = batch_kinds.get(proxy) == 'Final known-good re-probe'
             if not is_final_extra and attempts >= MAX_SEARCH_ATTEMPTS:
@@ -12768,10 +12815,20 @@ def fetch_ebay_html_with_fixed_pair():
                 continue
 
             winner = None
+            private_winner_html = None
             completed_results = []
             for future in done:
                 proxy = future_to_proxy.pop(future, None)
                 if proxy is None:
+                    continue
+                if proxy == RESERVE_ID:
+                    try:
+                        private_result, private_html, _unused = future.result()
+                    except Exception:
+                        private_result, private_html = 'proxy_error', None
+                    logging.info('UK reserve: one-shot result=%s', private_result)
+                    if private_result == 'success':
+                        private_winner_html = private_html
                     continue
                 try:
                     result, html, session = future.result()
@@ -12839,6 +12896,22 @@ def fetch_ebay_html_with_fixed_pair():
                     f"проверено {attempts} proxy за {discovery_elapsed:.1f} сек."
                 )
                 return winner_html
+
+            if private_winner_html is not None:
+                for future, proxy in list(future_to_proxy.items()):
+                    if future.done():
+                        _cleanup_late_probe_future(future, proxy)
+                    elif not future.cancel():
+                        future.add_done_callback(
+                            lambda f, p=proxy: _cleanup_late_probe_future(f, p)
+                        )
+                future_to_proxy.clear()
+                executor.shutdown(wait=False, cancel_futures=True)
+                # One-shot HTML only: no fixed session, public pool, sticky record,
+                # auction reuse, coordinator feedback or managed-source accounting.
+                record_ebay_success()
+                logging.info('UK reserve: valid search received; returning to normal sources next cycle')
+                return private_winner_html
 
             if completed_results:
                 time.sleep(_discovery_replacement_pause(completed_results))
@@ -13876,6 +13949,8 @@ def proxy_preflight_warm_worker():
 def bot_worker():
     global is_paused
     logging.info("🤖 Бот-воркер запущен")
+    logging.info('UK reserve: configured=%s enabled=%s; isolated emergency-only duty budget',
+                 private_reserve.configured, private_reserve.enabled)
     db_ready_event.wait()
     while True:
         try:
@@ -13923,12 +13998,12 @@ def bot_worker():
         try:
             result = check_and_send_new_items()
             if result == 'ok':
-                wait = random.uniform(CHECK_INTERVAL, CHECK_INTERVAL + 12)
+                wait = random.uniform(CHECK_INTERVAL, CHECK_INTERVAL_MAX)
                 logging.info(f"✅ Успешная проверка. Следующая через {wait:.0f} секунд.")
             elif result == 'parse_error':
                 # Сеть/eBay были доступны, проблема только в DOM-разметке. Нельзя
                 # ошибочно объявлять рабочий proxy плохим и запускать частый discovery.
-                wait = random.uniform(CHECK_INTERVAL, CHECK_INTERVAL + 12)
+                wait = random.uniform(CHECK_INTERVAL, CHECK_INTERVAL_MAX)
                 logging.warning(
                     f"⚠️ eBay доступен, но разметка не распознана. "
                     f"Повтор обычной проверки через {wait:.0f} секунд без смены proxy."
