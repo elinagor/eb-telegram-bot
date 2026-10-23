@@ -4,7 +4,11 @@ Configuration is private environment state. Neither exception text nor connectio
 details leave this module. PEM files are private, temporary, and never enter Git.
 """
 import atexit
+import html
+import ipaddress
+import logging
 import os
+import re
 import ssl
 import tempfile
 import threading
@@ -216,7 +220,11 @@ class PrivateReserve:
 
     def _request_once(self, profile, classify):
         session = response = None
+        diagnostic_response = None
+        result, body = 'proxy_error', None
+        started = time.monotonic()
         try:
+            from curl_cffi.const import CurlInfo
             factory = self._session_factory
             if factory is None:
                 from curl_cffi import requests as cffi_requests
@@ -226,22 +234,93 @@ class PrivateReserve:
                 impersonate=profile['impersonate'], verify=True, trust_env=False,
                 allow_redirects=False, timeout=(5.0, 12.0),
                 curl_options=dict(self._curl_options),
+                curl_infos=[CurlInfo.HTTP_CONNECTCODE],
             )
             response = session.get(self._search_url, timeout=(5.0, 12.0),
                                    allow_redirects=False)
+            diagnostic_response = response
             if getattr(response, 'url', '') and not _safe_search_url(str(response.url)):
-                return 'http_error', None
+                result = 'http_error'
+                return result, None
             body = response.text or ''
             result = classify(response, body)
             if result not in ('success', 'blocked', 'rate_limited', 'proxy_auth', 'http_error'):
                 result = 'http_error'
             return result, body if result == 'success' else None
         except Exception as exc:
-            return _transport_result(exc), None
+            result = _transport_result(exc)
+            try:
+                error_response = getattr(exc, 'response', None)
+                if error_response is not None:
+                    diagnostic_response = error_response
+            except Exception:
+                pass
+            return result, None
         finally:
+            self._log_diagnostic(diagnostic_response, body, result, started)
             for obj in (response, session):
                 if obj is not None:
                     try:
                         obj.close()
                     except Exception:
                         pass
+
+    def _log_diagnostic(self, response, body, result, started):
+        """Log only bounded numbers and fixed enums; observation cannot fail a request."""
+        try:
+            from curl_cffi.const import CurlInfo
+
+            def status(value):
+                return value if type(value) is int and 0 <= value <= 599 else 0
+
+            safe_result = result if type(result) is str and result in (
+                'success', 'blocked', 'rate_limited', 'proxy_auth',
+                'proxy_ssl', 'proxy_timeout', 'proxy_error', 'http_error',
+            ) else 'proxy_error'
+            origin_http = status(getattr(response, 'status_code', 0))
+            infos = getattr(response, 'infos', None)
+            connect_http = status(infos.get(CurlInfo.HTTP_CONNECTCODE, 0)) if type(infos) is dict else 0
+            content = getattr(response, 'content', None)
+            byte_count = min(len(content), 1_000_000_000) if type(content) in (bytes, bytearray) else 0
+
+            peer_match = 'unknown'
+            peer = getattr(response, 'primary_ip', None)
+            if type(peer) is str:
+                try:
+                    expected = ipaddress.ip_address(urlsplit(self._endpoint).hostname or '')
+                    actual = ipaddress.ip_address(peer)
+                    peer_match = 'true' if expected == actual else 'false'
+                except ValueError:
+                    pass
+
+            sample = body[:65536] if type(body) is str else ''
+            match = re.search(r'<title\b[^>]*>(.*?)</title\s*>', sample[:16384], re.I | re.S)
+            title = html.unescape(match.group(1)).lower() if match else ''
+            if 'pardon our interruption' in title:
+                title_class = 'challenge'
+            elif 'access denied' in title:
+                title_class = 'access_denied'
+            elif 'ebay' in title:
+                title_class = 'ebay'
+            else:
+                title_class = 'other' if title else 'empty'
+            low = sample.lower()
+            if safe_result == 'success':
+                body_class = 'search'
+            elif ('pardon our interruption' in low
+                  or 'something about your browser made us think you were a bot' in low
+                  or title_class == 'access_denied'):
+                body_class = 'challenge'
+            else:
+                body_class = 'other' if sample else 'empty'
+            duration_ms = max(0, min(3_600_000, int((time.monotonic() - started) * 1000)))
+            logging.info(
+                'UK reserve: source=VPS connect_http=%d origin_http=%d '
+                'peer_matches_config=%s bytes=%d title_class=%s body_class=%s '
+                'result=%s duration_ms=%d',
+                connect_http, origin_http, peer_match, byte_count, title_class,
+                body_class, safe_result, duration_ms,
+            )
+        except Exception:
+            # Never log diagnostic errors: their text may contain private data.
+            pass
