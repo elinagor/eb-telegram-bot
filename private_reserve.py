@@ -100,6 +100,7 @@ class PrivateReserve:
         if not all(values) or not _safe_endpoint(values[0]) or not _safe_search_url(search_url):
             return
         try:
+            import certifi
             from curl_cffi.const import CurlOpt
             directory = tempfile.TemporaryDirectory(prefix='uk-reserve-')
             self._directory = directory
@@ -118,6 +119,9 @@ class PrivateReserve:
             validation.load_verify_locations(cafile=paths[0])
             validation.load_cert_chain(certfile=paths[1], keyfile=paths[2])
             self._curl_options = {
+                # curl_cffi initializes both CA options unless origin CAINFO is
+                # explicit. Preserve public origin trust and private proxy trust.
+                CurlOpt.CAINFO: certifi.where(),
                 CurlOpt.PROXY_CAINFO: paths[0],
                 CurlOpt.PROXY_SSLCERT: paths[1],
                 CurlOpt.PROXY_SSLKEY: paths[2],
