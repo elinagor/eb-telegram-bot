@@ -1718,42 +1718,71 @@ class ProviderManager:
         headers = {'Authorization': f'Token {key}'}
         params = {'mode': 'direct', 'valid': 'true', 'page': 1, 'page_size': 100}
         out = []
+        visited = set()
         try:
-            while url and len(out) < 500:
-                resp = requests.get(
-                    url, headers=headers, params=params if '?' not in url else None,
-                    timeout=PROVIDER_API_TIMEOUT,
-                )
-                if resp.status_code in (401, 403):
-                    logging.warning(f"Webshare#{idx} API: HTTP {resp.status_code}; account paused for 30 min")
-                    with self.lock:
-                        state['api_disabled_until'] = time.time() + 1800
-                        state['proxies'] = set()
-                        self._rebuild_webshare_snapshot_locked()
+            for _page in range(5):
+                # Provider pagination is untrusted: never forward its token to a
+                # different origin/path or let an empty/repeated page stall refresh.
+                parts = urlsplit(url)
+                if (parts.scheme != 'https' or parts.hostname != 'proxy.webshare.io'
+                        or parts.port not in (None, 443) or parts.username is not None
+                        or parts.password is not None or parts.fragment
+                        or parts.path != '/api/v2/proxy/list/'
+                        or any(c in url for c in '\r\n\x00') or url in visited):
+                    logging.warning(f"Webshare#{idx} API: invalid/repeated pagination; keep previous snapshot")
                     return None
-                if resp.status_code == 429:
-                    logging.warning(f"Webshare#{idx} API: HTTP 429; keep previous snapshot")
+                visited.add(url)
+                resp = None
+                try:
+                    resp = requests.get(
+                        url, headers=headers, params=params if '?' not in url else None,
+                        timeout=PROVIDER_API_TIMEOUT, allow_redirects=False,
+                    )
+                    if resp.status_code in (401, 403):
+                        logging.warning(f"Webshare#{idx} API: HTTP {resp.status_code}; account paused for 30 min")
+                        with self.lock:
+                            state['api_disabled_until'] = time.time() + 1800
+                            state['proxies'] = set()
+                            self._rebuild_webshare_snapshot_locked()
+                        return None
+                    if resp.status_code == 429:
+                        logging.warning(f"Webshare#{idx} API: HTTP 429; keep previous snapshot")
+                        return None
+                    if resp.status_code != 200:
+                        logging.warning(f"Webshare#{idx} API: HTTP {resp.status_code}; keep previous snapshot")
+                        return None
+                    data = resp.json()
+                    for row in data.get('results') or []:
+                        if row.get('valid') is not True:
+                            continue
+                        host = str(row.get('proxy_address') or '').strip()
+                        port = row.get('port')
+                        user = str(row.get('username') or '')
+                        password = str(row.get('password') or '')
+                        if host and port and user and password:
+                            out.append(
+                                f"http://{quote(user, safe='')}:{quote(password, safe='')}@{host}:{int(port)}"
+                            )
+                            if len(out) >= 500:
+                                break
+                    next_url = data.get('next')
+                finally:
+                    if resp is not None:
+                        try:
+                            resp.close()
+                        except Exception:
+                            pass
+                if next_url is None or next_url == '' or len(out) >= 500:
+                    return list(dict.fromkeys(out))
+                if not isinstance(next_url, str):
+                    logging.warning(f"Webshare#{idx} API: invalid pagination; keep previous snapshot")
                     return None
-                if resp.status_code != 200:
-                    logging.warning(f"Webshare#{idx} API: HTTP {resp.status_code}; keep previous snapshot")
-                    return None
-                data = resp.json()
-                for row in data.get('results') or []:
-                    if row.get('valid') is not True:
-                        continue
-                    host = str(row.get('proxy_address') or '').strip()
-                    port = row.get('port')
-                    user = str(row.get('username') or '')
-                    password = str(row.get('password') or '')
-                    if host and port and user and password:
-                        out.append(
-                            f"http://{quote(user, safe='')}:{quote(password, safe='')}@{host}:{int(port)}"
-                        )
-                url = data.get('next')
+                url = next_url
                 params = None
-            return list(dict.fromkeys(out))
+            logging.warning(f"Webshare#{idx} API: pagination limit reached; keep previous snapshot")
+            return None
         except Exception as e:
-            logging.warning(f"Webshare#{idx} API недоступен: {e}; keep previous snapshot")
+            logging.warning(f"Webshare#{idx} API unavailable ({type(e).__name__}); keep previous snapshot")
             return None
 
     def _refresh_webshare_usage(self, idx, state, force=False):
