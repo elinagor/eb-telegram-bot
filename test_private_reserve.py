@@ -474,6 +474,25 @@ def test_browser_fetch_failure_retains_existing_cooldown(fetch_factory, scanner,
     assert not reserve.in_flight
 
 
+@pytest.mark.parametrize('wait', ['1', '45', '120', '300'])
+def test_authenticated_gateway_spacing_does_not_cause_origin_rate_limit_cooldown(fetch_factory, scanner, wait):
+    reserve, _factory, session, response = fetch_factory(b'', 429, clock=lambda: 100.0)
+    response.headers = {'Retry-After': wait}
+    assert reserve._run_reserved({}, scanner._classify_private_reserve_response) == ('http_error', None, None)
+    assert reserve.cooldown_until == 100.0 + max(120, int(wait) + 1)
+    session.get.assert_not_called()
+    assert response.closed and not reserve.in_flight
+
+
+@pytest.mark.parametrize('wait', ['', '0', '301', '900', '1800', '-1', '1.5', '1\r\nX: bad', 'abc', None])
+def test_origin_or_invalid_retry_after_keeps_conservative_rate_limit(fetch_factory, scanner, wait):
+    reserve, _factory, _session, response = fetch_factory(b'', 429, clock=lambda: 100.0)
+    response.headers = {'Retry-After': wait}
+    assert reserve._run_reserved({}, scanner._classify_private_reserve_response) == ('rate_limited', None, None)
+    assert reserve.cooldown_until == 1900.0
+    assert response.closed and not reserve.in_flight
+
+
 @pytest.mark.parametrize('error,expected', [
     (RuntimeError('certificate failed ' + FETCH_CONFIG), 'proxy_ssl'),
     (RuntimeError('CONNECT 407 ' + FETCH_CONFIG), 'proxy_auth'),
