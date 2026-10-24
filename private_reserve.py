@@ -298,6 +298,18 @@ class PrivateReserve:
                 if response.status_code in (401, 407):
                     result = 'proxy_auth'
                     return result, None
+                if response.status_code == 429:
+                    # The authenticated gateway uses short Retry-After values for
+                    # its own spacing/rest gate; origin rate limits remain 1800s.
+                    try:
+                        wait = response.headers.get('Retry-After', '')
+                    except Exception:
+                        wait = ''
+                    if type(wait) is str and re.fullmatch(r'[0-9]{1,3}', wait) and 1 <= int(wait) <= 300:
+                        with self.lock:
+                            self.cooldown_until = max(self.cooldown_until, self.clock() + max(120, int(wait) + 1))
+                        result = 'http_error'
+                        return result, None
             else:
                 session = factory(
                     proxy=self._endpoint, headers={'Accept-Language': 'en-GB,en;q=0.9'},
