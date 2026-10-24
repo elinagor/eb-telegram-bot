@@ -8,7 +8,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from private_reserve import PrivateReserve, RESERVE_ID, normal_check_delay_bounds
+from private_reserve import PrivateReserve, RESERVE_ID, MAX_FETCH_BYTES, normal_check_delay_bounds
 from proxy_runtime import ProbeLimiter
 from test_coordinator_uk import scanner, forbid_unmocked_network
 
@@ -295,7 +295,7 @@ def test_vps_route_diagnostic_is_sanitized(reserve_factory, caplog, peer, expect
     with caplog.at_level('INFO'):
         assert reserve._request_once({'impersonate': 'chrome'}, lambda *args: 'blocked') == ('blocked', None)
     message = caplog.records[-1].getMessage()
-    assert 'source=VPS connect_http=200 origin_http=403' in message
+    assert 'source=VPS browser_fetch=false connect_http=200 origin_http=403' in message
     assert 'peer_matches_config=' + expected in message
     assert 'bytes=' + str(len(body.encode())) in message
     assert 'title_class=access_denied body_class=challenge result=blocked duration_ms=' in message
@@ -371,6 +371,216 @@ def test_diagnostic_failure_never_changes_success_or_cleanup(reserve_factory, mo
     assert reserve._request_once({'impersonate': 'chrome'}, lambda *args: 'success') == ('success', 'valid')
     response.close.assert_called_once()
     session.close.assert_called_once()
+
+
+FETCH_CONNECT = ENDPOINT.replace('reserve.example', '192.0.2.19')
+FETCH_CONFIG = FETCH_CONNECT.replace(':8443', ':28444') + '/v1/search'
+FETCH_TARGET = 'https://192.0.2.19:28444/v1/search'
+SEARCH_HTML = b'<title>Items | eBay</title><div class="s-card"><a href="/itm/123456789012">Kit</a></div>'
+
+
+class FetchResponse:
+    def __init__(self, status=200, url=FETCH_TARGET):
+        self.status_code = status
+        self.url = url
+        self.content = b''
+        self.primary_ip = '192.0.2.19'
+        self.infos = {}
+        self.closed = False
+
+    @property
+    def text(self):
+        return self.content.decode('utf-8', errors='replace')
+
+    def close(self):
+        self.closed = True
+
+
+@pytest.fixture
+def fetch_factory(reserve_factory):
+    def make(payload=SEARCH_HTML, status=200, response_url=FETCH_TARGET,
+             chunks=None, transport_error=None, **kwargs):
+        from curl_cffi.curl import CURL_WRITEFUNC_ERROR
+        response = FetchResponse(status, response_url)
+        session = Mock()
+
+        def post(*args, **options):
+            if transport_error is not None:
+                raise transport_error
+            for chunk in ([payload] if chunks is None else chunks):
+                if options['content_callback'](chunk) == CURL_WRITEFUNC_ERROR:
+                    error = RuntimeError('private transfer aborted ' + FETCH_CONFIG)
+                    error.response = response
+                    raise error
+            return response
+
+        session.post.side_effect = post
+        factory = Mock(return_value=session)
+        config = {'UK_RESERVE_URL': FETCH_CONNECT, 'UK_RESERVE_FETCH_URL': FETCH_CONFIG}
+        config.update(kwargs.pop('environ', {}))
+        reserve = reserve_factory(environ=config, session_factory=factory, **kwargs)
+        return reserve, factory, session, response
+    return make
+
+
+def test_browser_fetch_uses_direct_private_mtls_and_explicit_auth(fetch_factory, scanner, caplog):
+    from curl_cffi.const import CurlInfo, CurlOpt
+    reserve, factory, session, response = fetch_factory()
+    assert reserve.enabled and reserve.browser_fetch
+    with caplog.at_level('INFO'):
+        assert reserve._request_once({}, scanner._classify_private_reserve_response) == ('success', SEARCH_HTML.decode())
+    options = factory.call_args.kwargs
+    assert options['verify'] == reserve._ca_path
+    assert options['cert'] == reserve._client_cert
+    assert options['trust_env'] is False and options['allow_redirects'] is False
+    assert options['timeout'] == (5.0, 30.0)
+    assert 'proxy' not in options and 'proxies' not in options
+    assert options['curl_options'] == {CurlOpt.PROXY: ''}
+    assert options['curl_infos'] == [CurlInfo.HTTP_CONNECTCODE]
+    post = session.post.call_args
+    assert post.args == (FETCH_TARGET,)
+    assert post.kwargs['json'] == {'url': SEARCH}
+    assert post.kwargs['auth'] == ('offline-user', 'test-password-' * 4)
+    assert post.kwargs['allow_redirects'] is False and post.kwargs['timeout'] == (5.0, 30.0)
+    session.get.assert_not_called()
+    session.close.assert_called_once()
+    assert response.closed
+    assert 'source=VPS browser_fetch=true' in caplog.text
+    assert 'peer_matches_config=true' in caplog.text
+    assert all(secret not in caplog.text for secret in (FETCH_CONFIG, FETCH_TARGET, SEARCH, '192.0.2.19', 'test-password-'))
+
+
+@pytest.mark.parametrize('payload,status,expected', [
+    (b'<title>Home | eBay</title>', 200, 'http_error'),
+    (b'<title>Pardon Our Interruption</title>', 200, 'blocked'),
+    (b'', 403, 'blocked'), (b'', 429, 'rate_limited'),
+    (b'', 413, 'http_error'), (b'', 503, 'http_error'),
+    (b'', 401, 'proxy_auth'), (b'', 407, 'proxy_auth'), (b'', 302, 'http_error'),
+])
+def test_browser_fetch_rejects_failures_without_connect_fallback(fetch_factory, scanner, payload, status, expected):
+    reserve, _factory, session, response = fetch_factory(payload, status)
+    assert reserve._request_once({}, scanner._classify_private_reserve_response) == (expected, None)
+    session.post.assert_called_once()
+    session.get.assert_not_called()
+    session.close.assert_called_once()
+    assert response.closed
+
+
+@pytest.mark.parametrize('status,seconds', [(403, 900), (429, 1800), (401, 3600), (413, 120), (503, 120)])
+def test_browser_fetch_failure_retains_existing_cooldown(fetch_factory, scanner, status, seconds):
+    reserve, _factory, _session, _response = fetch_factory(b'', status, clock=lambda: 100.0)
+    assert reserve._run_reserved({}, scanner._classify_private_reserve_response)[1:] == (None, None)
+    assert reserve.cooldown_until == 100.0 + seconds
+    assert not reserve.in_flight
+
+
+@pytest.mark.parametrize('error,expected', [
+    (RuntimeError('certificate failed ' + FETCH_CONFIG), 'proxy_ssl'),
+    (RuntimeError('CONNECT 407 ' + FETCH_CONFIG), 'proxy_auth'),
+    (RuntimeError('curl: (28) timed out ' + FETCH_CONFIG), 'proxy_timeout'),
+])
+def test_browser_fetch_transport_errors_stay_private(fetch_factory, scanner, caplog, error, expected):
+    reserve, _factory, session, _response = fetch_factory(transport_error=error)
+    with caplog.at_level('INFO'):
+        assert reserve._request_once({}, scanner._classify_private_reserve_response) == (expected, None)
+    session.get.assert_not_called()
+    session.close.assert_called_once()
+    assert FETCH_CONFIG not in caplog.text and 'test-password-' not in caplog.text
+
+
+@pytest.mark.parametrize('url', [
+    FETCH_CONFIG.replace('https:', 'http:'),
+    FETCH_CONFIG.replace('192.0.2.19', '192.0.2.20'),
+    FETCH_CONFIG.replace('192.0.2.19', 'reserve.example'),
+    FETCH_CONFIG.replace(':28444', ''),
+    FETCH_CONFIG.replace(':28444', ':70000'),
+    FETCH_CONFIG.replace('/v1/search', '/v1/other'),
+    FETCH_CONFIG + '?url=private', FETCH_CONFIG + '#fragment',
+    FETCH_CONFIG.replace('offline-user', 'different-user'),
+    FETCH_CONFIG.replace('test-password-', 'other-password-'),
+    FETCH_TARGET, FETCH_CONFIG + '\r\nX-Injected: private',
+    FETCH_CONFIG + '\x00', ' ' + FETCH_CONFIG,
+])
+def test_browser_fetch_unsafe_config_fails_closed(reserve_factory, url, caplog):
+    factory = Mock()
+    reserve = reserve_factory(environ={'UK_RESERVE_URL': FETCH_CONNECT, 'UK_RESERVE_FETCH_URL': url},
+                              session_factory=factory)
+    assert reserve.configured and not reserve.enabled and reserve._directory is None
+    assert reserve._request_once({}, Mock()) == ('http_error', None)
+    factory.assert_not_called()
+    assert url not in caplog.text
+
+
+def test_browser_fetch_invalid_certificate_material_disables_optional_transport():
+    config = {'UK_RESERVE_URL': FETCH_CONNECT, 'UK_RESERVE_FETCH_URL': FETCH_CONFIG,
+              'UK_RESERVE_CA_PEM': 'invalid', 'UK_RESERVE_CLIENT_CERT_PEM': 'invalid',
+              'UK_RESERVE_CLIENT_KEY_PEM': 'invalid'}
+    reserve = PrivateReserve(config, SEARCH)
+    assert not reserve.enabled and reserve._directory is None
+
+
+def test_browser_fetch_checks_search_url_again_before_post(fetch_factory):
+    reserve, factory, _session, _response = fetch_factory()
+    reserve._search_url = 'https://external.example/private'
+    assert reserve._request_once({}, Mock()) == ('http_error', None)
+    factory.assert_not_called()
+
+
+def test_browser_fetch_rejects_unexpected_response_url(fetch_factory):
+    reserve, _factory, session, response = fetch_factory(response_url='https://external.example/private')
+    classify = Mock(return_value='success')
+    assert reserve._request_once({}, classify) == ('http_error', None)
+    classify.assert_not_called()
+    session.close.assert_called_once()
+    assert response.closed
+
+
+def test_browser_fetch_accepts_exactly_four_mib(fetch_factory, scanner):
+    payload = SEARCH_HTML + b' ' * (MAX_FETCH_BYTES - len(SEARCH_HTML))
+    reserve, _factory, session, response = fetch_factory(payload)
+    result, body = reserve._request_once({}, scanner._classify_private_reserve_response)
+    assert result == 'success' and len(body.encode()) == MAX_FETCH_BYTES
+    assert response.closed
+    session.close.assert_called_once()
+
+
+@pytest.mark.parametrize('chunks', [
+    [b'x' * (MAX_FETCH_BYTES + 1)],
+    [SEARCH_HTML, b' ' * (MAX_FETCH_BYTES - len(SEARCH_HTML)), b'!'],
+])
+def test_browser_fetch_aborts_oversize_before_classification(fetch_factory, chunks, caplog):
+    reserve, _factory, session, response = fetch_factory(chunks=chunks)
+    classify = Mock(return_value='success')
+    with caplog.at_level('INFO'):
+        assert reserve._request_once({}, classify) == ('http_error', None)
+    classify.assert_not_called()
+    session.get.assert_not_called()
+    session.close.assert_called_once()
+    assert response.closed
+    assert FETCH_CONFIG not in caplog.text and 'private transfer aborted' not in caplog.text
+
+
+def test_browser_fetch_reuses_existing_admission_budget(fetch_factory, scanner):
+    clock = [100.0]
+    reserve, _factory, session, _response = fetch_factory(clock=lambda: clock[0])
+    executor, limiter = PendingExecutor(), ProbeLimiter(maximum=1)
+    reserve.note_failure()
+    clock[0] = 124.99
+    assert reserve.submit(executor, limiter, {}, scanner._classify_private_reserve_response) is None
+    for now in (125.0, 170.0, 215.0):
+        clock[0] = now
+        future = reserve.submit(executor, limiter, {}, scanner._classify_private_reserve_response)
+        assert future is not None
+        executor.run()
+        assert future.result()[0] == 'success'
+        assert not reserve.in_flight and limiter.count() == 0
+        clock[0] += 44.99
+        assert reserve.submit(executor, limiter, {}, scanner._classify_private_reserve_response) is None
+    assert session.post.call_count == 3 and reserve.cooldown_until == 515.0
+    clock[0] = 514.99
+    assert not reserve.eligible()
+    clock[0] = 515.0
+    assert reserve.eligible()
 
 
 @pytest.mark.parametrize('target', ['http://www.ebay.co.uk/sch/i.html',
