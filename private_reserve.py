@@ -14,10 +14,11 @@ import tempfile
 import threading
 import time
 from collections import deque
-from urllib.parse import unquote, urlsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 
 RESERVE_ID = 'uk-private-reserve'
+MAX_FETCH_BYTES = 4 * 1024 * 1024
 
 
 def normal_check_delay_bounds(raw_interval='30'):
@@ -72,6 +73,25 @@ def _transport_result(exc):
     return 'proxy_error'
 
 
+def _safe_fetch_endpoint(value, reserve_url):
+    """The optional gateway must use the same literal VPS and existing identity."""
+    try:
+        if type(value) is not str or any(ord(c) <= 32 or ord(c) >= 127 for c in value):
+            return False
+        parts, reserve = urlsplit(value), urlsplit(reserve_url)
+        username, password = unquote(parts.username or ''), unquote(parts.password or '')
+        return (parts.scheme == 'https' and parts.port is not None
+                and 1 <= parts.port <= 65535 and parts.path == '/v1/search'
+                and not parts.query and not parts.fragment
+                and ipaddress.ip_address(parts.hostname or '') == ipaddress.ip_address(reserve.hostname or '')
+                and username == unquote(reserve.username or '')
+                and password == unquote(reserve.password or '')
+                and 1 <= len(username) <= 64 and 32 <= len(password) <= 256
+                and not any(c in username + password for c in '\r\n\x00'))
+    except (TypeError, ValueError):
+        return False
+
+
 class PrivateReserve:
     """A bounded emergency request, never a persistent or pool-managed session."""
     failure_after = 25.0
@@ -96,12 +116,20 @@ class PrivateReserve:
         self._search_url = ''
         self._session_factory = session_factory
         self._curl_options = {}
+        self._ca_path = ''
+        self._client_cert = None
+        self._fetch_url = ''
+        self._fetch_auth = None
         env = os.environ if environ is None else environ
+        fetch_url = env.get('UK_RESERVE_FETCH_URL', '')
+        self.browser_fetch = bool(fetch_url)
         values = [env.get(key, '') for key in (
             'UK_RESERVE_URL', 'UK_RESERVE_CA_PEM',
             'UK_RESERVE_CLIENT_CERT_PEM', 'UK_RESERVE_CLIENT_KEY_PEM')]
-        self.configured = any(values)
+        self.configured = any(values) or self.browser_fetch
         if not all(values) or not _safe_endpoint(values[0]) or not _safe_search_url(search_url):
+            return
+        if self.browser_fetch and not _safe_fetch_endpoint(fetch_url, values[0]):
             return
         try:
             import certifi
@@ -135,6 +163,11 @@ class PrivateReserve:
                 CurlOpt.PROXY_SSLKEYTYPE: 'PEM',
             }
             self._endpoint, self._search_url = values[0], search_url
+            self._ca_path, self._client_cert = paths[0], (paths[1], paths[2])
+            if self.browser_fetch:
+                parts = urlsplit(fetch_url)
+                self._fetch_url = urlunsplit((parts.scheme, parts.netloc.rsplit('@', 1)[-1], parts.path, '', ''))
+                self._fetch_auth = (unquote(parts.username or ''), unquote(parts.password or ''))
             self.enabled = True
             atexit.register(self.close)
         except Exception:
@@ -223,23 +256,60 @@ class PrivateReserve:
         diagnostic_response = None
         result, body = 'proxy_error', None
         started = time.monotonic()
+        fetch_buffer = bytearray()
+        fetch_invalid = False
         try:
             from curl_cffi.const import CurlInfo
             factory = self._session_factory
             if factory is None:
                 from curl_cffi import requests as cffi_requests
                 factory = cffi_requests.Session
-            session = factory(
-                proxy=self._endpoint, headers={'Accept-Language': 'en-GB,en;q=0.9'},
-                impersonate=profile['impersonate'], verify=True, trust_env=False,
-                allow_redirects=False, timeout=(5.0, 12.0),
-                curl_options=dict(self._curl_options),
-                curl_infos=[CurlInfo.HTTP_CONNECTCODE],
-            )
-            response = session.get(self._search_url, timeout=(5.0, 12.0),
-                                   allow_redirects=False)
+            if self.browser_fetch:
+                from curl_cffi.curl import CURL_WRITEFUNC_ERROR
+                from curl_cffi.const import CurlOpt
+                if not self._fetch_url or not _safe_search_url(self._search_url):
+                    result = 'http_error'
+                    return result, None
+
+                def receive(chunk):
+                    nonlocal fetch_invalid
+                    if type(chunk) is not bytes or len(chunk) > MAX_FETCH_BYTES - len(fetch_buffer):
+                        fetch_invalid = True
+                        return CURL_WRITEFUNC_ERROR
+                    fetch_buffer.extend(chunk)
+                    return len(chunk)
+
+                session = factory(
+                    headers={'Accept-Language': 'en-GB,en;q=0.9'},
+                    verify=self._ca_path, cert=self._client_cert, trust_env=False,
+                    allow_redirects=False, timeout=(5.0, 30.0),
+                    curl_infos=[CurlInfo.HTTP_CONNECTCODE],
+                    curl_options={CurlOpt.PROXY: ''},
+                )
+                response = session.post(
+                    self._fetch_url, json={'url': self._search_url}, auth=self._fetch_auth,
+                    timeout=(5.0, 30.0), allow_redirects=False, content_callback=receive,
+                )
+                diagnostic_response = response
+                if fetch_invalid or getattr(response, 'url', None) != self._fetch_url:
+                    result = 'http_error'
+                    return result, None
+                response.content = bytes(fetch_buffer)
+                if response.status_code in (401, 407):
+                    result = 'proxy_auth'
+                    return result, None
+            else:
+                session = factory(
+                    proxy=self._endpoint, headers={'Accept-Language': 'en-GB,en;q=0.9'},
+                    impersonate=profile['impersonate'], verify=True, trust_env=False,
+                    allow_redirects=False, timeout=(5.0, 12.0),
+                    curl_options=dict(self._curl_options),
+                    curl_infos=[CurlInfo.HTTP_CONNECTCODE],
+                )
+                response = session.get(self._search_url, timeout=(5.0, 12.0),
+                                       allow_redirects=False)
             diagnostic_response = response
-            if getattr(response, 'url', '') and not _safe_search_url(str(response.url)):
+            if not self.browser_fetch and getattr(response, 'url', '') and not _safe_search_url(str(response.url)):
                 result = 'http_error'
                 return result, None
             body = response.text or ''
@@ -248,11 +318,13 @@ class PrivateReserve:
                 result = 'http_error'
             return result, body if result == 'success' else None
         except Exception as exc:
-            result = _transport_result(exc)
+            result = 'http_error' if fetch_invalid else _transport_result(exc)
             try:
                 error_response = getattr(exc, 'response', None)
                 if error_response is not None:
                     diagnostic_response = error_response
+                    if self.browser_fetch and response is None:
+                        response = error_response
             except Exception:
                 pass
             return result, None
@@ -315,10 +387,10 @@ class PrivateReserve:
                 body_class = 'other' if sample else 'empty'
             duration_ms = max(0, min(3_600_000, int((time.monotonic() - started) * 1000)))
             logging.info(
-                'UK reserve: source=VPS connect_http=%d origin_http=%d '
+                'UK reserve: source=VPS browser_fetch=%s connect_http=%d origin_http=%d '
                 'peer_matches_config=%s bytes=%d title_class=%s body_class=%s '
                 'result=%s duration_ms=%d',
-                connect_http, origin_http, peer_match, byte_count, title_class,
+                'true' if self.browser_fetch else 'false', connect_http, origin_http, peer_match, byte_count, title_class,
                 body_class, safe_result, duration_ms,
             )
         except Exception:
